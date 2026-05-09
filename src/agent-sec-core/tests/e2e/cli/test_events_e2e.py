@@ -1068,9 +1068,14 @@ class TestEventsHelpAndVersion:
     def test_version_option(self):
         """TC-038: --version option should show version number.
 
-        Expected: "agent-sec-cli 0.3.0"
+        Expected: "agent-sec-cli <semver>" (e.g. "agent-sec-cli 0.4.0")
         """
+        import re
+
         result = run_cli("--version")
         assert result.returncode == 0
         assert "agent-sec-cli" in result.stdout
-        assert "0.3.0" in result.stdout or "0." in result.stdout
+        # Verify a semver-like version number follows "agent-sec-cli"
+        assert re.search(
+            r"agent-sec-cli\s+\d+\.\d+\.\d+", result.stdout
+        ), f"Expected semver after 'agent-sec-cli', got: {result.stdout!r}"

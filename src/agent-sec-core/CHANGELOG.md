@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.0
+
+**Prompt Scanner**
+
+- Prompt scanner hook now asks user on missing model instead of fail-open. (#463)
+- Added prompt injection detection benchmark dataset and evaluation toolkit. (#464)
+
+**Security Middleware & Event System**
+
+- Refactored security_events SQLite storage to SQLAlchemy ORM with multi-table extensibility and typed repositories. (#459)
+
+**Skill Ledger**
+
+- Fixed sign-skill auto-register config (exact awk match) and parse openclaw stdout unconditionally. (#445)
+- Unified XDG paths under `agent-sec/skill-ledger` vendor namespace. (#445)
+- Unified single-skill verify into structured result for consistent output. (#445)
+- Converted integration tests from subprocess to Typer CliRunner. (#445)
+
+**OpenClaw Integration**
+
+- Registered plugin at openclaw gateway explicitly to support Gateway startup planning. (#446)
+
+**Refactoring**
+
+- Removed deprecated agent-sec-core skill directory; aligned README and spec with agent-sec-cli workflow. (#454)
+
+**Toolchain & CI**
+
+- Added coverage report for sec-core CI. (#431)
+- Enabled rpmbuild and e2e test CI for main branch. (#432)
+
 ## 0.3.0
 
 **Prompt Scanner — Multi-layer prompt injection & jailbreak detection**
