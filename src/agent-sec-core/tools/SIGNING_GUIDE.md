@@ -39,6 +39,28 @@ agent-sec-cli verify
 exports the public key to `agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`.
 You can override the export path with `--trusted-keys-dir <DIR>`.
 
+## After Source Build Installation
+
+After running the unified source build, use the installed script and verifier:
+
+```bash
+./scripts/build-all.sh --component sec-core
+
+# 1. One-time setup. The installed script auto-detects the trusted-keys
+#    directory used by agent-sec-cli verify.
+/usr/local/bin/sign-skill.sh --init
+
+# 2. Sign the installed agent-sec-core skills.
+/usr/local/bin/sign-skill.sh --batch /usr/share/anolisa/skills --force
+
+# 3. Verify all configured skill directories.
+agent-sec-cli verify
+```
+
+For the default source-build install, `agent-sec-cli verify` already reads
+`/usr/share/anolisa/skills` from its packaged `config.conf`, so no verification
+directory argument is required.
+
 ## Step-by-Step (Manual Key Management)
 
 If you prefer full control over GPG key management instead of using `--init`:
@@ -66,8 +88,10 @@ gpg --list-secret-keys me@example.com
 ### 2. Export the Public Key
 
 The verifier loads trusted public keys from the packaged `agent_sec_cli/asset_verify/trusted-keys/`
-directory. When running from this source checkout, `--init` exports to
-`agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/` automatically.
+directory. When `agent-sec-cli` is installed, `sign-skill.sh` auto-detects this
+directory from `agent_sec_cli.asset_verify.verifier`. When running only from this
+source checkout, it falls back to
+`agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`.
 To re-export manually:
 
 ```bash
@@ -114,10 +138,16 @@ Each signed skill directory will contain:
 
 ### 4. Configure the Verifier
 
-`--batch` signs skill directories but does not edit verifier configuration. For
-batch verification, make sure the skills root is listed in the verifier config
+For installed `agent-sec-cli`, `--batch` uses the detected verifier
+`config.conf` and registers the skills root before signing. For source-tree-only
+or custom layouts, make sure the skills root is listed in the verifier config
 packaged with the CLI (`agent-sec-cli/src/agent_sec_cli/asset_verify/config.conf`
-in this source tree):
+in this source tree). You can also choose the config file explicitly:
+
+```bash
+tools/sign-skill.sh --batch /custom/skills --force \
+    --config-file /path/to/agent_sec_cli/asset_verify/config.conf
+```
 
 ```ini
 skills_dir = [
@@ -212,7 +242,7 @@ agent-sec-cli verify
 | **Check** | `--check` | Verify prerequisites (gpg, jq, sha256sum) |
 | **Single** | `<skill_dir> [--force]` | Sign one skill directory |
 | **Batch** | `--batch <parent_dir> [--force]` | Sign all subdirectories under parent. |
-| **Export** | `--export-key [DIR]` | Export public key (default: `agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`) |
+| **Export** | `--export-key [DIR]` | Export public key (default: auto-detected verifier `trusted-keys/`, then source-tree fallback) |
 
 Common options:
 
@@ -221,3 +251,4 @@ Common options:
 | `--force` | Overwrite existing `.skill-meta/Manifest.json` and `.skill-meta/.skill.sig` |
 | `--skill-name NAME` | Override the skill name in the manifest (default: directory name) |
 | `--trusted-keys-dir DIR` | Override the public key export directory (used with `--init`) |
+| `--config-file FILE` | Override the verifier config updated by `--batch` |

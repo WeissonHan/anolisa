@@ -39,6 +39,27 @@ agent-sec-cli verify
 `agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`。
 可通过 `--trusted-keys-dir <DIR>` 覆盖导出路径。
 
+## 源码构建安装后的用法
+
+执行统一源码构建后，使用已安装的脚本和校验器：
+
+```bash
+./scripts/build-all.sh --component sec-core
+
+# 1. 一次性初始化。已安装脚本会自动识别 agent-sec-cli verify 使用的
+#    trusted-keys 目录。
+/usr/local/bin/sign-skill.sh --init
+
+# 2. 签名已安装的 agent-sec-core skills。
+/usr/local/bin/sign-skill.sh --batch /usr/share/anolisa/skills --force
+
+# 3. 验证所有已配置的 skill 目录。
+agent-sec-cli verify
+```
+
+默认源码构建安装场景下，`agent-sec-cli verify` 已经从随包安装的
+`config.conf` 读取 `/usr/share/anolisa/skills`，因此不需要再指定验签目录。
+
 ## 手动逐步操作
 
 如果你希望完全控制 GPG 密钥管理，而不使用 `--init`：
@@ -66,8 +87,10 @@ gpg --list-secret-keys me@example.com
 ### 2. 导出公钥
 
 校验器从打包后的 `agent_sec_cli/asset_verify/trusted-keys/` 目录加载受信公钥。
-在当前源码树中运行时，`--init` 会自动导出到
-`agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`。手动重新导出：
+当 `agent-sec-cli` 已安装时，`sign-skill.sh` 会从
+`agent_sec_cli.asset_verify.verifier` 自动识别该目录；仅在源码树中运行时，
+会回退到 `agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`。
+手动重新导出：
 
 ```bash
 tools/sign-skill.sh --export-key
@@ -113,9 +136,15 @@ tools/sign-skill.sh --batch /usr/share/anolisa/skills --force
 
 ### 4. 配置校验器
 
-`--batch` 只负责签名 skill 目录，不会修改校验器配置。若要进行批量校验，请确保
+当使用已安装的 `agent-sec-cli` 时，`--batch` 会使用自动识别到的 verifier
+`config.conf`，并在签名前注册 skill 根目录。对于仅源码树运行或自定义布局，请确保
 skill 根目录已配置在随 CLI 打包的校验器配置中（当前源码树中的路径为
-`agent-sec-cli/src/agent_sec_cli/asset_verify/config.conf`）：
+`agent-sec-cli/src/agent_sec_cli/asset_verify/config.conf`）。也可以显式指定配置文件：
+
+```bash
+tools/sign-skill.sh --batch /custom/skills --force \
+    --config-file /path/to/agent_sec_cli/asset_verify/config.conf
+```
 
 ```ini
 skills_dir = [
@@ -210,7 +239,7 @@ agent-sec-cli verify
 | **检查** | `--check` | 检查前置依赖（gpg、jq、sha256sum） |
 | **单个签名** | `<skill_dir> [--force]` | 签名单个 skill 目录 |
 | **批量签名** | `--batch <parent_dir> [--force]` | 签名目录下所有子目录。 |
-| **导出公钥** | `--export-key [DIR]` | 导出公钥（默认：`agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`） |
+| **导出公钥** | `--export-key [DIR]` | 导出公钥（默认：自动识别 verifier 的 `trusted-keys/`，失败后回退源码树路径） |
 
 常用选项：
 
@@ -219,3 +248,4 @@ agent-sec-cli verify
 | `--force` | 覆盖已有的 `.skill-meta/Manifest.json` 和 `.skill-meta/.skill.sig` |
 | `--skill-name NAME` | 覆盖 Manifest 中的 skill 名称（默认：目录名） |
 | `--trusted-keys-dir DIR` | 覆盖公钥导出目录（配合 `--init` 使用） |
+| `--config-file FILE` | 覆盖 `--batch` 更新的 verifier 配置文件 |
