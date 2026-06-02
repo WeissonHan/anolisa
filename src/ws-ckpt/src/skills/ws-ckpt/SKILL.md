@@ -1,11 +1,10 @@
 ---
 name: ws-ckpt
 description: >
-  工作区快照管理。用户说"保存一下"、"存个快照"时创建 checkpoint;
+  工作区快照管理。用户说"保存一下"、"存个快照"时创建 checkpoint，仅限 Linux;
   说"回滚"、"撤销"、"恢复到之前"时 rollback;说"删掉快照"时 delete;
   说"看看快照"、"有哪些快照"时 list;说"查看快照状态"、"查看快照剩余空间"时 status。
 ---
-
 # ws-ckpt 工作区快照管理
 
 基于 btrfs COW 快照,为任意工作区提供微秒级 checkpoint/rollback。
@@ -13,18 +12,17 @@ description: >
 ## 工作区路径（关键 — 必须遵守）
 
 ⚠️ **绝对禁止猜测或推断工作区路径。**
-⚠️ **绝对禁止工作区路径是 cwd 或 cwd 的父路径**
-如果工作区路径是 cwd 或 cwd 的父路径，拒绝执行
 
 ws-ckpt 的所有命令都需要 `-w <workspace>` 指定工作区路径。执行任何命令前，必须按以下顺序确定 `-w` 参数：
 
 1. 用户在**当前消息中明确给出**了路径 → 直接使用
 2. 否则 → **必须向用户询问**："请提供工作区路径（传给 `-w` 的目录）"，拿到回复后再执行
-3. 工作区路径**不可以**是 hosting process 的 cwd 或 cwd 的父路径
 
 不得从环境变量、默认路径、或任何隐含上下文中猜测。
 
 确定后，本次会话内复用同一个 workspace 路径，不要重复询问。
+
+cwd 占用的拦截由 daemon 层统一处理,skill 不再做前置守卫。
 
 ## 触发规则
 
@@ -40,9 +38,6 @@ ws-ckpt 的所有命令都需要 `-w <workspace>` 指定工作区路径。执行
 
 ### checkpoint — 创建快照
 
-⚠️ **绝对禁止工作区路径是 cwd 或 cwd 的父路径**
-如果工作区路径是 cwd 或 cwd 的父路径，拒绝执行
-
 ```bash
 ws-ckpt checkpoint -w <workspace> -i <id> [-m <message>]
 ```
@@ -56,9 +51,6 @@ ws-ckpt checkpoint -w <path-to-workspace> -i before-refactor -m "重构前备份
 ```
 
 ### rollback — 回滚到快照
-
-⚠️ **绝对禁止工作区路径是 cwd 或 cwd 的父路径**
-如果工作区路径是 cwd 或 cwd 的父路径，拒绝执行
 
 ```bash
 ws-ckpt rollback -w <workspace> -s <snapshot>
