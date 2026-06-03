@@ -13,7 +13,7 @@ use ws_ckpt_common::{DaemonConfig, DiffEntry, WorkspaceInfo, SNAPSHOTS_DIR};
 
 use super::btrfs_common;
 use crate::util::{is_mounted, run_command, run_command_checked};
-use btrfs_common::resolve_symlink_path;
+use btrfs_common::{backup_path_for, resolve_symlink_path};
 
 pub struct BtrfsLoopBackend {
     pub mount_path: PathBuf,
@@ -31,13 +31,14 @@ impl BtrfsLoopBackend {
         }
     }
 
-    /// Internal init implementation; caller wraps with cleanup-on-failure.
+    /// Internal init implementation; caller wraps with cleanup-on-failure. Sets `*backup_owned` after step 5.
     async fn do_init_storage(
         &self,
         original_path: &str,
         ws_id: &str,
         subvol_path: &Path,
         snap_dir: &Path,
+        backup_owned: &mut bool,
     ) -> anyhow::Result<()> {
         // 1. Create subvolume
         btrfs_common::create_subvolume(subvol_path).await?;
@@ -76,17 +77,25 @@ impl BtrfsLoopBackend {
             Command::new("sync").status().await.ok();
         }
 
-        // 4. Record original directory permissions before removal
+        // 4. Record original directory permissions before backup
         let orig_meta = tokio::fs::metadata(original_path)
             .await
             .context("failed to read original directory metadata")?;
         let orig_uid = orig_meta.uid();
         let orig_gid = orig_meta.gid();
 
-        // 5. Remove original directory (data is safely in btrfs subvolume now)
-        tokio::fs::remove_dir_all(original_path)
+        // 5. Move original aside (#673). Refuse to clobber a pre-existing backup.
+        let backup_path = backup_path_for(original_path);
+        if tokio::fs::symlink_metadata(&backup_path).await.is_ok() {
+            anyhow::bail!(
+                "refusing to overwrite pre-existing backup {:?}; remove it manually first",
+                backup_path
+            );
+        }
+        tokio::fs::rename(original_path, &backup_path)
             .await
-            .context("failed to remove original directory")?;
+            .context("failed to rename original directory to backup")?;
+        *backup_owned = true;
 
         // 6. Create symlink: user path -> btrfs subvolume
         if let Some(parent) = Path::new(original_path).parent() {
@@ -118,26 +127,20 @@ impl BtrfsLoopBackend {
             );
         }
 
+        // 8. Drop backup. A leftover .pre-init-bak blocks the next init.
+        if let Err(e) = tokio::fs::remove_dir_all(&backup_path).await {
+            error!(
+                "init ok but backup remove failed {:?}: {}; next init will fail until removed",
+                backup_path, e
+            );
+        }
+
         info!(
             "BtrfsLoopBackend: storage init complete for ws_id={}, subvol={}",
             ws_id,
             subvol_path.display()
         );
         Ok(())
-    }
-
-    /// Cleanup partially-created storage on init failure.
-    async fn cleanup_init_storage(original_path: &str, subvol_path: &Path, snap_dir: &Path) {
-        // Remove symlink if it exists
-        let _ = tokio::fs::remove_file(original_path).await;
-
-        // Remove snapshots dir
-        let _ = tokio::fs::remove_dir_all(snap_dir).await;
-
-        // Delete subvolume (best effort)
-        if let Err(e) = btrfs_common::delete_subvolume(subvol_path).await {
-            error!("cleanup: failed to delete subvolume: {}", e);
-        }
     }
 }
 
@@ -167,12 +170,25 @@ impl StorageBackend for BtrfsLoopBackend {
         let subvol_path = self.mount_path.join(ws_id);
         let snap_dir = self.snapshots_dir.join(ws_id);
 
+        let mut backup_owned = false;
         if let Err(e) = self
-            .do_init_storage(&resolved_str, ws_id, &subvol_path, &snap_dir)
+            .do_init_storage(
+                &resolved_str,
+                ws_id,
+                &subvol_path,
+                &snap_dir,
+                &mut backup_owned,
+            )
             .await
         {
             error!("init_workspace storage failed, cleaning up: {:#}", e);
-            Self::cleanup_init_storage(&resolved_str, &subvol_path, &snap_dir).await;
+            btrfs_common::cleanup_init_storage(
+                &resolved_str,
+                &subvol_path,
+                &snap_dir,
+                backup_owned,
+            )
+            .await;
             return Err(e);
         }
 
