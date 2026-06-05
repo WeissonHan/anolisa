@@ -1,54 +1,172 @@
 //! Package manager abstraction (dnf/apt/zypper).
 
+use std::process::Command;
+
 use thiserror::Error;
 
-/// Errors returned by native package-manager backends.
 #[derive(Debug, Error)]
 pub enum PkgError {
-    /// The native command exited unsuccessfully or could not be invoked.
     #[error("package manager command failed: {0}")]
     CommandFailed(String),
-    /// No backend is available for the host package base.
-    #[error("unsupported package base")]
-    Unsupported,
+    #[error("unsupported package base: {0}")]
+    Unsupported(String),
 }
 
 /// Abstraction over system package managers.
 pub trait PackageManager {
-    /// Install every package listed by the caller.
     fn install(&self, packages: &[&str]) -> Result<(), PkgError>;
-    /// Remove every package listed by the caller.
     fn remove(&self, packages: &[&str]) -> Result<(), PkgError>;
-    /// Return whether a package is already present according to the native DB.
     fn is_installed(&self, package: &str) -> bool;
 }
 
-/// DNF/YUM-family package backend.
+/// DNF/YUM backend for RPM-based distros (Anolis, ALINUX, RHEL, Fedora).
 pub struct DnfBackend;
 
-/// APT/dpkg-family package backend.
+/// APT backend for DEB-based distros (Ubuntu, Debian).
 pub struct AptBackend;
 
 impl PackageManager for DnfBackend {
-    fn install(&self, _packages: &[&str]) -> Result<(), PkgError> {
-        todo!("owner: platform-runtime; when native rpm installs ship; dnf install")
+    fn install(&self, packages: &[&str]) -> Result<(), PkgError> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+        let status = Command::new("dnf")
+            .args(["install", "-y", "--setopt=install_weak_deps=False"])
+            .args(packages)
+            .status()
+            .map_err(|e| PkgError::CommandFailed(format!("failed to spawn dnf: {e}")))?;
+        if !status.success() {
+            return Err(PkgError::CommandFailed(format!(
+                "dnf install exited with {status}"
+            )));
+        }
+        Ok(())
     }
-    fn remove(&self, _packages: &[&str]) -> Result<(), PkgError> {
-        todo!("owner: platform-runtime; when native rpm removal ships; dnf remove")
+
+    fn remove(&self, packages: &[&str]) -> Result<(), PkgError> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+        let status = Command::new("dnf")
+            .args(["remove", "-y"])
+            .args(packages)
+            .status()
+            .map_err(|e| PkgError::CommandFailed(format!("failed to spawn dnf: {e}")))?;
+        if !status.success() {
+            return Err(PkgError::CommandFailed(format!(
+                "dnf remove exited with {status}"
+            )));
+        }
+        Ok(())
     }
-    fn is_installed(&self, _package: &str) -> bool {
-        todo!("owner: platform-runtime; when native rpm status probes ship; rpm -q")
+
+    fn is_installed(&self, package: &str) -> bool {
+        Command::new("rpm")
+            .args(["-q", package])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
 
 impl PackageManager for AptBackend {
-    fn install(&self, _packages: &[&str]) -> Result<(), PkgError> {
-        todo!("owner: platform-runtime; when native deb installs ship; apt install")
+    fn install(&self, packages: &[&str]) -> Result<(), PkgError> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+        let status = Command::new("apt-get")
+            .args(["install", "-y", "--no-install-recommends"])
+            .args(packages)
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .status()
+            .map_err(|e| PkgError::CommandFailed(format!("failed to spawn apt-get: {e}")))?;
+        if !status.success() {
+            return Err(PkgError::CommandFailed(format!(
+                "apt-get install exited with {status}"
+            )));
+        }
+        Ok(())
     }
-    fn remove(&self, _packages: &[&str]) -> Result<(), PkgError> {
-        todo!("owner: platform-runtime; when native deb removal ships; apt remove")
+
+    fn remove(&self, packages: &[&str]) -> Result<(), PkgError> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+        let status = Command::new("apt-get")
+            .args(["remove", "-y"])
+            .args(packages)
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .status()
+            .map_err(|e| PkgError::CommandFailed(format!("failed to spawn apt-get: {e}")))?;
+        if !status.success() {
+            return Err(PkgError::CommandFailed(format!(
+                "apt-get remove exited with {status}"
+            )));
+        }
+        Ok(())
     }
-    fn is_installed(&self, _package: &str) -> bool {
-        todo!("owner: platform-runtime; when native deb status probes ship; dpkg -l")
+
+    fn is_installed(&self, package: &str) -> bool {
+        Command::new("dpkg")
+            .args(["-s", package])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
+}
+
+/// Detect the appropriate package manager for the current system.
+///
+/// Uses `pkg_base` from `EnvFacts` to select the backend. Falls back to
+/// checking binary availability if `pkg_base` is `None`.
+pub fn detect_package_manager(pkg_base: Option<&str>) -> Result<Box<dyn PackageManager>, PkgError> {
+    match pkg_base {
+        Some(base) if base.starts_with("anolis") || base.starts_with("alinux") => {
+            Ok(Box::new(DnfBackend))
+        }
+        Some(base)
+            if base.starts_with("rhel")
+                || base.starts_with("centos")
+                || base.starts_with("fedora") =>
+        {
+            Ok(Box::new(DnfBackend))
+        }
+        Some(base) if base.starts_with("ubuntu") || base.starts_with("debian") => {
+            Ok(Box::new(AptBackend))
+        }
+        Some(base) => {
+            // Fallback: try to detect from binary availability
+            if command_exists("dnf") || command_exists("yum") {
+                Ok(Box::new(DnfBackend))
+            } else if command_exists("apt-get") {
+                Ok(Box::new(AptBackend))
+            } else {
+                Err(PkgError::Unsupported(base.to_string()))
+            }
+        }
+        None => {
+            // No pkg_base info; probe binaries
+            if command_exists("dnf") || command_exists("yum") {
+                Ok(Box::new(DnfBackend))
+            } else if command_exists("apt-get") {
+                Ok(Box::new(AptBackend))
+            } else {
+                Err(PkgError::Unsupported("unknown".to_string()))
+            }
+        }
+    }
+}
+
+fn command_exists(cmd: &str) -> bool {
+    Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }

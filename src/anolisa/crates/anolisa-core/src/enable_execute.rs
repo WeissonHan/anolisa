@@ -1955,6 +1955,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn state_save_failure_restores_prior_installed_toml() {
+        if nix::unistd::Uid::effective().is_root() {
+            // CAP_DAC_OVERRIDE bypasses the `chmod 0o500` sabotage that
+            // `sabotage_state_save_unix` relies on, so this regression
+            // can only be exercised under an unprivileged uid.
+            eprintln!("skipping state_save_failure_restores_prior_installed_toml under uid 0");
+            return;
+        }
         let root = tempdir().expect("tempdir");
         let payloads = tempdir().expect("tempdir");
         let layout = fixture_layout(root.path());
@@ -2035,6 +2042,15 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn state_save_failure_no_prior_state_leaves_no_installed_toml() {
+        if nix::unistd::Uid::effective().is_root() {
+            // CAP_DAC_OVERRIDE bypasses the `chmod 0o500` sabotage that
+            // `sabotage_state_save_unix` relies on, so this regression
+            // can only be exercised under an unprivileged uid.
+            eprintln!(
+                "skipping state_save_failure_no_prior_state_leaves_no_installed_toml under uid 0"
+            );
+            return;
+        }
         let root = tempdir().expect("tempdir");
         let payloads = tempdir().expect("tempdir");
         let layout = fixture_layout(root.path());

@@ -1,4 +1,12 @@
 //! Systemd service management bridge.
+//!
+//! Thin wrapper around `systemctl(1)`. Each operation spawns the binary,
+//! captures stdout/stderr, and maps the result onto [`SystemdError`].
+//! `NotFound` is reserved for the well-known "unit X not loaded" error
+//! pattern; everything else (binary missing, non-zero exit, parse failure)
+//! collapses to `CommandFailed` with a human-readable message.
+
+use std::process::{Command, Output};
 
 use thiserror::Error;
 
@@ -13,18 +21,6 @@ pub enum SystemdError {
     NotFound(String),
 }
 
-/// Query the status of a systemd unit.
-pub fn unit_status(unit: &str) -> Result<UnitStatus, SystemdError> {
-    if unit.trim().is_empty() {
-        return Err(SystemdError::NotFound("<empty>".to_string()));
-    }
-    // TODO(owner: platform-runtime, when: status/restart need live unit state):
-    // invoke `systemctl show` and parse active/enabled/description fields.
-    Err(SystemdError::CommandFailed(
-        "systemd unit status query is not implemented".to_string(),
-    ))
-}
-
 /// Snapshot of systemd unit state used by status/restart flows.
 #[derive(Debug)]
 pub struct UnitStatus {
@@ -36,28 +32,106 @@ pub struct UnitStatus {
     pub description: String,
 }
 
-/// Enable and start a systemd unit.
+fn run_systemctl(args: &[&str]) -> Result<Output, SystemdError> {
+    Command::new("systemctl")
+        .args(args)
+        .output()
+        .map_err(|e| SystemdError::CommandFailed(format!("failed to spawn systemctl: {e}")))
+}
+
+fn classify_error(unit: &str, output: &Output) -> SystemdError {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stderr}{stdout}");
+    let lower = combined.to_lowercase();
+    if lower.contains("could not be found")
+        || lower.contains("not loaded")
+        || lower.contains("no such file or directory")
+        || lower.contains("unit file") && lower.contains("does not exist")
+    {
+        return SystemdError::NotFound(unit.to_string());
+    }
+    let trimmed = combined.trim();
+    let detail = if trimmed.is_empty() {
+        format!(
+            "systemctl exited with {}",
+            output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        )
+    } else {
+        trimmed.to_string()
+    };
+    SystemdError::CommandFailed(detail)
+}
+
+/// Query the status of a systemd unit via `systemctl show`.
+pub fn unit_status(unit: &str) -> Result<UnitStatus, SystemdError> {
+    if unit.trim().is_empty() {
+        return Err(SystemdError::NotFound("<empty>".to_string()));
+    }
+    let out = run_systemctl(&[
+        "show",
+        unit,
+        "--no-pager",
+        "--property=LoadState,ActiveState,UnitFileState,Description",
+    ])?;
+    if !out.status.success() {
+        return Err(classify_error(unit, &out));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut load_state = String::new();
+    let mut active_state = String::new();
+    let mut unit_file_state = String::new();
+    let mut description = String::new();
+    for line in stdout.lines() {
+        if let Some(v) = line.strip_prefix("LoadState=") {
+            load_state = v.to_string();
+        } else if let Some(v) = line.strip_prefix("ActiveState=") {
+            active_state = v.to_string();
+        } else if let Some(v) = line.strip_prefix("UnitFileState=") {
+            unit_file_state = v.to_string();
+        } else if let Some(v) = line.strip_prefix("Description=") {
+            description = v.to_string();
+        }
+    }
+    if load_state == "not-found" || (load_state == "masked" && unit_file_state.is_empty()) {
+        return Err(SystemdError::NotFound(unit.to_string()));
+    }
+    Ok(UnitStatus {
+        active: active_state == "active" || active_state == "reloading",
+        enabled: matches!(
+            unit_file_state.as_str(),
+            "enabled" | "enabled-runtime" | "alias" | "static" | "indirect"
+        ),
+        description,
+    })
+}
+
+/// Enable and start a systemd unit (`systemctl enable --now <unit>`).
 pub fn enable_unit(unit: &str) -> Result<(), SystemdError> {
     if unit.trim().is_empty() {
         return Err(SystemdError::NotFound("<empty>".to_string()));
     }
-    // TODO(owner: platform-runtime, when: service execute path ships):
-    // invoke `systemctl enable --now <unit>` and surface command status.
-    Err(SystemdError::CommandFailed(
-        "systemd unit enable is not implemented".to_string(),
-    ))
+    let out = run_systemctl(&["enable", "--now", unit])?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(classify_error(unit, &out))
 }
 
-/// Stop and disable a systemd unit.
+/// Stop and disable a systemd unit (`systemctl disable --now <unit>`).
 pub fn disable_unit(unit: &str) -> Result<(), SystemdError> {
     if unit.trim().is_empty() {
         return Err(SystemdError::NotFound("<empty>".to_string()));
     }
-    // TODO(owner: platform-runtime, when: service execute path ships):
-    // invoke `systemctl disable --now <unit>` and surface command status.
-    Err(SystemdError::CommandFailed(
-        "systemd unit disable is not implemented".to_string(),
-    ))
+    let out = run_systemctl(&["disable", "--now", unit])?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(classify_error(unit, &out))
 }
 
 #[cfg(test)]

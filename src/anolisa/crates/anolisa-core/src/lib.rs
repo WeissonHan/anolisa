@@ -25,6 +25,7 @@ pub mod lock;
 pub mod manifest;
 pub mod path_safety;
 pub mod registry;
+pub mod sandbox_install;
 pub mod self_update;
 pub mod service;
 pub mod state;

@@ -77,6 +77,15 @@ pub enum CliError {
     /// "the machine refused" (exit 1).
     #[error("execution failed: {reason}")]
     Runtime { command: String, reason: String },
+
+    /// The command completed but the resulting state is degraded
+    /// (e.g. sandbox install where one or more phases emitted warnings
+    /// rather than hard failure). Maps to exit code 2 so wrapping
+    /// scripts can distinguish "clean success" (0) from "installed
+    /// but needs attention" (2). Phase-level failures are still
+    /// surfaced as `Runtime` (exit 1).
+    #[error("degraded: {reason}")]
+    Degraded { command: String, reason: String },
 }
 
 impl CliError {
@@ -85,6 +94,7 @@ impl CliError {
             Self::NotImplemented { .. } => "NOT_IMPLEMENTED",
             Self::InvalidArgument { .. } => "INVALID_ARGUMENT",
             Self::Runtime { .. } => "EXECUTION_FAILED",
+            Self::Degraded { .. } => "DEGRADED",
         }
     }
 
@@ -93,6 +103,7 @@ impl CliError {
             Self::NotImplemented { .. } => 64,
             Self::InvalidArgument { .. } => 2,
             Self::Runtime { .. } => 1,
+            Self::Degraded { .. } => 2,
         }
     }
 
@@ -101,6 +112,7 @@ impl CliError {
             Self::NotImplemented { command, .. } => command,
             Self::InvalidArgument { command, .. } => command,
             Self::Runtime { command, .. } => command,
+            Self::Degraded { command, .. } => command,
         }
     }
 
@@ -109,6 +121,7 @@ impl CliError {
             Self::NotImplemented { hint, .. } => hint.as_deref(),
             Self::InvalidArgument { .. } => None,
             Self::Runtime { .. } => None,
+            Self::Degraded { .. } => None,
         }
     }
 
@@ -119,6 +132,7 @@ impl CliError {
             }
             Self::InvalidArgument { reason, .. } => reason.clone(),
             Self::Runtime { reason, .. } => reason.clone(),
+            Self::Degraded { reason, .. } => reason.clone(),
         }
     }
 

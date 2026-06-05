@@ -421,6 +421,7 @@ pub struct CapabilityManifestsView<'a> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
+#[allow(clippy::needless_lifetimes)]
 impl<'a> CapabilityManifestsView<'a> {
     /// Empty view for callers that have not loaded the catalog yet (the
     /// alpha case for every CLI surface). Forwards-compatible: when the
@@ -433,6 +434,7 @@ impl<'a> CapabilityManifestsView<'a> {
     }
 }
 
+#[allow(clippy::needless_lifetimes)]
 impl<'a> Default for CapabilityManifestsView<'a> {
     fn default() -> Self {
         Self::empty()
@@ -2487,6 +2489,15 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn uninstall_execute_state_save_failure_rolls_back_files_and_state() {
+        if nix::unistd::Uid::effective().is_root() {
+            // CAP_DAC_OVERRIDE bypasses the `chmod 0o500` sabotage below,
+            // so this regression can only be exercised under an
+            // unprivileged uid.
+            eprintln!(
+                "skipping uninstall_execute_state_save_failure_rolls_back_files_and_state under uid 0"
+            );
+            return;
+        }
         // Sabotage strategy: keep `state_dir` writable for everything the
         // executor needs (lock acquire, journal writes, backup writes),
         // then flip `state_dir` to 0o500 so the *only* operation that
