@@ -414,9 +414,9 @@ pub async fn cleanup_snapshots(
         None => return Ok(workspace_not_found(workspace)),
     };
 
-    // P1: plan under write lock — pure in-memory work, no fs I/O.
+    // P1: plan under read lock — pure in-memory work, no fs I/O.
     let (ws_id, to_remove_ids, snap_dir) = {
-        let ws = arc.write().await;
+        let ws = arc.read().await;
         let ws_id = ws.ws_id.clone();
         let snap_dir = state.index_dir(&ws_id);
 
