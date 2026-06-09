@@ -266,7 +266,7 @@ class DaemonServer:
                 asyncio.CancelledError,
             ):
                 bytes_out, response = await self._write_response(writer, response)
-            if access_log:
+            if access_log or not response.ok:
                 _log_request_completion(
                     request_id=request_id,
                     method=method,

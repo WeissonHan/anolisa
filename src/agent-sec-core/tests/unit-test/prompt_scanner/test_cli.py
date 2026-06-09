@@ -11,7 +11,10 @@ from agent_sec_cli.correlation_context import (
     clear_process_trace_context,
     init_process_trace_context,
 )
-from agent_sec_cli.daemon.errors import DaemonTransportError
+from agent_sec_cli.daemon.errors import (
+    DaemonRuntimePathError,
+    DaemonTransportError,
+)
 from agent_sec_cli.daemon.protocol import DaemonResponse
 from agent_sec_cli.prompt_scanner.cli import (
     _build_error_output,
@@ -246,17 +249,35 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
     def tearDown(self) -> None:
         clear_process_trace_context()
 
-    def test_daemon_transport_error_exits_nonzero(self) -> None:
+    def test_daemon_transport_error_returns_error_json(self) -> None:
         with patch(
             "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
             side_effect=DaemonTransportError("socket missing"),
         ):
             out = runner.invoke(scanner_app, ["--text", "hello"])
-        self.assertEqual(out.exit_code, 1)
-        self.assertIn("daemon is unavailable", out.stderr)
-        self.assertIn("socket missing", out.stderr)
+        self.assertEqual(out.exit_code, 0)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "error")
+        self.assertIn("daemon is unavailable", parsed["summary"])
+        self.assertIn("socket missing", parsed["summary"])
+        self.assertEqual(out.stderr, "")
 
-    def test_daemon_unavailable_response_exits_nonzero(self) -> None:
+    def test_daemon_runtime_path_error_returns_error_json(self) -> None:
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
+            side_effect=DaemonRuntimePathError(
+                "XDG_RUNTIME_DIR is required for agent-sec daemon"
+            ),
+        ):
+            out = runner.invoke(scanner_app, ["--text", "hello"])
+        self.assertEqual(out.exit_code, 0)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "error")
+        self.assertIn("daemon is unavailable", parsed["summary"])
+        self.assertIn("XDG_RUNTIME_DIR is required", parsed["summary"])
+        self.assertEqual(out.stderr, "")
+
+    def test_daemon_unavailable_response_returns_error_json(self) -> None:
         daemon_response = DaemonResponse(
             id="req-prompt",
             ok=False,
@@ -273,8 +294,11 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
         ):
             out = runner.invoke(scanner_app, ["--text", "hello"])
 
-        self.assertEqual(out.exit_code, 1)
-        self.assertIn("status=loading", out.stderr)
+        self.assertEqual(out.exit_code, 0)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "error")
+        self.assertIn("status=loading", parsed["summary"])
+        self.assertEqual(out.stderr, "")
 
     def test_daemon_action_nonzero_exit_outputs_json_before_exit(self) -> None:
         data = _build_error_output("Scanner error: model exploded")
@@ -292,7 +316,7 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
         ):
             out = runner.invoke(scanner_app, ["--text", "hello", "--format", "json"])
 
-        self.assertEqual(out.exit_code, 1)
+        self.assertEqual(out.exit_code, 0)
         parsed = json.loads(out.stdout)
         self.assertEqual(parsed["verdict"], "error")
         self.assertEqual(parsed["summary"], "Scanner error: model exploded")
@@ -314,12 +338,12 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
         ):
             out = runner.invoke(scanner_app, ["--text", "hello", "--format", "text"])
 
-        self.assertEqual(out.exit_code, 2)
+        self.assertEqual(out.exit_code, 0)
         self.assertIn("ERROR", out.stdout)
         self.assertIn("Scanner error: model exploded", out.stdout)
         self.assertEqual(out.stderr, "")
 
-    def test_daemon_action_nonzero_exit_without_output_uses_stderr(self) -> None:
+    def test_daemon_action_nonzero_exit_without_output_returns_error_json(self) -> None:
         daemon_response = DaemonResponse(
             id="req-prompt",
             ok=True,
@@ -334,9 +358,11 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
         ):
             out = runner.invoke(scanner_app, ["--text", "hello", "--format", "json"])
 
-        self.assertEqual(out.exit_code, 1)
-        self.assertEqual(out.stdout, "")
-        self.assertIn("scanner failed", out.stderr)
+        self.assertEqual(out.exit_code, 0)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "error")
+        self.assertEqual(parsed["summary"], "scanner failed")
+        self.assertEqual(out.stderr, "")
 
     @patch("agent_sec_cli.prompt_scanner.cli.DaemonClient")
     def test_daemon_call_passes_trace_context_payload(self, mock_client_cls) -> None:

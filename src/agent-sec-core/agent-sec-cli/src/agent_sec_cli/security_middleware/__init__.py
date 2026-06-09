@@ -70,10 +70,10 @@ def invoke(action: str, **kwargs: Any) -> ActionResult:
     2. Routes to the appropriate backend.
     3. Calls ``pre_action`` (no-op under the single-event model), then
        ``execute(ctx, **kwargs)``.
-    4. Logs a single ``<action>`` completion event (post-hook) with
-       ``result="succeeded"``, or logs the same event type with
-       ``result="failed"`` on failure (on_error). Each event contains both
-       the request kwargs and the result/error details.
+    4. Logs a single ``<action>`` completion event (post-hook) with a result
+       derived from ``ActionResult.success``, or logs the same event type with
+       ``result="failed"`` when the backend raises (on_error). Each event
+       contains both the request kwargs and the result/error details.
     5. Returns the :class:`ActionResult` produced by the backend.
 
     Raises whatever exception the backend raises (after logging it).

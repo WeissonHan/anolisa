@@ -60,9 +60,28 @@ class TestPostAction(unittest.TestCase):
         event = mock_log.call_args[0][0]
         self.assertEqual(event.event_type, "harden")
         self.assertEqual(event.category, "hardening")
+        self.assertEqual(event.result, "succeeded")
         self.assertEqual(event.trace_id, "t-123")
         self.assertIn("request", event.details)
         self.assertIn("result", event.details)
+
+    @patch("agent_sec_cli.security_middleware.lifecycle.log_event")
+    def test_post_action_marks_unsuccessful_action_result_as_failed(self, mock_log):
+        ctx = RequestContext(action="code_scan", trace_id="t-failed-result")
+        result = ActionResult(
+            success=False,
+            data={"ok": False, "verdict": "error"},
+            error="scan error",
+            exit_code=1,
+        )
+
+        post_action(ctx, result, {"code": "bad"}, DummyBackend())
+
+        event = mock_log.call_args[0][0]
+        self.assertEqual(event.event_type, "code_scan")
+        self.assertEqual(event.category, "code_scan")
+        self.assertEqual(event.result, "failed")
+        self.assertEqual(event.details["result"], {"ok": False, "verdict": "error"})
 
     @patch("agent_sec_cli.security_middleware.lifecycle.log_event")
     def test_post_action_copies_request_tracing_to_security_event(self, mock_log):

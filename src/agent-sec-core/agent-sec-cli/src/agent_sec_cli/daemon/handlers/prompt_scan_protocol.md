@@ -20,14 +20,17 @@ Examples:
 - daemon process exits before writing a response
 - daemon response is not valid protocol data
 - daemon response exceeds the configured size limit
+- daemon runtime path cannot be resolved, for example when `XDG_RUNTIME_DIR` is
+  not set and no explicit daemon socket path is provided
 
 Caller behavior:
 
 ```python
 try:
     response = client.call("scan-prompt", params=params)
-except DaemonClientError:
-    # Daemon is unreachable or the protocol is broken.
+except (DaemonClientError, DaemonRuntimePathError):
+    # Daemon is unreachable, the protocol is broken, or the local runtime
+    # socket path cannot be resolved.
     exit(1)
 ```
 

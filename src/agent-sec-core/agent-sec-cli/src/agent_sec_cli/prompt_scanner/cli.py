@@ -1,5 +1,6 @@
 """CLI entry point for the prompt scanner (scan-prompt command)."""
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,10 @@ from typing import Any
 import typer
 from agent_sec_cli.correlation_context import get_current_trace_context
 from agent_sec_cli.daemon.client import DaemonClient
-from agent_sec_cli.daemon.errors import DaemonClientError
+from agent_sec_cli.daemon.errors import (
+    DaemonClientError,
+    DaemonRuntimePathError,
+)
 from agent_sec_cli.daemon.protocol import DaemonResponse
 from agent_sec_cli.prompt_scanner.config import ScanMode
 from agent_sec_cli.prompt_scanner.result import Verdict
@@ -176,36 +180,34 @@ def scan_prompt(
     for t in texts:
         try:
             response = _call_scan_prompt_daemon(t, scan_mode.value, source)
-        except DaemonClientError as exc:
-            typer.echo(_daemon_unavailable_message(str(exc)), err=True)
-            raise typer.Exit(code=1)
+        except (DaemonClientError, DaemonRuntimePathError) as exc:
+            _print_error_json(_daemon_unavailable_message(str(exc)))
+            raise typer.Exit(code=0)
 
         if not response.ok:
-            typer.echo(response.stderr or _daemon_error_message(response), err=True)
-            raise typer.Exit(code=response.exit_code or 1)
+            _print_error_json(response.stderr or _daemon_error_message(response))
+            raise typer.Exit(code=0)
 
         # --- Output ---
-        output_rendered = False
         if output_format == "text":
             if response.data:
                 _print_text(response.data)
-                output_rendered = True
-            elif response.exit_code == 0:
-                typer.echo(f"Error: {response.stderr}", err=True)
-                raise typer.Exit(code=response.exit_code)
+            else:
+                typer.echo(
+                    f"Error: {response.stderr or 'scan-prompt returned no result data'}",
+                    err=True,
+                )
+                raise typer.Exit(code=response.exit_code or 1)
         else:
             if response.stdout:
                 typer.echo(response.stdout)
-                output_rendered = True
-
-        if response.exit_code != 0:
-            if not output_rendered:
-                typer.echo(
+            elif response.data:
+                typer.echo(json.dumps(response.data, indent=2, ensure_ascii=False))
+            else:
+                _print_error_json(
                     response.stderr
-                    or f"scan-prompt failed with exit code {response.exit_code}",
-                    err=True,
+                    or f"scan-prompt returned no output (exit code {response.exit_code})"
                 )
-            raise typer.Exit(code=response.exit_code)
 
     raise typer.Exit(code=0)
 
@@ -253,6 +255,11 @@ def _daemon_error_message(response: DaemonResponse) -> str:
     if response.error:
         return response.error.get("message", "daemon request failed")
     return "daemon request failed"
+
+
+def _print_error_json(message: str) -> None:
+    """Print a scanner-compatible ERROR verdict payload."""
+    typer.echo(json.dumps(_build_error_output(message), indent=2, ensure_ascii=False))
 
 
 def _print_text(d: dict[str, Any]) -> None:

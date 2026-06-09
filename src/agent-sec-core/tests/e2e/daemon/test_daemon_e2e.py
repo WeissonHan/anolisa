@@ -309,7 +309,7 @@ def _wait_for_health(socket_path: Path, process: subprocess.Popen[str]) -> None:
             else:
                 if response.get("ok") is True:
                     return
-        time.sleep(0.05)
+        time.sleep(0.5)
 
     raise AssertionError(f"daemon did not become healthy; last_error={last_error!r}")
 

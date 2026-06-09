@@ -193,7 +193,7 @@ def _wait_for_health(socket_path: Path, daemon: DaemonProcess) -> None:
                 if response.get("ok") is True:
                     _print_progress("daemon.health is ready")
                     return
-        time.sleep(0.05)
+        time.sleep(0.5)
 
     raise AssertionError(f"daemon did not become healthy; last_error={last_error!r}")
 

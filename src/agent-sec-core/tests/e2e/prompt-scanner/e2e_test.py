@@ -88,10 +88,11 @@ class TestBasicScan:
     """Verify fundamental scan-prompt behaviour."""
 
     def test_empty_text_returns_error(self) -> None:
-        """--text '' produces exit_code=0 but empty stdout (CLI skips empty input)."""
-        proc = _run_scan("")
-        # The CLI does not exit 1 for --text ''; it silently outputs nothing.
-        assert proc.stdout.strip() == ""
+        """--text '' produces an ERROR verdict JSON while preserving exit 0."""
+        result = _parse_result(_run_scan(""))
+        assert result["verdict"] == "error"
+        assert result["ok"] is False
+        assert "no input text provided" in result["summary"]
 
     def test_safe_prompt_passes(self) -> None:
         """Benign greeting should pass with no findings."""
