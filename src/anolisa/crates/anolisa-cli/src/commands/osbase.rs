@@ -61,7 +61,7 @@ pub struct SandboxArgs {
 pub enum SandboxCommands {
     /// Install a sandbox scenario (reads from sandbox.toml manifest)
     ///
-    /// Runs: Preflight → Packages → Done
+    /// Runs: Preflight → Packages → Services → Verify → State
     Install {
         /// Scenario name (e.g. runc, rund, gvisor, firecracker, landlock).
         /// Run `anolisa osbase sandbox list` to see available scenarios.
@@ -264,15 +264,44 @@ fn handle_sandbox_install(
             let env = anolisa_env::EnvService::detect();
             match osbase_install::execute_install(&request, &env) {
                 Ok(outcome) => {
-                    // Progress was already printed via eprintln! in the core.
-                    if outcome.exit_code != 0 {
-                        Err(CliError::Runtime {
-                            command: format!("osbase sandbox install {}", outcome.target),
-                            reason: format!("install failed (exit_code={})", outcome.exit_code),
-                        })
-                    } else {
-                        Ok(())
+                    if outcome.exit_code == 1 {
+                        // Phase failure — phases already printed to stderr by
+                        // the core.  Surface the failed phase in the error.
+                        let failed_phase = outcome
+                            .phases
+                            .iter()
+                            .rev()
+                            .find(|p| p.status == osbase_install::PhaseStatus::Failed);
+                        let reason = match failed_phase {
+                            Some(p) => format!(
+                                "phase '{}' failed: {}",
+                                p.name,
+                                p.message.as_deref().unwrap_or("unknown error")
+                            ),
+                            None => "install failed".to_string(),
+                        };
+                        for w in &outcome.warnings {
+                            eprintln!("[osbase] warning: {w}");
+                        }
+                        return Err(CliError::Runtime {
+                            command: format!("osbase sandbox install {target}"),
+                            reason,
+                        });
                     }
+                    // exit_code 2 = degraded (non-fatal warnings already
+                    // printed to stderr by the core). CLI still returns
+                    // success so the user sees "install ok".
+                    if !outcome.warnings.is_empty() {
+                        eprintln!(
+                            "[osbase] install completed with {} warning(s)",
+                            outcome.warnings.len()
+                        );
+                    }
+                    // Print informational hints (not counted as warnings).
+                    for hint in &outcome.hints {
+                        eprintln!("[osbase] hint: {hint}");
+                    }
+                    Ok(())
                 }
                 Err(err) => Err(map_osbase_err(err, "install", &target)),
             }
@@ -401,15 +430,27 @@ fn send_helper_request(
 
     match resp {
         HelperResponse::Success { message, exit_code } => {
-            if exit_code == 0 {
+            if exit_code == 0 || exit_code == 2 {
+                // exit_code 0 = full success, 2 = degraded (non-fatal
+                // verify/state warnings). Both are reported as success;
+                // the core already printed diagnostics to stderr.
                 for line in message.lines() {
                     eprintln!("[osbase] {line}");
                 }
+                if exit_code == 2 {
+                    eprintln!("[osbase] install completed with degraded status (non-fatal)");
+                }
                 Ok(())
             } else {
+                // exit_code = 1 → phase failure.  Print the phase summary
+                // (from the helper response) before reporting the error so
+                // the user sees which phases passed and which failed.
+                for line in message.lines() {
+                    eprintln!("[osbase] {line}");
+                }
                 Err(CliError::Runtime {
                     command: command_label.to_string(),
-                    reason: format!("{message} (exit_code={exit_code})"),
+                    reason: format!("install failed (exit_code={exit_code})"),
                 })
             }
         }

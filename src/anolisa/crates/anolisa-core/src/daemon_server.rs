@@ -409,78 +409,49 @@ fn dispatch_osbase_install(
     let env = anolisa_env::EnvService::detect();
 
     match execute_install(&request, &env) {
-        Ok(outcome) => {
-            // Build formatted progress lines matching CLI's expected output.
-            use crate::sandbox_manifest::SandboxManifest;
-            let mut lines = Vec::new();
-
-            // Load manifest for scenario metadata.
-            let scenario_cfg = SandboxManifest::load()
-                .ok()
-                .and_then(|m| m.find_scenario(scenario).cloned());
-
-            let message = if dry_run {
-                // Dry-run: use "would install" wording.
-                if let Some(ref cfg) = scenario_cfg {
-                    let pkg_list = cfg.packages.join(" ");
-                    if !pkg_list.is_empty() {
-                        lines.push(format!("[dry-run] would install packages: {pkg_list}"));
-                    }
-                    lines.push(format!(
-                        "[dry-run] preflight: kernel {} \u{2713}",
-                        cfg.requires_kernel
-                    ));
-                }
-                lines.push("[dry-run] no packages will be installed in dry-run mode".to_string());
-                lines.join("\n")
-            } else {
-                // Preflight line
-                if let Some(ref cfg) = scenario_cfg {
-                    lines.push(format!(
-                        "preflight: kernel {} \u{2713}",
-                        cfg.requires_kernel
-                    ));
-                    if cfg.requires_kvm {
-                        lines.push(
-                            "preflight: KVM required \u{2014} checking /dev/kvm... \u{2713}"
-                                .to_string(),
-                        );
-                    }
-                }
-
-                // Packages line
-                let packages_str = scenario_cfg
-                    .as_ref()
-                    .map(|c| c.packages.join(" "))
-                    .unwrap_or_default();
-                if !packages_str.is_empty() {
-                    lines.push(format!("installing packages: {packages_str}"));
-                    lines.push("dnf install completed (exit_code=0)".to_string());
-                }
-
-                lines.push("installed successfully".to_string());
-
-                // Optional packages hint
-                if !outcome.warnings.is_empty() {
-                    for w in &outcome.warnings {
-                        lines.push(w.clone());
-                    }
-                } else {
-                    lines.push("optional packages available: (none)".to_string());
-                }
-
-                lines.join("\n")
-            };
-
-            HelperResponse::Success {
-                message,
-                exit_code: outcome.exit_code,
-            }
-        }
+        Ok(outcome) => format_outcome_response(outcome),
         Err(e) => HelperResponse::Error {
             code: "EXECUTION_FAILED".to_string(),
             message: format!("{e}"),
         },
+    }
+}
+
+/// Format an `OsbaseInstallOutcome` into a `HelperResponse::Success`.
+///
+/// Renders every phase from `outcome.phases` so the non-root CLI path
+/// sees the full five-phase pipeline result (preflight, packages,
+/// services, verify, state) rather than a partial reconstruction.
+fn format_outcome_response(outcome: crate::osbase_install::OsbaseInstallOutcome) -> HelperResponse {
+    use crate::osbase_install::PhaseStatus;
+    let mut lines = Vec::new();
+
+    for phase in &outcome.phases {
+        let status_str = match phase.status {
+            PhaseStatus::Success => "\u{2713}",
+            PhaseStatus::Skipped => "skipped",
+            PhaseStatus::Degraded => "degraded",
+            PhaseStatus::Failed => "\u{2717}",
+        };
+        let msg = phase.message.as_deref().unwrap_or("");
+        lines.push(format!("{}: {} {}", phase.name, status_str, msg));
+    }
+
+    // Append real warnings if any.
+    for w in &outcome.warnings {
+        lines.push(format!("warning: {w}"));
+    }
+
+    // Append informational hints.
+    for h in &outcome.hints {
+        lines.push(format!("hint: {h}"));
+    }
+
+    let message = lines.join("\n");
+
+    HelperResponse::Success {
+        message,
+        exit_code: outcome.exit_code,
     }
 }
 
@@ -719,6 +690,160 @@ mod tests {
                 assert_eq!(version, "0.1.0");
             }
             _ => panic!("expected Status response"),
+        }
+    }
+
+    /// Verify that the helper response renders all five phases from
+    /// outcome.phases (preflight, packages, services, verify, state),
+    /// not from reconstructed metadata.
+    #[test]
+    fn helper_install_dryrun_surfaces_all_phases() {
+        use crate::osbase_install::{OsbaseDomain, OsbaseInstallOutcome, PhaseResult, PhaseStatus};
+
+        // Simulate a successful runc install outcome with all five phases.
+        let outcome = OsbaseInstallOutcome {
+            domain: OsbaseDomain::Sandbox,
+            target: "runc".to_string(),
+            phases: vec![
+                PhaseResult {
+                    name: "preflight".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some("kernel 6.6.30 satisfies >=4.18".to_string()),
+                    duration_ms: None,
+                },
+                PhaseResult {
+                    name: "packages".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some("installed: runc containerd docker docker-client".to_string()),
+                    duration_ms: None,
+                },
+                PhaseResult {
+                    name: "services".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some("enabled: containerd, docker".to_string()),
+                    duration_ms: None,
+                },
+                PhaseResult {
+                    name: "verify".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some(
+                        "all checks passed: runc --version, systemctl is-active containerd, docker version, docker info"
+                            .to_string(),
+                    ),
+                    duration_ms: None,
+                },
+                PhaseResult {
+                    name: "state".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some("sandbox-runc recorded in /var/lib/anolisa/installed.toml".to_string()),
+                    duration_ms: None,
+                },
+            ],
+            exit_code: 0,
+            warnings: vec![],
+            hints: vec!["optional packages available: nerdctl".to_string()],
+        };
+
+        let resp = super::format_outcome_response(outcome);
+
+        match resp {
+            HelperResponse::Success { message, exit_code } => {
+                assert_eq!(exit_code, 0);
+                // All five phases must appear in the formatted output.
+                assert!(
+                    message.contains("preflight:"),
+                    "missing preflight phase in helper output: {message}"
+                );
+                assert!(
+                    message.contains("packages:"),
+                    "missing packages phase in helper output: {message}"
+                );
+                assert!(
+                    message.contains("services:"),
+                    "missing services phase in helper output: {message}"
+                );
+                assert!(
+                    message.contains("verify:"),
+                    "missing verify phase in helper output: {message}"
+                );
+                assert!(
+                    message.contains("state:"),
+                    "missing state phase in helper output: {message}"
+                );
+                // Hints appear but NOT as warnings.
+                assert!(
+                    message.contains("hint: optional packages available: nerdctl"),
+                    "missing hint line in helper output: {message}"
+                );
+                assert!(
+                    !message.contains("warning:"),
+                    "unexpected warning in clean install: {message}"
+                );
+            }
+            other => panic!("expected Success, got: {other:?}"),
+        }
+    }
+
+    /// Verify degraded verify phase shows as warning in helper output.
+    #[test]
+    fn helper_degraded_verify_shows_warning() {
+        use crate::osbase_install::{OsbaseDomain, OsbaseInstallOutcome, PhaseResult, PhaseStatus};
+
+        let outcome = OsbaseInstallOutcome {
+            domain: OsbaseDomain::Sandbox,
+            target: "runc".to_string(),
+            phases: vec![
+                PhaseResult {
+                    name: "preflight".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some("ok".to_string()),
+                    duration_ms: None,
+                },
+                PhaseResult {
+                    name: "packages".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some("ok".to_string()),
+                    duration_ms: None,
+                },
+                PhaseResult {
+                    name: "services".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some("ok".to_string()),
+                    duration_ms: None,
+                },
+                PhaseResult {
+                    name: "verify".to_string(),
+                    status: PhaseStatus::Degraded,
+                    message: Some("docker info failed (exit 1)".to_string()),
+                    duration_ms: None,
+                },
+                PhaseResult {
+                    name: "state".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some("recorded".to_string()),
+                    duration_ms: None,
+                },
+            ],
+            exit_code: 2,
+            warnings: vec!["verify degraded: docker info failed (exit 1)".to_string()],
+            hints: vec![],
+        };
+
+        let resp = super::format_outcome_response(outcome);
+
+        match resp {
+            HelperResponse::Success { message, exit_code } => {
+                assert_eq!(exit_code, 2, "degraded should exit 2");
+                assert!(
+                    message.contains("verify: degraded"),
+                    "verify phase should show 'degraded': {message}"
+                );
+                assert!(
+                    message.contains("warning: verify degraded"),
+                    "warning line expected: {message}"
+                );
+            }
+            other => panic!("expected Success, got: {other:?}"),
         }
     }
 }

@@ -2,20 +2,29 @@
 //!
 //! The install pipeline reads scenario definitions from `sandbox.toml`
 //! (deployed by `anolisa system setup` to `/etc/anolisa/sandbox.toml`)
-//! and executes a simplified 3-step flow:
+//! and executes a five-phase flow:
 //!
-//!   1. Preflight — kernel version gate, KVM check if required
-//!   2. Packages  — `dnf install -y <packages>` from manifest
-//!   3. Hint      — print optional packages if any
+//!   1. Preflight  — kernel version gate, KVM check if required
+//!   2. Packages   — `dnf install -y <packages>` from manifest
+//!   3. Services   — `systemctl enable --now` for each service
+//!   4. Verify     — scenario-aware checks from `verify_commands` in manifest
+//!   5. State      — persist to `installed.toml`
 //!
-//! The old 5-phase pipeline in `sandbox_install.rs` is no longer invoked
-//! from this path.  `Kernel` and `Security` domains remain stubs.
+//! Currently serves the "beginner" scenario only: zero optional
+//! parameters, full-stack install from manifest.
 
 use std::process::Command;
 
 use anolisa_env::EnvFacts;
+use anolisa_platform::fs_layout::FsLayout;
+use chrono::{SecondsFormat, Utc};
 
+use crate::lock::{InstallLock, LockError};
 use crate::sandbox_manifest::{ManifestError, SandboxManifest, ScenarioConfig};
+use crate::state::{
+    InstallMode as StateInstallMode, InstalledObject, InstalledState, ObjectKind, ObjectStatus,
+    Ownership, ServiceRef,
+};
 
 // ===========================================================================
 // Public types
@@ -87,7 +96,11 @@ pub struct OsbaseInstallOutcome {
     pub phases: Vec<PhaseResult>,
     /// `0` success, `1` failed, `2` degraded.
     pub exit_code: i32,
+    /// Real degraded-verification or phase warnings.
     pub warnings: Vec<String>,
+    /// Informational hints (e.g. optional packages available). Not counted
+    /// as warnings and do not affect `exit_code`.
+    pub hints: Vec<String>,
 }
 
 /// Per-phase result.
@@ -298,16 +311,17 @@ fn sandbox_dispatch(
 
     if request.dry_run {
         eprintln!("[osbase] scenario: {}", scenario.name);
-        if !scenario.packages.is_empty() {
-            let pkg_list = scenario.packages.join(" ");
-            eprintln!("[osbase] [dry-run] would install packages: {pkg_list}");
+        let outcome = build_dry_run_outcome(request, &scenario);
+        // Print phase plan in pipeline order so Direct and Helper paths
+        // produce identical user-facing output.
+        for phase in &outcome.phases {
+            let msg = phase.message.as_deref().unwrap_or("");
+            eprintln!("[osbase] [dry-run] {}: {msg}", phase.name);
         }
-        eprintln!(
-            "[osbase] [dry-run] preflight: kernel {} \u{2713}",
-            scenario.requires_kernel
-        );
-        eprintln!("[osbase] [dry-run] no packages will be installed in dry-run mode");
-        return Ok(build_dry_run_outcome(request, &scenario));
+        for hint in &outcome.hints {
+            eprintln!("[osbase] [dry-run] hint: {hint}");
+        }
+        return Ok(outcome);
     }
 
     run_manifest_install(request, env, &scenario)
@@ -345,17 +359,48 @@ fn build_dry_run_outcome(
         duration_ms: None,
     });
 
-    // Optional hint
-    if !scenario.packages_optional.is_empty() {
+    // Services
+    if scenario.services.is_empty() {
         phases.push(PhaseResult {
-            name: "optional_hint".to_string(),
+            name: "services".to_string(),
+            status: PhaseStatus::Skipped,
+            message: Some("no services for this scenario".to_string()),
+            duration_ms: None,
+        });
+    } else {
+        phases.push(PhaseResult {
+            name: "services".to_string(),
             status: PhaseStatus::Skipped,
             message: Some(format!(
-                "optional: {}",
-                scenario.packages_optional.join(" ")
+                "systemctl enable --now {}",
+                scenario.services.join(" ")
             )),
             duration_ms: None,
         });
+    }
+
+    // Verify
+    phases.push(PhaseResult {
+        name: "verify".to_string(),
+        status: PhaseStatus::Skipped,
+        message: Some("post-install checks".to_string()),
+        duration_ms: None,
+    });
+
+    // State
+    phases.push(PhaseResult {
+        name: "state".to_string(),
+        status: PhaseStatus::Skipped,
+        message: Some("persist to installed.toml".to_string()),
+        duration_ms: None,
+    });
+
+    let mut hints = vec!["dry-run mode: no changes made".to_string()];
+    if !scenario.packages_optional.is_empty() {
+        hints.push(format!(
+            "optional packages available: {}",
+            scenario.packages_optional.join(" ")
+        ));
     }
 
     OsbaseInstallOutcome {
@@ -363,14 +408,116 @@ fn build_dry_run_outcome(
         target: request.target.clone(),
         phases,
         exit_code: 0,
-        warnings: vec!["dry-run mode: no changes made".to_string()],
+        warnings: vec![],
+        hints,
     }
 }
 
-/// Execute the simplified manifest-driven install:
+/// Enable and start systemd services.
+fn run_enable_services(services: &[String]) -> Result<String, String> {
+    let mut enabled = Vec::new();
+    for svc in services {
+        let output = Command::new("systemctl")
+            .args(["enable", "--now", svc])
+            .output()
+            .map_err(|e| format!("failed to run systemctl: {e}"))?;
+        if output.status.success() {
+            eprintln!("[osbase] services: {svc}.service active \u{2713}");
+            enabled.push(svc.clone());
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "systemctl enable --now {svc} failed: {}",
+                stderr.trim()
+            ));
+        }
+    }
+    Ok(format!("enabled: {}", enabled.join(", ")))
+}
+
+/// Result of scenario-aware post-install verification.
+enum VerifyOutcome {
+    /// All verify commands passed.
+    Passed(String),
+    /// No verify commands or services defined; nothing to verify.
+    NothingToVerify,
+    /// One or more checks failed (degraded, not fatal).
+    Failed(String),
+}
+
+/// Scenario-aware post-install verification.
+///
+/// If `scenario.verify_commands` is non-empty, each entry is executed as a
+/// shell-style command (split on whitespace). Otherwise, falls back to
+/// `systemctl is-active` for each service declared in the scenario.
+fn run_post_verify(scenario: &ScenarioConfig) -> VerifyOutcome {
+    let mut checks = Vec::new();
+
+    if !scenario.verify_commands.is_empty() {
+        // Use explicit verify commands from manifest.
+        for cmd_str in &scenario.verify_commands {
+            let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let (bin, args) = (parts[0], &parts[1..]);
+            if let Err(e) = run_verify_cmd(bin, args, cmd_str) {
+                return VerifyOutcome::Failed(e);
+            }
+            checks.push(cmd_str.as_str());
+        }
+    } else if !scenario.services.is_empty() {
+        // Fallback: check each service is active.
+        for svc in &scenario.services {
+            if let Err(e) =
+                run_verify_cmd("systemctl", &["is-active", svc], &format!("{svc} active"))
+            {
+                return VerifyOutcome::Failed(e);
+            }
+            checks.push(svc.as_str());
+        }
+    } else {
+        // No verify commands and no services — nothing to verify.
+        return VerifyOutcome::NothingToVerify;
+    }
+
+    VerifyOutcome::Passed(format!("all checks passed: {}", checks.join(", ")))
+}
+
+/// Run a single verification command and report result.
+fn run_verify_cmd(cmd: &str, args: &[&str], label: &str) -> Result<(), String> {
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|e| format!("{label}: command not found — is the package installed? ({e})"))?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let first_line = stdout.lines().next().unwrap_or("");
+        eprintln!("[osbase] verify: {label} \u{2713} {first_line}");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let hint = stderr.lines().next().unwrap_or("").trim();
+        if hint.is_empty() {
+            Err(format!(
+                "{label} failed (exit {})",
+                output.status.code().unwrap_or(-1)
+            ))
+        } else {
+            Err(format!(
+                "{label} failed (exit {}): {hint}",
+                output.status.code().unwrap_or(-1)
+            ))
+        }
+    }
+}
+
+/// Execute the five-phase manifest-driven install:
 /// 1. Preflight (kernel + KVM)
-/// 2. dnf install packages
-/// 3. Optional packages hint
+/// 2. Packages (full stack from manifest)
+/// 3. Services (systemctl enable --now)
+/// 4. Verify (scenario-aware: verify_commands from manifest, or service checks)
+/// 5. State (persist to installed.toml)
 fn run_manifest_install(
     request: &OsbaseInstallRequest,
     env: &EnvFacts,
@@ -382,6 +529,7 @@ fn run_manifest_install(
     eprintln!("[osbase] scenario: {}", scenario.name);
 
     // ─── Phase 1: Preflight ──────────────────────────────────────────────
+    // Preflight is read-only (kernel/KVM checks); runs before the lock.
     let preflight_result = run_preflight(env, scenario, request.force);
     match preflight_result {
         Ok(msg) => {
@@ -393,19 +541,41 @@ fn run_manifest_install(
             });
         }
         Err(reason) => {
+            eprintln!("[osbase] error: {reason}");
             phases.push(PhaseResult {
                 name: "preflight".to_string(),
                 status: PhaseStatus::Failed,
-                message: Some(reason.clone()),
+                message: Some(reason),
                 duration_ms: None,
             });
-            eprintln!("[osbase] error: {reason}");
-            return Err(OsbaseInstallError::PhaseFailed {
-                phase: "preflight".to_string(),
-                message: reason,
+            return Ok(OsbaseInstallOutcome {
+                domain: request.domain,
+                target: request.target.clone(),
+                phases,
+                exit_code: 1,
+                warnings,
+                hints: vec![],
             });
         }
     }
+
+    // ─── Acquire InstallLock ─────────────────────────────────────────────
+    // Lock covers the full mutation window: packages → services → state.
+    // Held until the function returns (drop releases the lock).
+    let layout = FsLayout::system(None);
+    let _lock = InstallLock::acquire(&layout.lock_file).map_err(|e| match e {
+        LockError::Held { path } => OsbaseInstallError::PhaseFailed {
+            phase: "lock".to_string(),
+            message: format!(
+                "install lock at {} is held by another process; try again later",
+                path.display()
+            ),
+        },
+        other => OsbaseInstallError::PhaseFailed {
+            phase: "lock".to_string(),
+            message: format!("failed to acquire install lock: {other}"),
+        },
+    })?;
 
     // ─── Phase 2: Packages ───────────────────────────────────────────────
     if scenario.packages.is_empty() {
@@ -433,43 +603,219 @@ fn run_manifest_install(
                 phases.push(PhaseResult {
                     name: "packages".to_string(),
                     status: PhaseStatus::Failed,
-                    message: Some(reason.clone()),
+                    message: Some(reason),
                     duration_ms: None,
                 });
-                return Err(OsbaseInstallError::PhaseFailed {
-                    phase: "packages".to_string(),
-                    message: reason,
+                return Ok(OsbaseInstallOutcome {
+                    domain: request.domain,
+                    target: request.target.clone(),
+                    phases,
+                    exit_code: 1,
+                    warnings,
+                    hints: vec![],
                 });
             }
         }
     }
 
+    // ─── Phase 3: Services ───────────────────────────────────────────────
+    if scenario.services.is_empty() {
+        phases.push(PhaseResult {
+            name: "services".to_string(),
+            status: PhaseStatus::Skipped,
+            message: Some("no services for this scenario".to_string()),
+            duration_ms: None,
+        });
+    } else {
+        eprintln!(
+            "[osbase] enabling services: {}",
+            scenario.services.join(", ")
+        );
+        match run_enable_services(&scenario.services) {
+            Ok(msg) => {
+                phases.push(PhaseResult {
+                    name: "services".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some(msg),
+                    duration_ms: None,
+                });
+            }
+            Err(reason) => {
+                eprintln!("[osbase] service enablement failed: {reason}");
+                phases.push(PhaseResult {
+                    name: "services".to_string(),
+                    status: PhaseStatus::Failed,
+                    message: Some(reason),
+                    duration_ms: None,
+                });
+                return Ok(OsbaseInstallOutcome {
+                    domain: request.domain,
+                    target: request.target.clone(),
+                    phases,
+                    exit_code: 1,
+                    warnings,
+                    hints: vec![],
+                });
+            }
+        }
+    }
+
+    // ─── Phase 4: Verify ─────────────────────────────────────────────────
+    if !request.skip_verify {
+        match run_post_verify(scenario) {
+            VerifyOutcome::Passed(msg) => {
+                phases.push(PhaseResult {
+                    name: "verify".to_string(),
+                    status: PhaseStatus::Success,
+                    message: Some(msg),
+                    duration_ms: None,
+                });
+            }
+            VerifyOutcome::NothingToVerify => {
+                phases.push(PhaseResult {
+                    name: "verify".to_string(),
+                    status: PhaseStatus::Skipped,
+                    message: Some("no verify commands defined for this scenario".to_string()),
+                    duration_ms: None,
+                });
+            }
+            VerifyOutcome::Failed(reason) => {
+                // Verify failure is degraded, not fatal
+                eprintln!("[osbase] verify degraded: {reason}");
+                warnings.push(format!("verify degraded: {reason}"));
+                phases.push(PhaseResult {
+                    name: "verify".to_string(),
+                    status: PhaseStatus::Degraded,
+                    message: Some(reason),
+                    duration_ms: None,
+                });
+            }
+        }
+    } else {
+        eprintln!("[osbase] verify: skipped (--no-verify)");
+        phases.push(PhaseResult {
+            name: "verify".to_string(),
+            status: PhaseStatus::Skipped,
+            message: Some("skipped by --no-verify".to_string()),
+            duration_ms: None,
+        });
+    }
+
+    // ─── Phase 5: State ─────────────────────────────────────────────────────
+    // Lock is already held (acquired before Phase 2).
+    let state_path = layout.state_dir.join("installed.toml");
+    let state_result = (|| -> Result<String, String> {
+        let mut state =
+            InstalledState::load(&state_path).map_err(|e| format!("failed to load state: {e}"))?;
+
+        // Mark state as system-scoped so other tools interpret paths correctly.
+        state.install_mode = StateInstallMode::System;
+        state.prefix = layout.prefix.clone();
+
+        let obj = InstalledObject {
+            kind: ObjectKind::Osbase,
+            name: format!("sandbox-{}", scenario.name),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            status: ObjectStatus::Installed,
+            manifest_digest: None,
+            distribution_source: Some("sandbox.toml".to_string()),
+            raw_package: None,
+            install_backend: Some("dnf".to_string()),
+            ownership: Some(Ownership::RpmManaged),
+            rpm_metadata: None,
+            installed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            last_operation_id: None,
+            managed: true,
+            adopted: false,
+            subscription_scope: Default::default(),
+            enabled_features: vec![],
+            component_refs: vec![],
+            files: vec![],
+            external_modified_files: vec![],
+            services: scenario
+                .services
+                .iter()
+                .map(|s| ServiceRef {
+                    name: format!("{s}.service"),
+                    manager: "systemd".to_string(),
+                    restartable: true,
+                    enabled: true,
+                    scope: Default::default(),
+                })
+                .collect(),
+            health: vec![],
+        };
+        state.upsert_object(obj);
+        state
+            .save(&state_path)
+            .map_err(|e| format!("failed to save state: {e}"))?;
+        Ok(format!(
+            "sandbox-{} recorded in {}",
+            scenario.name,
+            state_path.display()
+        ))
+    })();
+
+    match state_result {
+        Ok(msg) => {
+            eprintln!("[osbase] state: {msg}");
+            phases.push(PhaseResult {
+                name: "state".to_string(),
+                status: PhaseStatus::Success,
+                message: Some(msg),
+                duration_ms: None,
+            });
+        }
+        Err(reason) => {
+            // State persistence failure after packages/services were mutated
+            // is a hard error: the machine has changed but we have no record.
+            eprintln!("[osbase] state: FAILED: {reason}");
+            warnings.push(format!(
+                "state persistence failed after packages/services were modified: {reason}"
+            ));
+            phases.push(PhaseResult {
+                name: "state".to_string(),
+                status: PhaseStatus::Failed,
+                message: Some(reason),
+                duration_ms: None,
+            });
+            return Ok(OsbaseInstallOutcome {
+                domain: request.domain,
+                target: request.target.clone(),
+                phases,
+                exit_code: 1,
+                warnings,
+                hints: vec![],
+            });
+        }
+    }
+
     eprintln!("[osbase] installed successfully");
 
-    // ─── Phase 3: Optional packages hint ─────────────────────────────────
+    // Optional packages hint — informational only, not a warning.
+    let mut hints = Vec::new();
     if !scenario.packages_optional.is_empty() {
         let hint = format!(
             "optional packages available: {}",
             scenario.packages_optional.join(" ")
         );
         eprintln!("[osbase] {hint}");
-        warnings.push(hint.clone());
-        phases.push(PhaseResult {
-            name: "optional_hint".to_string(),
-            status: PhaseStatus::Success,
-            message: Some(hint),
-            duration_ms: None,
-        });
-    } else {
-        eprintln!("[osbase] optional packages available: (none)");
+        hints.push(hint);
     }
+
+    let exit_code = if phases.iter().any(|p| p.status == PhaseStatus::Degraded) {
+        2
+    } else {
+        0
+    };
 
     Ok(OsbaseInstallOutcome {
         domain: request.domain,
         target: request.target.clone(),
         phases,
-        exit_code: 0,
+        exit_code,
         warnings,
+        hints,
     })
 }
 
@@ -671,6 +1017,24 @@ mod tests {
                 execute_install(&r, &env).unwrap_or_else(|_| panic!("scenario '{s}' should work"));
             assert_eq!(outcome.exit_code, 0);
             assert_eq!(outcome.target, s);
+
+            // Every dry-run must produce exactly five phases in canonical order.
+            let phase_names: Vec<&str> = outcome.phases.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(
+                phase_names,
+                vec!["preflight", "packages", "services", "verify", "state"],
+                "scenario '{s}' should produce exactly five phases in order"
+            );
+            // All phases must be Skipped in dry-run mode.
+            for phase in &outcome.phases {
+                assert_eq!(
+                    phase.status,
+                    PhaseStatus::Skipped,
+                    "scenario '{s}' phase '{}' should be Skipped in dry-run, got {:?}",
+                    phase.name,
+                    phase.status
+                );
+            }
         }
     }
 

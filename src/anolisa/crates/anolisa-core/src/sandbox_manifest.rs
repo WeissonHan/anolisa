@@ -27,6 +27,14 @@ pub struct ScenarioConfig {
     /// Optional packages — hinted to user but not auto-installed.
     #[serde(default)]
     pub packages_optional: Vec<String>,
+    /// Services to enable+start after package install (systemctl enable --now).
+    #[serde(default)]
+    pub services: Vec<String>,
+    /// Post-install verify commands (e.g. `["runc --version", "docker info"]`).
+    /// Each entry is a shell-style command string split on whitespace.
+    /// If empty, the verify phase falls back to `systemctl is-active` for each service.
+    #[serde(default)]
+    pub verify_commands: Vec<String>,
     /// Whether KVM (`/dev/kvm`) is required.
     #[serde(default)]
     pub requires_kvm: bool,
@@ -217,6 +225,19 @@ mod tests {
     }
 
     #[test]
+    fn runc_packages_and_services() {
+        let m = SandboxManifest::parse(BUILTIN_MANIFEST).unwrap();
+        let s = m.find_scenario("runc").unwrap();
+        assert_eq!(
+            s.packages,
+            vec!["runc", "containerd", "docker", "docker-client"]
+        );
+        assert_eq!(s.packages_optional, vec!["nerdctl"]);
+        assert_eq!(s.services, vec!["containerd", "docker"]);
+        assert!(!s.requires_kvm);
+    }
+
+    #[test]
     fn gvisor_packages() {
         let m = SandboxManifest::parse(BUILTIN_MANIFEST).unwrap();
         let s = m.find_scenario("gvisor").unwrap();
@@ -242,6 +263,8 @@ mod tests {
             name: "test".to_string(),
             packages: vec![],
             packages_optional: vec![],
+            services: vec![],
+            verify_commands: vec![],
             requires_kvm: false,
             requires_kernel: ">=5.10".to_string(),
         };
