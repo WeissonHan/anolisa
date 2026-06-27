@@ -1,7 +1,7 @@
 # sandbox.toml — osbase sandbox scenario registry
 # 用户可编辑：添加/删除 scenario、修改包名、调整内核要求
 
-manifest_version = 2
+manifest_version = 3
 
 [[scenario]]
 name = "runc"

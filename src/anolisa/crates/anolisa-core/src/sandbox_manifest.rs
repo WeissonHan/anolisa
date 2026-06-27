@@ -94,18 +94,37 @@ impl SandboxManifest {
     }
 
     /// Load from explicit search paths (for testing / custom prefix).
+    ///
+    /// If a system-deployed manifest is found but has a lower
+    /// `manifest_version` than the built-in one, the built-in takes
+    /// precedence — this prevents stale `/etc/anolisa/sandbox.toml`
+    /// (from an older `system setup`) from overriding newer scenario
+    /// definitions compiled into the binary.
     pub fn load_with_search_paths(paths: &[PathBuf]) -> Result<Self, ManifestError> {
+        let builtin = Self::parse(BUILTIN_MANIFEST)?;
+
         for path in paths {
             if path.is_file() {
                 let content = std::fs::read_to_string(path).map_err(|e| ManifestError::Io {
                     path: path.clone(),
                     source: e,
                 })?;
-                return Self::parse(&content);
+                let disk = Self::parse(&content)?;
+                if disk.manifest_version >= builtin.manifest_version {
+                    return Ok(disk);
+                }
+                // Stale manifest on disk — prefer built-in.
+                eprintln!(
+                    "[osbase] warning: {} has manifest_version={} \
+                     but built-in is {}; using built-in",
+                    path.display(),
+                    disk.manifest_version,
+                    builtin.manifest_version,
+                );
+                return Ok(builtin);
             }
         }
-        // Fallback to built-in
-        Self::parse(BUILTIN_MANIFEST)
+        Ok(builtin)
     }
 
     /// Parse from TOML string.
@@ -205,7 +224,7 @@ mod tests {
     #[test]
     fn parse_builtin_manifest() {
         let m = SandboxManifest::parse(BUILTIN_MANIFEST).expect("builtin must parse");
-        assert_eq!(m.manifest_version, 2);
+        assert_eq!(m.manifest_version, 3);
         assert_eq!(m.scenarios.len(), 5);
         assert!(m.find_scenario("gvisor").is_some());
         assert!(m.find_scenario("firecracker").is_some());
