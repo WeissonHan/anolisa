@@ -3,6 +3,7 @@
 
 #![allow(dead_code, unused_imports)] // Activated by daemon API wiring.
 
+mod checkpoint;
 mod manager;
 
 pub use manager::{CreateSandbox, SandboxManager};
