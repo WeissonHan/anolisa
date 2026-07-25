@@ -9,6 +9,7 @@ mod cli;
 mod daemon;
 mod error;
 mod file_provider;
+mod guest;
 mod metrics;
 mod spawner;
 mod state;
