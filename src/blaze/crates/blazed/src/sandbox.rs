@@ -7,5 +7,6 @@ mod checkpoint;
 mod flush;
 mod hibernate;
 mod manager;
+mod template;
 
 pub use manager::{CreateSandbox, SandboxManager};
