@@ -142,6 +142,10 @@ pub struct StorageSection {
     #[serde(default = "default_images_dir")]
     pub images_dir: PathBuf,
 
+    /// Provider-owned runtime slots. This must not be the image directory.
+    #[serde(default = "default_instances_dir")]
+    pub instances_dir: PathBuf,
+
     /// Storage provider backend name (e.g. "file", "btrfs", "zfs").
     #[serde(default = "default_storage_provider")]
     pub provider: String,
@@ -160,16 +164,27 @@ pub struct StorageSection {
     /// NOTE: Reserved for future use. Not yet wired into runtime.
     #[serde(default = "default_flush_interval")]
     pub flush_interval: String,
+
+    /// Logical size of file-provider root filesystem slots.
+    #[serde(default = "default_rootfs_size")]
+    pub rootfs_size: u64,
+
+    /// Logical size of file-provider guest memory slots.
+    #[serde(default = "default_mem_size")]
+    pub mem_size: u64,
 }
 
 impl Default for StorageSection {
     fn default() -> Self {
         Self {
             images_dir: default_images_dir(),
+            instances_dir: default_instances_dir(),
             provider: default_storage_provider(),
             pool_size: 0,
             prefork: false,
             flush_interval: default_flush_interval(),
+            rootfs_size: default_rootfs_size(),
+            mem_size: default_mem_size(),
         }
     }
 }
@@ -222,11 +237,20 @@ fn default_prometheus_socket() -> PathBuf {
 fn default_images_dir() -> PathBuf {
     PathBuf::from("/var/lib/blaze/images")
 }
+fn default_instances_dir() -> PathBuf {
+    PathBuf::from("/var/lib/blaze/instances")
+}
 fn default_storage_provider() -> String {
     "file".to_string()
 }
 fn default_flush_interval() -> String {
     "30s".to_string()
+}
+fn default_rootfs_size() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+fn default_mem_size() -> u64 {
+    4 * 1024 * 1024 * 1024
 }
 
 #[cfg(test)]
@@ -239,6 +263,7 @@ mod tests {
         assert_eq!(cfg.daemon.log_level, "info");
         assert_eq!(cfg.policy.on_load_error, PolicyLoadErrorMode::Fail);
         assert!(cfg.backends.is_empty());
+        assert_ne!(cfg.storage.images_dir, cfg.storage.instances_dir);
     }
 
     #[test]
