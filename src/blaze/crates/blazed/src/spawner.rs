@@ -20,6 +20,8 @@
 
 #![allow(dead_code)]
 
+mod netns;
+
 use std::path::Path;
 use std::sync::Arc;
 
