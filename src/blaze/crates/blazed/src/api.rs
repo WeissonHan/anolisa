@@ -10,11 +10,14 @@ use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use blaze_core::backend::{BackendKind, BackendStatus, select_backend};
+use blaze_core::backend::{
+    BackendKind, BackendStatus, NetworkConfig, SpawnRequest, select_backend,
+};
 use blaze_core::kernel::HookKind;
 use blaze_core::lifecycle::{SandboxInstance, SandboxState, StartPath};
 use blaze_core::policy::{ImageMetadata, RuntimeDecision, WorkloadClass, parse_duration};
 use blaze_core::pool::{PoolConfig, PoolKey};
+use blaze_core::storage::AcquireOpts;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::CONTENT_TYPE;
@@ -309,35 +312,55 @@ async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Respon
     //    The daemon picks LinuxSandboxSpawner when the configured
     //    backend binary exists; otherwise MockSpawner keeps the daemon
     //    usable on macOS dev hosts and in CI.
-    let binary_path = {
+    let (binary_path, rootfs_size, mem_size) = {
         let cfg = state
             .config
             .lock()
             .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()))?;
-        cfg.backends
-            .get(state.active_backend.as_str())
-            .cloned()
-            .unwrap_or_else(std::path::PathBuf::new)
+        (
+            cfg.backends
+                .get(state.active_backend.as_str())
+                .cloned()
+                .unwrap_or_else(std::path::PathBuf::new),
+            cfg.storage.rootfs_size,
+            cfg.storage.mem_size,
+        )
     };
+    let storage = state
+        .storage
+        .acquire(&AcquireOpts {
+            instance_id: instance.id.to_string(),
+            rootfs_size,
+            mem_size,
+        })
+        .await?;
     let work_dir = state.state_dir.join(instance.id.to_string());
     let spawner = state.spawner.clone();
     let actual_backend = match spawner
-        .spawn(
-            &instance,
-            &binary_path,
-            &work_dir,
-            &decision.backend,
-            decision.vm.as_ref(),
-        )
+        .spawn(SpawnRequest {
+            instance_id: instance.id,
+            run_dir: work_dir,
+            binary_path,
+            storage: storage.clone(),
+            backend: decision.backend.clone(),
+            vm: decision.vm.clone(),
+            network: decision
+                .backend
+                .firecracker
+                .as_ref()
+                .map(|config| NetworkConfig {
+                    enabled: config.enable_network,
+                    interface_id: "eth0".to_string(),
+                }),
+        })
         .await
     {
-        Ok(handle) => {
-            let real_backend = handle.backend;
-            let mut handles = state
-                .spawn_handles
-                .lock()
-                .map_err(|_| BlazeDaemonError::Internal("spawn_handles lock poisoned".into()))?;
-            handles.insert(instance.id, handle);
+        Ok(backend_instance) => {
+            let real_backend = backend_instance.backend();
+            let mut instances = state.backend_instances.lock().map_err(|_| {
+                BlazeDaemonError::Internal("backend_instances lock poisoned".into())
+            })?;
+            instances.insert(instance.id, backend_instance);
             real_backend
         }
         Err(err) => {
@@ -346,6 +369,13 @@ async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Respon
             tracing::error!(instance = %instance.id, ?err, "spawn failed, marking destroyed");
             let _ = instance.transition(SandboxState::Destroyed);
             instance.persist(&state.state_dir)?;
+            if let Err(release_error) = state.storage.release(storage).await {
+                tracing::warn!(
+                    instance = %instance.id,
+                    ?release_error,
+                    "storage cleanup after spawn failure failed"
+                );
+            }
             state.metrics.inc(&state.metrics.instances_destroyed);
             return Err(err.into());
         }
@@ -429,7 +459,7 @@ fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<By
 fn destroy_instance_state(
     state: &Arc<ServerState>,
     uuid: Uuid,
-) -> Result<(SandboxInstance, Option<crate::spawner::SpawnHandle>)> {
+) -> Result<(SandboxInstance, Option<crate::spawner::DynBackendInstance>)> {
     let mut map = state
         .instances
         .lock()
@@ -441,23 +471,26 @@ fn destroy_instance_state(
     inst.persist(&state.state_dir)?;
     let snapshot = inst.clone();
     drop(map);
-    let handle = {
-        let mut handles = state
-            .spawn_handles
+    let backend = {
+        let mut instances = state
+            .backend_instances
             .lock()
-            .map_err(|_| BlazeDaemonError::Internal("spawn_handles lock poisoned".into()))?;
-        handles.remove(&uuid)
+            .map_err(|_| BlazeDaemonError::Internal("backend_instances lock poisoned".into()))?;
+        instances.remove(&uuid)
     };
-    Ok((snapshot, handle))
+    Ok((snapshot, backend))
 }
 
 async fn destroy_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
     let uuid = parse_uuid(id)?;
-    let (inst, handle) = destroy_instance_state(state, uuid)?;
-    if let Some(handle) = handle
-        && let Err(err) = state.spawner.kill(&handle).await
+    let (inst, backend) = destroy_instance_state(state, uuid)?;
+    if let Some(backend) = backend
+        && let Err(err) = backend.kill().await
     {
-        tracing::warn!(instance = %uuid, ?err, "spawner.kill failed (non-fatal)");
+        tracing::warn!(instance = %uuid, ?err, "backend kill failed (non-fatal)");
+    }
+    if let Err(err) = state.storage.release_by_id(&uuid.to_string()).await {
+        tracing::warn!(instance = %uuid, ?err, "storage release failed (non-fatal)");
     }
     state.metrics.inc(&state.metrics.instances_destroyed);
     json_ok(&json!({
