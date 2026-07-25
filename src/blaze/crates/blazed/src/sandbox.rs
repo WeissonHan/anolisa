@@ -4,6 +4,7 @@
 #![allow(dead_code, unused_imports)] // Activated by daemon API wiring.
 
 mod checkpoint;
+mod flush;
 mod hibernate;
 mod manager;
 
