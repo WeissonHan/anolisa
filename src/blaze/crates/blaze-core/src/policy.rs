@@ -184,17 +184,36 @@ impl PolicyFile {
             });
         }
 
-        // Validate [pool].warm_ttl format (e.g. "30s", "30m", "1h", "1d"; pure numbers are illegal).
-        if let Some(pool) = self.pool.as_ref()
-            && parse_duration(&pool.warm_ttl).is_none()
-        {
-            return Err(BlazeError::PolicyEvalError {
-                reason: format!(
-                    "policy \"{policy_name}\": [pool].warm_ttl must be a duration like \"30s\", \"30m\", \"1h\", \"1d\", got \"{warm_ttl}\"",
-                    policy_name = self.policy_name,
-                    warm_ttl = pool.warm_ttl
-                ),
-            });
+        if let Some(pool) = self.pool.as_ref() {
+            if parse_duration(&pool.warm_ttl).is_none() {
+                return Err(BlazeError::PolicyEvalError {
+                    reason: format!(
+                        "policy \"{policy_name}\": [pool].warm_ttl must be a duration like \"30s\", \"30m\", \"1h\", \"1d\", got \"{warm_ttl}\"",
+                        policy_name = self.policy_name,
+                        warm_ttl = pool.warm_ttl
+                    ),
+                });
+            }
+            if pool.enabled && pool.min > pool.target {
+                return Err(BlazeError::PolicyEvalError {
+                    reason: format!(
+                        "policy \"{policy_name}\": [pool] requires min <= target, got min={min}, target={target}",
+                        policy_name = self.policy_name,
+                        min = pool.min,
+                        target = pool.target
+                    ),
+                });
+            }
+            if pool.enabled && pool.max > 0 && pool.target > pool.max {
+                return Err(BlazeError::PolicyEvalError {
+                    reason: format!(
+                        "policy \"{policy_name}\": [pool] requires target <= max when max is non-zero, got target={target}, max={max}",
+                        policy_name = self.policy_name,
+                        target = pool.target,
+                        max = pool.max
+                    ),
+                });
+            }
         }
 
         Ok(())
@@ -1094,6 +1113,95 @@ warm_ttl = "300"
 "#;
         let pf: PolicyFile = toml::from_str(raw).expect("parse");
         assert!(pf.validate().is_err());
+    }
+
+    #[test]
+    fn validate_pool_size_boundaries() {
+        let valid_equal = r#"
+manifest_version = 1
+policy_name = "pool-equal"
+
+[match]
+workload_class = "agent-tool"
+
+[select]
+backend_priority = ["firecracker"]
+
+[pool]
+enabled = true
+min = 3
+target = 3
+max = 3
+warm_ttl = "30m"
+"#;
+        toml::from_str::<PolicyFile>(valid_equal)
+            .expect("parse equal boundaries")
+            .validate()
+            .expect("equal pool boundaries should be valid");
+
+        let valid_unbounded = valid_equal
+            .replace(
+                "policy_name = \"pool-equal\"",
+                "policy_name = \"pool-unbounded\"",
+            )
+            .replace(
+                "min = 3\ntarget = 3\nmax = 3",
+                "min = 1\ntarget = 3\nmax = 0",
+            );
+        toml::from_str::<PolicyFile>(&valid_unbounded)
+            .expect("parse unbounded max")
+            .validate()
+            .expect("max=0 should remain the documented unbounded value");
+    }
+
+    #[test]
+    fn validate_rejects_pool_min_above_target() {
+        let raw = r#"
+manifest_version = 1
+policy_name = "pool-min-above-target"
+
+[match]
+workload_class = "agent-tool"
+
+[select]
+backend_priority = ["firecracker"]
+
+[pool]
+enabled = true
+min = 3
+target = 2
+max = 4
+warm_ttl = "30m"
+"#;
+        let policy = toml::from_str::<PolicyFile>(raw).expect("parse");
+        let error = policy.validate().expect_err("min above target must fail");
+        assert!(error.to_string().contains("min <= target"));
+    }
+
+    #[test]
+    fn validate_rejects_pool_target_above_bounded_max() {
+        let raw = r#"
+manifest_version = 1
+policy_name = "pool-target-above-max"
+
+[match]
+workload_class = "agent-tool"
+
+[select]
+backend_priority = ["firecracker"]
+
+[pool]
+enabled = true
+min = 1
+target = 5
+max = 4
+warm_ttl = "30m"
+"#;
+        let policy = toml::from_str::<PolicyFile>(raw).expect("parse");
+        let error = policy
+            .validate()
+            .expect_err("target above bounded max must fail");
+        assert!(error.to_string().contains("target <= max"));
     }
 
     #[test]

@@ -89,10 +89,10 @@ rootfs_size = 8589934592
 mem_size = 4294967296
 
 # Number of pre-warmed storage slots to keep ready in the pool.
-# pool_size = 0           # [Reserved] Warm pool slots (not yet active)
+pool_size = 0
 
-# Whether to prefork (pre-allocate) storage slots at daemon startup.
-# prefork = false         # [Reserved] Pre-start VMs in pool (not yet active)
+# Pre-start and pause a backend in each warm slot.
+prefork = false
 
 # Interval between flush-dirty sweeps.
 # flush_interval = "30s"   # [Reserved] Dirty data flush period (not yet active)
