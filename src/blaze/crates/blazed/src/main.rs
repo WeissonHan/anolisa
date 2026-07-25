@@ -8,6 +8,11 @@ mod api;
 mod cli;
 mod daemon;
 mod error;
+#[cfg(feature = "test-failpoints")]
+mod failpoint;
+#[cfg(not(feature = "test-failpoints"))]
+#[path = "failpoint_disabled.rs"]
+mod failpoint;
 mod file_provider;
 mod guest;
 mod metrics;
