@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Daemon runtime: bind UDS, accept connections, wire signal handlers.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,11 +9,8 @@ use blaze_core::backend::BackendKind;
 use blaze_core::config::{DaemonConfig, PolicyLoadErrorMode};
 use blaze_core::kernel::HookRegistry;
 use blaze_core::policy::PolicyEngine;
-use blaze_core::pool::PoolManager;
 use blaze_core::storage::StorageProvider;
 use blaze_core::template::TemplateRegistry;
-use http_body_util::Full;
-use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -30,11 +28,17 @@ use crate::state::ServerState;
 /// bind the API socket, and run the accept loop until SIGTERM/SIGINT.
 pub async fn run(config_path: &Path) -> Result<()> {
     let config = DaemonConfig::load(config_path)?;
+    let flush_interval = blaze_core::policy::parse_duration(&config.storage.flush_interval)
+        .ok_or_else(|| {
+            BlazeDaemonError::Internal(
+                "validated storage.flush_interval could not be parsed".to_string(),
+            )
+        })?;
+    crate::failpoint::announce();
     tracing::info!(?config_path, "loaded daemon config");
 
     ensure_dirs(&config)?;
     let policy = load_policy_engine(&config)?;
-    let pool = PoolManager::new();
     let template = TemplateRegistry::new();
     let hook = HookRegistry::new();
     let (spawner, active_backend) = build_spawner(&config).await;
@@ -71,13 +75,16 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let state = Arc::new(ServerState::build(
         config,
         policy,
-        pool,
         template,
         hook,
         spawner,
         active_backend,
         storage,
-    ));
+    )?);
+    let reconciled = state.manager.reconcile_orphans().await?;
+    if reconciled > 0 {
+        tracing::warn!(reconciled, "cleaned orphan backend resources at startup");
+    }
 
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
@@ -86,10 +93,15 @@ pub async fn run(config_path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let listener = UnixListener::bind(&socket_path)?;
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))?;
     tracing::info!(socket = %socket_path.display(), "blaze UDS API listening");
 
     // Optional TCP listener for remote platform API
     let tcp_listener = if !http_addr.is_empty() {
+        tracing::warn!(
+            addr = %http_addr,
+            "TCP API has no built-in authentication or TLS; expose it only on a trusted network"
+        );
         let tcp = TcpListener::bind(&http_addr)
             .await
             .map_err(|e| BlazeDaemonError::Internal(format!("bind TCP {http_addr}: {e}")))?;
@@ -99,7 +111,33 @@ pub async fn run(config_path: &Path) -> Result<()> {
         None
     };
 
-    serve(listener, tcp_listener, state).await
+    let flush_task = state.manager.start_flush_loop(flush_interval);
+    let mut result = serve(listener, tcp_listener, state.clone()).await;
+    if let Err(error) = state.manager.stop_flush_loop(flush_task).await {
+        tracing::error!(%error, "provider flush task shutdown failed");
+        if result.is_ok() {
+            result = Err(error);
+        }
+    }
+    if let Err(error) = state.manager.shutdown().await {
+        tracing::error!(%error, "sandbox manager shutdown failed");
+        if result.is_ok() {
+            result = Err(error);
+        }
+    }
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => {
+            tracing::info!(socket = %socket_path.display(), "removed blaze UDS API socket");
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::error!(%error, socket = %socket_path.display(), "failed to remove blaze UDS API socket");
+            if result.is_ok() {
+                result = Err(error.into());
+            }
+        }
+    }
+    result
 }
 
 fn ensure_dirs(cfg: &DaemonConfig) -> Result<()> {
@@ -269,7 +307,6 @@ where
         if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
             tracing::debug!(?err, "connection closed with error");
         }
-        let _: Option<Full<Bytes>> = None;
     });
 }
 

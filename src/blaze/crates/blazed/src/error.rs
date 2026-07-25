@@ -11,7 +11,6 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, BlazeDaemonError>;
 
-#[allow(dead_code)] // All variants become reachable through the management API.
 #[derive(Debug, Error)]
 pub enum BlazeDaemonError {
     #[error("core error: {0}")]
@@ -90,7 +89,6 @@ impl BlazeDaemonError {
     }
 
     /// Stable machine-readable API error code.
-    #[allow(dead_code)] // Used by structured API responses after manager wiring.
     pub fn code(&self) -> &'static str {
         match self {
             BlazeDaemonError::BadRequest(_) => "invalid_request",

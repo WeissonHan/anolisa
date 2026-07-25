@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! No-op hooks used when daemon verification support is disabled.
 
-#![allow(dead_code)] // Call sites land with their owning lifecycle commits.
-
 /// Keep daemon startup independent from verification-only configuration.
 pub(crate) fn announce() {}
 

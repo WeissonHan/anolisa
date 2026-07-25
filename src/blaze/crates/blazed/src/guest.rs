@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Firecracker-vsock guest agent client.
 
-#![allow(dead_code, unused_imports)] // Activated by sandbox-manager API wiring.
-
 pub mod client;
 
 pub use client::{GuestClient, GuestExecResult};
