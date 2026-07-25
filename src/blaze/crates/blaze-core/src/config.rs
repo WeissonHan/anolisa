@@ -154,17 +154,14 @@ pub struct StorageSection {
     pub provider: String,
 
     /// Warm pool target size (0 = no pool).
-    /// NOTE: Reserved for future use. Not yet wired into runtime.
     #[serde(default)]
     pub pool_size: usize,
 
     /// Whether to pre-start VMs in pool slots.
-    /// NOTE: Reserved for future use. Not yet wired into runtime.
     #[serde(default)]
     pub prefork: bool,
 
     /// Interval for flushing dirty data.
-    /// NOTE: Reserved for future use. Not yet wired into runtime.
     #[serde(default = "default_flush_interval")]
     pub flush_interval: String,
 
@@ -226,7 +223,8 @@ impl DaemonConfig {
         Ok(cfg)
     }
 
-    /// Reject configurations that make lifecycle operations unsafe or timers invalid.
+    /// Reject configurations that would make lifecycle operations unsafe or
+    /// cause Tokio timers to panic.
     pub fn validate(&self) -> Result<()> {
         let images = &self.storage.images_dir;
         let instances = &self.storage.instances_dir;

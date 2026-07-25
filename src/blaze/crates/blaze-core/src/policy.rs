@@ -94,8 +94,9 @@ pub enum ResetMode {
 }
 
 /// Checkpoint strategy selection.
-/// NOTE(Phase 3): v0.1 stores strategy in policy config but does NOT invoke
-/// kernel syscalls. Real checkpoint/restore via UFFD-WP deferred to Phase 3.
+///
+/// v0.1 stores this strategy in policy config but does not invoke kernel
+/// checkpoint interfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CheckpointStrategy {
@@ -185,6 +186,8 @@ impl PolicyFile {
         }
 
         if let Some(pool) = self.pool.as_ref() {
+            // Validate [pool].warm_ttl format (e.g. "30s", "30m", "1h", "1d";
+            // pure numbers are illegal).
             if parse_duration(&pool.warm_ttl).is_none() {
                 return Err(BlazeError::PolicyEvalError {
                     reason: format!(
@@ -204,6 +207,7 @@ impl PolicyFile {
                     ),
                 });
             }
+            // max=0 is the documented unbounded value.
             if pool.enabled && pool.max > 0 && pool.target > pool.max {
                 return Err(BlazeError::PolicyEvalError {
                     reason: format!(
@@ -734,9 +738,9 @@ fn backend_has_vm_override(policy: &PolicyFile, kind: BackendKind) -> bool {
             .as_ref()
             .map(|fc| fc.vcpus.is_some() || fc.memory.is_some())
             .unwrap_or(false),
-        // Phase 1: only Firecracker has a [backend.*] override section. Other
-        // VM-class backends always return false here so users are not warned
-        // about a missing override they cannot yet provide.
+        // Only Firecracker currently has a [backend.*] override section.
+        // Other VM-class backends return false so users are not warned about
+        // a missing override they cannot provide.
         _ => false,
     }
 }

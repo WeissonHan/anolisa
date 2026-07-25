@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! # Kernel Coordinator (v0.1: state-only stub)
 //!
-//! v0.1 maintains only a hook state machine; it does NOT push syscalls to `/proc/anolisa/...`.
-//! Phase 3 will integrate real kernel interfaces (mm-template register, UFFD-WP activate, etc.).
+//! v0.1 maintains only a hook state machine and does not issue kernel commands.
 //!
 //! ## Concurrency model
 //!
@@ -11,10 +10,9 @@
 //!
 //! Kernel hook registry.
 //!
-//! v0.1: state-only stub. The registry tracks per-hook activation but
-//! does **not** push commands to `/proc/anolisa/...`; that lands in
-//! Phase 3. Each hook kind is single-tenant: at most one instance can
-//! own activation at a time (the per-hook mutex requirement).
+//! v0.1: state-only stub. The registry tracks per-hook activation but does not
+//! issue kernel commands. Each hook kind is single-tenant: at most one instance
+//! can own activation at a time (the per-hook mutex requirement).
 
 use std::collections::HashMap;
 use std::fmt;
