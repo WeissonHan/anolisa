@@ -88,12 +88,29 @@ provider = "file"       # Storage provider selection. Currently supported: "file
                         # "auto" probes available providers in priority order (currently equivalent to "file").
                         # Other values will log a warning and fall back to file.
 images_dir = "/var/lib/blaze/images"
+instances_dir = "/var/lib/blaze/instances"
 # pool_size = 0           # [Reserved] Warm pool slots (not yet active)
 # prefork = false         # [Reserved] Pre-start VMs in pool (not yet active)
 # flush_interval = "30s"  # [Reserved] Dirty data flush period (not yet active)
 ```
 
-The `file` provider uses standard filesystem operations for sandbox storage. The `auto` provider probes available backends in priority order (currently equivalent to `file`). Unrecognized values will log a warning and fall back to `file`.
+The `file` provider gives each instance independent root filesystem and memory
+files. `images_dir` and `instances_dir` must be disjoint; equal or nested paths
+are rejected. Independent copies use more capacity and add create latency, but
+remain valid without another instance's files. The `StorageProvider` interface
+allows other implementations to optimize this tradeoff. The `auto` provider
+currently resolves to `file`; unrecognized values log a warning and fall back
+to it.
+
+### Backend Host Requirements
+
+Firecracker requires Linux, root privileges, and the `ip` and `unshare`
+executables. When a policy enables VM networking, Blaze creates a dedicated
+namespace and link pair. Host routing, forwarding policy, DNS, and upstream
+connectivity remain operator-managed.
+
+See [Runtime Foundations](docs/design/runtime-foundations.md) for process
+ownership, storage, networking, and recovery behavior.
 
 ## API Endpoints
 
@@ -148,4 +165,3 @@ src/blaze/
 - Linux host with root privileges for sandbox backends
 
 ## License
-

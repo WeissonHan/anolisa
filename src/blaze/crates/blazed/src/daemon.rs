@@ -125,9 +125,7 @@ fn ensure_dirs(cfg: &DaemonConfig) -> Result<()> {
 async fn build_spawner(cfg: &DaemonConfig) -> (DynSpawner, BackendKind) {
     // --- Firecracker --------------------------------------------------------
     if let Some(fc_path) = cfg.backends.get(BackendKind::Firecracker.as_str()).cloned() {
-        let fc = FirecrackerSpawner {
-            images_dir: cfg.storage.images_dir.clone(),
-        };
+        let fc = FirecrackerSpawner::new(cfg.storage.images_dir.clone());
         match fc.probe(&fc_path).await {
             Ok(true) => {
                 tracing::info!(
