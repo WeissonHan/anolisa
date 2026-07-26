@@ -119,6 +119,19 @@ impl PoolManager {
         }
     }
 
+    /// Restore a claimed warm instance after activation fails.
+    ///
+    /// This bypasses capacity eviction because the instance already occupied
+    /// the slot before [`Self::lookup`] removed it.
+    pub fn restore_lookup(&mut self, key: PoolKey, instance_id: Uuid) {
+        let bucket = self.pools.entry(key.clone()).or_default();
+        if !bucket.warm.contains(&instance_id) {
+            bucket.warm.push_front(instance_id);
+        }
+        bucket.stats.warm_count = bucket.warm.len() as u32;
+        tracing::warn!(?key, %instance_id, "restored failed pool activation");
+    }
+
     /// Push an instance back into its pool after reset.
     pub fn return_to_pool(&mut self, key: PoolKey, instance_id: Uuid) {
         let bucket = self.pools.entry(key.clone()).or_default();
@@ -240,5 +253,21 @@ mod tests {
         mgr.return_to_pool(key(), Uuid::new_v4());
         let listed = mgr.list_pools();
         assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn failed_activation_restores_claim_ahead_of_new_entries() {
+        let mut mgr = PoolManager::new();
+        let claimed = Uuid::new_v4();
+        let later = Uuid::new_v4();
+        mgr.return_to_pool(key(), claimed);
+        assert_eq!(mgr.lookup(&key()), Some(claimed));
+        mgr.return_to_pool(key(), later);
+
+        mgr.restore_lookup(key(), claimed);
+
+        assert_eq!(mgr.stats(&key()).warm_count, 2);
+        assert_eq!(mgr.lookup(&key()), Some(claimed));
+        assert_eq!(mgr.lookup(&key()), Some(later));
     }
 }

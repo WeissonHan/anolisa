@@ -87,12 +87,26 @@ provider = "file"       # 存储 provider 选择。当前支持："file"、"auto
                         # "auto" 按优先级探测可用 provider（当前等同于 "file"）。
                         # 其他值将记录告警并回退到 file。
 images_dir = "/var/lib/blaze/images"
+instances_dir = "/var/lib/blaze/instances"
 # pool_size = 0           # [Reserved] 预热存储槽位数（尚未启用）
 # prefork = false         # [Reserved] 是否在槽位中预启动 VM（尚未启用）
 # flush_interval = "30s"  # [Reserved] 脏数据刷盘周期（尚未启用）
 ```
 
-`file` provider 使用标准文件系统操作管理 sandbox 存储。`auto` 按优先级探测可用 provider（当前等同于 `file`）。无法识别的值将记录告警并回退到 `file`。
+`file` provider 为每个实例提供独立的 root filesystem 和 memory 文件。
+`images_dir` 与 `instances_dir` 必须互不重叠；相同或互为父子目录的路径会被
+拒绝。独立副本会使用更多容量并增加 create 延迟，但不依赖其他实例文件也能
+保持有效。`StorageProvider` interface 允许其他实现优化这一取舍。`auto`
+当前等同于 `file`；无法识别的值会记录告警并回退到它。
+
+### 后端主机要求
+
+Firecracker 需要 Linux、root 权限以及 `ip`、`unshare` 可执行文件。policy
+启用 VM 网络后，Blaze 会创建独立 namespace 和 link pair。主机路由、转发
+策略、DNS 和上游连通性由运维人员管理。
+
+进程持有、存储、网络与恢复行为详见
+[Runtime 基础设计](docs/design/runtime-foundations_zh.md)。
 
 ## API 端点
 

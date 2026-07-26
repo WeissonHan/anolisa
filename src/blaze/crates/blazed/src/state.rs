@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::metrics::Metrics;
-use crate::spawner::{DynSpawner, SpawnHandle};
+use crate::spawner::{DynBackendInstance, DynSpawner};
 
 /// All daemon mutable state. Cloning is via `Arc` (see the `state.clone()`
 /// idiom in `daemon.rs`); the struct itself is never `Clone`.
@@ -32,7 +32,7 @@ pub struct ServerState {
     pub template: Mutex<TemplateRegistry>,
     pub hook: Mutex<HookRegistry>,
     pub instances: Mutex<HashMap<Uuid, SandboxInstance>>,
-    pub spawn_handles: Mutex<HashMap<Uuid, SpawnHandle>>,
+    pub backend_instances: Mutex<HashMap<Uuid, DynBackendInstance>>,
     pub spawner: DynSpawner,
     /// The backend kind that `build_spawner` actually probed and selected.
     /// API handlers use this to constrain availability to the single active
@@ -71,7 +71,7 @@ impl ServerState {
             template: Mutex::new(template),
             hook: Mutex::new(hook),
             instances: Mutex::new(instances),
-            spawn_handles: Mutex::new(HashMap::new()),
+            backend_instances: Mutex::new(HashMap::new()),
             spawner,
             active_backend,
             storage,
