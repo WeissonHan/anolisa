@@ -17,7 +17,10 @@ use async_trait::async_trait;
 use blaze_core::backend::{
     BackendKind, FlushResult, RestoreRequest, SnapshotRequest, SnapshotResult, SpawnRequest,
 };
+use blaze_core::guest_protocol::DEFAULT_MAX_RESPONSE_BYTES;
 use blaze_core::{BlazeError, Result};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -323,6 +326,11 @@ async fn spawn_mock_instance(
     restore_memory: Option<PathBuf>,
 ) -> Result<DynBackendInstance> {
     tokio::fs::create_dir_all(&run_dir).await?;
+    let socket = run_dir.join("vsock.uds");
+    if socket.exists() {
+        tokio::fs::remove_file(&socket).await?;
+    }
+    let listener = UnixListener::bind(&socket)?;
     let cancellation = CancellationToken::new();
     let task_token = cancellation.clone();
     let restored_files = match restore_memory {
@@ -335,10 +343,28 @@ async fn spawn_mock_instance(
         _ => HashMap::new(),
     };
     let files = Arc::new(Mutex::new(restored_files));
-    let task = tokio::spawn(async move { task_token.cancelled().await });
+    let task_files = files.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = task_token.cancelled() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else {
+                        break;
+                    };
+                    let files = task_files.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = serve_mock_guest(stream, files).await {
+                            tracing::debug!(%error, "mock guest connection ended");
+                        }
+                    });
+                }
+            }
+        }
+    });
     Ok(Arc::new(MockInstance {
         instance_id,
-        guest_socket_path: PathBuf::new(),
+        guest_socket_path: socket,
         cancellation,
         task: Mutex::new(Some(task)),
         files,
@@ -431,9 +457,95 @@ impl BackendInstance for MockInstance {
         if let Some(task) = task.take() {
             let _ = task.await;
         }
+        if self.guest_socket_path.exists() {
+            tokio::fs::remove_file(&self.guest_socket_path).await?;
+        }
         self.killed.store(true, Ordering::Release);
         Ok(())
     }
+}
+
+async fn serve_mock_guest(
+    mut stream: tokio::net::UnixStream,
+    files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+) -> std::io::Result<()> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let connect = read_mock_line(&mut stream, 128).await?;
+    if !connect.starts_with(b"CONNECT ") {
+        return Ok(());
+    }
+    stream.write_all(b"OK 5000\n").await?;
+    let request = read_mock_line(&mut stream, DEFAULT_MAX_RESPONSE_BYTES).await?;
+    let request: serde_json::Value = match serde_json::from_slice(&request) {
+        Ok(request) => request,
+        Err(_) => return Ok(()),
+    };
+    let id = request.get("id").cloned().unwrap_or_default();
+    let response = match request.get("op").and_then(serde_json::Value::as_str) {
+        Some("exec") => {
+            let command = request
+                .get("cmd")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            serde_json::json!({
+                "id": id,
+                "ok": true,
+                "rc": 0,
+                "stdout_b64": BASE64.encode(command.as_bytes()),
+                "stderr_b64": ""
+            })
+        }
+        Some("read") => {
+            let path = request
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let data = files.lock().await.get(path).cloned().unwrap_or_default();
+            serde_json::json!({"id": id, "ok": true, "data_b64": BASE64.encode(data)})
+        }
+        Some("write") => {
+            let path = request
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let data = request
+                .get("data_b64")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|encoded| BASE64.decode(encoded).ok())
+                .unwrap_or_default();
+            files.lock().await.insert(path, data);
+            serde_json::json!({"id": id, "ok": true})
+        }
+        _ => serde_json::json!({"id": id, "ok": true}),
+    };
+    let mut encoded = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
+    encoded.push(b'\n');
+    stream.write_all(&encoded).await
+}
+
+async fn read_mock_line<R>(stream: &mut R, limit: usize) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream).take(limit.saturating_add(1) as u64);
+    let mut output = Vec::with_capacity(limit.min(8192));
+    reader.read_until(b'\n', &mut output).await?;
+    if output.last() == Some(&b'\n') {
+        output.pop();
+        if output.len() <= limit {
+            return Ok(output);
+        }
+    }
+    if output.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mock guest line too long",
+        ));
+    }
+    Ok(output)
 }
 
 pub(super) async fn terminate_child(child: &mut Child, backend: &str) -> Result<()> {
@@ -619,6 +731,8 @@ mod tests {
     use blaze_core::policy::BackendConfigs;
     use blaze_core::storage::StorageSlot;
 
+    use crate::guest::GuestClient;
+
     use super::*;
 
     fn request(root: &Path) -> SpawnRequest {
@@ -643,12 +757,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_instance_supports_snapshot_and_idempotent_kill() {
+    async fn mock_instance_supports_guest_io_snapshot_and_idempotent_kill() {
         let temp = tempfile::tempdir().expect("temp");
         let instance = MockSpawner
             .spawn(request(temp.path()))
             .await
             .expect("spawn");
+        let client = GuestClient::new(
+            instance.guest_socket_path().to_path_buf(),
+            Duration::from_secs(1),
+            1024,
+        );
+        client
+            .write_file("/tmp/value".into(), b"hello")
+            .await
+            .expect("write");
+        assert_eq!(
+            client.read_file("/tmp/value".into()).await.expect("read"),
+            b"hello"
+        );
         let snapshot = temp.path().join("vmstate.snap");
         let memory = temp.path().join("mem.diff");
         instance
