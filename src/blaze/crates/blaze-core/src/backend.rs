@@ -2,11 +2,15 @@
 //! Sandbox backend kinds + selection / fallback.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::error::{BlazeError, Result};
+use crate::policy::{BackendConfigs, VmConfig};
+use crate::storage::StorageSlot;
 
 /// All backends that blaze v0.1 knows about. Each backend maps to a
 /// binary path configured in the daemon `[backends]` section.
@@ -80,6 +84,101 @@ impl FromStr for BackendKind {
     }
 }
 
+/// Optional per-sandbox network requested from a backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// Whether the backend should create an isolated network namespace.
+    pub enabled: bool,
+    /// Firecracker snapshot interface identifier.
+    #[serde(default = "default_interface_id")]
+    pub interface_id: String,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interface_id: default_interface_id(),
+        }
+    }
+}
+
+/// Default Firecracker interface identifier used by policies and snapshots.
+pub fn default_interface_id() -> String {
+    "eth0".to_string()
+}
+
+/// Complete input for starting a backend instance.
+#[derive(Debug, Clone)]
+pub struct SpawnRequest {
+    /// Stable sandbox identifier.
+    pub instance_id: Uuid,
+    /// Provider-owned runtime directory.
+    pub run_dir: PathBuf,
+    /// Backend executable selected during daemon startup.
+    pub binary_path: PathBuf,
+    /// Storage resources owned by this sandbox.
+    pub storage: StorageSlot,
+    /// Backend-specific policy configuration.
+    pub backend: BackendConfigs,
+    /// Generic VM resource configuration.
+    pub vm: Option<VmConfig>,
+    /// Optional isolated network.
+    pub network: Option<NetworkConfig>,
+}
+
+/// Complete input for restoring a backend from snapshot artifacts.
+#[derive(Debug, Clone)]
+pub struct RestoreRequest {
+    /// Common spawn resources and configuration.
+    pub spawn: SpawnRequest,
+    /// Firecracker VM-state snapshot.
+    pub snapshot_path: PathBuf,
+    /// Memory backend or diff used during restore.
+    pub mem_path: PathBuf,
+    /// Whether Firecracker should track pages dirtied after restore.
+    pub track_dirty: bool,
+}
+
+/// Snapshot flavor requested from a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotKind {
+    /// Self-contained VM and memory snapshot.
+    Full,
+    /// Difference relative to the configured base memory.
+    Diff,
+}
+
+/// Paths and semantics for one snapshot operation.
+#[derive(Debug, Clone)]
+pub struct SnapshotRequest {
+    /// Destination for VM state.
+    pub snapshot_path: PathBuf,
+    /// Destination for guest memory.
+    pub mem_path: PathBuf,
+    /// Snapshot flavor.
+    pub kind: SnapshotKind,
+}
+
+/// Backend-reported snapshot artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotResult {
+    /// Written VM-state path.
+    pub snapshot_path: PathBuf,
+    /// Written memory path.
+    pub mem_path: PathBuf,
+}
+
+/// Result of a backend-specific dirty-data flush.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushResult {
+    /// Pages persisted by the backend.
+    pub flushed_pages: u64,
+    /// Backend-reported operation duration.
+    pub duration_us: u64,
+}
+
 /// Probed availability of a single backend on this host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendStatus {
@@ -122,6 +221,29 @@ pub fn select_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_contracts_keep_stable_wire_defaults() {
+        let network: NetworkConfig =
+            serde_json::from_value(serde_json::json!({"enabled": true})).expect("network config");
+        assert_eq!(network.interface_id, "eth0");
+        assert_eq!(
+            serde_json::to_value(SnapshotKind::Full).expect("snapshot kind"),
+            serde_json::json!("full")
+        );
+
+        let flush = FlushResult {
+            flushed_pages: 17,
+            duration_us: 23,
+        };
+        assert_eq!(
+            serde_json::from_value::<FlushResult>(
+                serde_json::to_value(flush).expect("serialize flush result")
+            )
+            .expect("deserialize flush result"),
+            flush
+        );
+    }
 
     #[test]
     fn round_trip_str() {
