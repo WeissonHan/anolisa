@@ -358,9 +358,12 @@ pub struct FirecrackerConfig {
     /// Guest kernel command line.
     #[serde(default = "default_fc_boot_args")]
     pub boot_args: String,
-    /// Enable virtio-vsock (Phase 2+; parsed today but not yet wired).
+    /// Enable virtio-vsock and the guest-agent data plane.
     #[serde(default)]
     pub enable_vsock: bool,
+    /// Create an isolated network namespace, veth uplink, tap, and NAT.
+    #[serde(default)]
+    pub enable_network: bool,
     /// Capture guest ttyS0 output (Firecracker stdout) to `serial.log`.
     #[serde(default)]
     pub serial_log: bool,
@@ -377,6 +380,7 @@ impl Default for FirecrackerConfig {
         Self {
             boot_args: default_fc_boot_args(),
             enable_vsock: false,
+            enable_network: false,
             serial_log: false,
             vcpus: None,
             memory: None,

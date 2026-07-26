@@ -40,7 +40,7 @@ workload_class = "agent-rl"
 backend_priority = ["firecracker", "bubblewrap"]
 
 # Kernel hooks to activate for this workload class.
-# Available hooks (Phase 2+): "mm-template", "uffd-wp".
+# Available hooks: "mm-template", "uffd-wp".
 # Empty list means no kernel hooks.  Default: [].
 kernel_hooks = []
 
@@ -117,11 +117,12 @@ memory = "4G"
 # ---------------------------------------------------------------------------
 [backend.firecracker]
 boot_args = "console=ttyS0 reboot=k panic=1 pci=off"
-enable_vsock = true   # parsed but not yet wired (Phase 2+)
+enable_vsock = true   # exposes the guest agent through Firecracker's vsock proxy
+enable_network = false # opt in to a per-sandbox netns, tap, veth, and NAT
 serial_log = false
 
 # ---------------------------------------------------------------------------
-# Lifecycle hook sequences (Phase 3 — not yet active in v0.1).
+# Lifecycle hook sequences (not yet active in v0.1).
 # Each hook is a string of format "<provider>:<action>".
 # ---------------------------------------------------------------------------
 # [hooks.on_create]
