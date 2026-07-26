@@ -16,6 +16,7 @@ mod failpoint;
 mod file_provider;
 mod guest;
 mod metrics;
+mod runtime_pool;
 mod spawner;
 mod state;
 
