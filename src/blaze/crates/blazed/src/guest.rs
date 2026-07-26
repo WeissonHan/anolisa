@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Firecracker-vsock guest agent client.
 
-#[allow(dead_code)] // The lifecycle layer owns the client in the next stacked change.
 pub mod client;
 
-#[allow(unused_imports)] // Used by the lifecycle layer in the next stacked change.
 pub use client::GuestClient;
-#[allow(unused_imports)] // Used by the sandbox manager introduced in the next stacked PR.
 pub use client::GuestExecResult;
 
 use thiserror::Error;

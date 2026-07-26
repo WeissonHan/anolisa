@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Feature-gated fault hooks for daemon-level integration verification.
 
-#![allow(dead_code)] // Call sites land with their owning lifecycle commits.
-
 const FAILPOINTS_ENV: &str = "BLAZE_TEST_FAILPOINTS";
 const FAILPOINT_FILE_ENV: &str = "BLAZE_TEST_FAILPOINT_FILE";
 

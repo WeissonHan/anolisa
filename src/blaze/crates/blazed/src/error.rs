@@ -93,7 +93,6 @@ impl BlazeDaemonError {
     }
 
     /// Stable machine-readable API error code.
-    #[allow(dead_code)] // Used by structured API responses after manager wiring.
     pub fn code(&self) -> &'static str {
         match self {
             BlazeDaemonError::BadRequest(_) => "invalid_request",
