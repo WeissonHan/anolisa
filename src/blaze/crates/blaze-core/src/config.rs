@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BlazeError, ConfigErrorSource, Result};
+use crate::policy::parse_duration;
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -29,6 +30,8 @@ pub struct DaemonConfig {
     pub template: TemplateSection,
     #[serde(default)]
     pub metrics: MetricsSection,
+    #[serde(default)]
+    pub api: ApiSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +192,30 @@ impl Default for StorageSection {
     }
 }
 
+/// HTTP and guest-I/O safety limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiSection {
+    /// Maximum accepted HTTP request body.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Maximum decoded payload for guest read/write operations.
+    #[serde(default = "default_max_file_bytes")]
+    pub max_file_bytes: usize,
+    /// Default upper bound for one API operation.
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: String,
+}
+
+impl Default for ApiSection {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: default_max_body_bytes(),
+            max_file_bytes: default_max_file_bytes(),
+            request_timeout: default_request_timeout(),
+        }
+    }
+}
+
 impl DaemonConfig {
     /// Load and parse a daemon configuration file at `path`.
     pub fn load(path: &Path) -> Result<Self> {
@@ -199,9 +226,31 @@ impl DaemonConfig {
         Ok(cfg)
     }
 
-    /// Validate cross-field invariants that serde cannot express.
+    /// Reject configurations that make lifecycle operations unsafe or timers invalid.
     pub fn validate(&self) -> Result<()> {
-        validate_storage_paths(&self.storage.images_dir, &self.storage.instances_dir)
+        validate_storage_paths(&self.storage.images_dir, &self.storage.instances_dir)?;
+        if self.storage.rootfs_size == 0 || self.storage.mem_size == 0 {
+            return Err(invalid_config(
+                "storage.rootfs_size and storage.mem_size must be greater than zero",
+            ));
+        }
+        let flush_interval =
+            validate_duration("storage.flush_interval", &self.storage.flush_interval, 1)?;
+        if std::time::Instant::now()
+            .checked_add(flush_interval)
+            .is_none()
+        {
+            return Err(invalid_config(
+                "storage.flush_interval is too large for the platform timer",
+            ));
+        }
+        validate_duration("api.request_timeout", &self.api.request_timeout, 11)?;
+        if self.api.max_body_bytes == 0 || self.api.max_file_bytes == 0 {
+            return Err(invalid_config(
+                "api.max_body_bytes and api.max_file_bytes must be greater than zero",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -211,15 +260,30 @@ pub fn validate_storage_paths(images_dir: &Path, instances_dir: &Path) -> Result
         || images_dir.starts_with(instances_dir)
         || instances_dir.starts_with(images_dir)
     {
-        return Err(BlazeError::ConfigError {
-            source: ConfigErrorSource::InvalidValue(format!(
-                "storage.images_dir ({}) and storage.instances_dir ({}) must be disjoint",
-                images_dir.display(),
-                instances_dir.display()
-            )),
-        });
+        return Err(invalid_config(format!(
+            "storage.images_dir ({}) and storage.instances_dir ({}) must be disjoint",
+            images_dir.display(),
+            instances_dir.display()
+        )));
     }
     Ok(())
+}
+
+fn validate_duration(name: &str, value: &str, minimum_secs: u64) -> Result<std::time::Duration> {
+    let duration = parse_duration(value)
+        .ok_or_else(|| invalid_config(format!("{name} must be a positive duration")))?;
+    if duration.as_secs() < minimum_secs {
+        return Err(invalid_config(format!(
+            "{name} must be at least {minimum_secs}s"
+        )));
+    }
+    Ok(duration)
+}
+
+fn invalid_config(message: impl Into<String>) -> BlazeError {
+    BlazeError::ConfigError {
+        source: ConfigErrorSource::InvalidValue(message.into()),
+    }
 }
 
 // ----- defaults -----
@@ -275,6 +339,15 @@ fn default_rootfs_size() -> u64 {
 fn default_mem_size() -> u64 {
     4 * 1024 * 1024 * 1024
 }
+fn default_max_body_bytes() -> usize {
+    1024 * 1024
+}
+fn default_max_file_bytes() -> usize {
+    16 * 1024 * 1024
+}
+fn default_request_timeout() -> String {
+    "30s".to_string()
+}
 
 #[cfg(test)]
 mod tests {
@@ -287,6 +360,7 @@ mod tests {
         assert_eq!(cfg.policy.on_load_error, PolicyLoadErrorMode::Fail);
         assert!(cfg.backends.is_empty());
         assert_ne!(cfg.storage.images_dir, cfg.storage.instances_dir);
+        assert_eq!(cfg.api.max_body_bytes, 1024 * 1024);
     }
 
     #[test]
@@ -324,5 +398,29 @@ mod tests {
             let error = cfg.validate().expect_err("overlapping paths");
             assert!(error.to_string().contains("must be disjoint"));
         }
+    }
+
+    #[test]
+    fn validation_rejects_short_timeout() {
+        let mut cfg = DaemonConfig::default();
+        cfg.api.request_timeout = "10s".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_invalid_or_subsecond_flush_interval() {
+        for invalid in ["", "0s", "500ms", "30", "later", "18446744073709551615s"] {
+            let mut cfg = DaemonConfig::default();
+            cfg.storage.flush_interval = invalid.to_string();
+            let error = cfg.validate().expect_err("invalid flush interval");
+            assert!(
+                error.to_string().contains("storage.flush_interval"),
+                "unexpected error for {invalid:?}: {error}"
+            );
+        }
+
+        let mut cfg = DaemonConfig::default();
+        cfg.storage.flush_interval = "1s".into();
+        cfg.validate().expect("one second is the minimum");
     }
 }

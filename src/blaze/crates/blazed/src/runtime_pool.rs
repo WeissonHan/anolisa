@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Async warm pool that owns storage slots and optional paused backend VMs.
 
-#![allow(dead_code)] // Activated by SandboxManager in the lifecycle commit.
-
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
