@@ -64,6 +64,7 @@ impl StorageProvider for FileStorageProvider {
     }
 
     async fn acquire(&self, opts: &AcquireOpts) -> Result<StorageSlot> {
+        crate::failpoint::storage("storage-acquire")?;
         let slot = self.slot_for_id(&opts.instance_id)?;
         let instance_dir = &slot.instance_dir;
 
@@ -127,6 +128,7 @@ impl StorageProvider for FileStorageProvider {
     }
 
     async fn release(&self, slot: StorageSlot) -> Result<()> {
+        crate::failpoint::storage("storage-release")?;
         // Re-derive the canonical path from instances_dir + slot.id. Do not
         // trust path strings carried in a persisted or externally built slot.
         let canonical_dir = self.slot_for_id(&slot.id)?.instance_dir;
@@ -174,6 +176,7 @@ impl StorageProvider for FileStorageProvider {
     }
 
     async fn flush_dirty(&self, slot: &StorageSlot) -> Result<()> {
+        crate::failpoint::storage("flush-storage")?;
         // Never trust paths carried by a runtime or persisted slot. Rebuild
         // the complete provider-owned artifact set from the validated ID.
         let canonical = self.slot_for_id(&slot.id)?;
