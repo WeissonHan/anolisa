@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Template registry.
 //!
-//! v0.1: pure in-memory. No `/proc/anolisa/mm/template/` traffic — that
-//! lands in Phase 3 of the roadmap.
+//! v0.1: pure in-memory. It does not issue kernel template commands.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -169,9 +168,9 @@ impl TemplateRegistry {
     /// than `idle_ttl` (or that are invalidated, regardless of TTL).
     /// Returns the ids that were removed.
     pub fn gc_unused(&mut self, idle_ttl: Duration) -> Vec<Uuid> {
-        // TODO(Phase 3): gc_unused() currently only removes templates from the in-memory registry.
-        // Once Kernel Coordinator lands, this must invoke kernel.deactivate() (or equivalent)
-        // to release physical pages held by mm-template; otherwise kernel-side frames leak.
+        // This registry owns metadata only. Kernel-backed template memory is
+        // outside the daemon template registry and therefore has no resource
+        // handle here.
         let now = Utc::now();
         let ttl = chrono::Duration::from_std(idle_ttl).unwrap_or(chrono::Duration::zero());
         let stale: Vec<Uuid> = self

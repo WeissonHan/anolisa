@@ -16,7 +16,9 @@ sandbox 被销毁或进程退出。后端特定的启动、暂停、snapshot、r
 执行。若无法读取该环境，清理会停止并保留进程，供运维人员检查。
 
 成功清理后会删除后端 socket 和 PID 元数据。serial log 在 16 MiB 时轮转。
-destroy 后会有意保留 run directory 中剩余的日志和配置，供问题诊断使用。
+基础 instance API 在 destroy 后会保留 run directory 中剩余的日志和配置，
+供问题诊断使用。由 sandbox management API 持有生命周期时，destroy 会在
+backend 清理完成后以事务方式删除 run directory。
 
 ## File storage provider
 

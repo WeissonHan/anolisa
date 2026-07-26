@@ -20,7 +20,9 @@ cleanup fails closed and leaves the process for operator inspection.
 
 Backend sockets and PID metadata are removed after successful cleanup. Serial
 logs rotate at 16 MiB. The run directory and its remaining logs and
-configuration are intentionally retained after destroy for diagnostics.
+configuration are retained by the foundational instance API for diagnostics.
+When the sandbox management API owns the lifecycle, destroy removes the run
+directory transactionally after backend cleanup.
 
 ## File storage provider
 

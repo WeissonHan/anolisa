@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-//! blaze-core: shared types and v0.1 in-memory implementations for the
+//! blaze-core: shared contracts and persistence primitives for the
 //! blaze sandbox-orchestration daemon.
 //!
-//! This crate intentionally has no I/O surface beyond JSON/TOML on local
-//! filesystems. Network/UDS surfaces are implemented in the `blazed` daemon
-//! crate. Modules map 1:1 to the functional breakdown:
+//! This crate performs bounded local filesystem I/O for configuration,
+//! lifecycle metadata, and checkpoint manifests. Process, network, and UDS
+//! surfaces are implemented in the `blazed` daemon crate.
 //!
 //! - [`config`]: daemon TOML configuration
 //! - [`policy`]: workload class + policy file schema
 //! - [`backend`]: backend kinds + selection / fallback
+//! - [`lifecycle`]: sandbox state machine + JSON persistence
 //! - [`checkpoint`]: checkpoint metadata, integrity, lineage, and pruning
 //! - [`guest_protocol`]: guest-agent wire DTOs
-//! - [`lifecycle`]: sandbox state machine + JSON persistence
+//! - [`storage`]: provider and slot contracts
 //! - [`pool`]: warm-pool key/stat/manager
 //! - [`template`]: template registry + refcnt + GC
 //! - [`kernel`]: kernel hook registry, per-hook mutex

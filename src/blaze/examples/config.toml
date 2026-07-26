@@ -13,8 +13,8 @@
 # Options: trace, debug, info, warn, error.  Default: "info".
 log_level = "info"
 
-# Root directory for persistent daemon state (instance metadata, templates,
-# images). The daemon creates subdirectories automatically on first startup.
+# Root directory for persistent instance metadata, checkpoints, hibernate
+# artifacts, runtime sockets, and warm-pool bookkeeping.
 # Default: "/var/lib/blaze".
 state_dir = "/var/lib/blaze"
 
@@ -29,6 +29,8 @@ socket = "/run/blaze/api.sock"
 [listen]
 # TCP bind address for remote HTTP API.
 # Leave empty or omit to disable TCP (UDS-only mode).
+# The daemon does not provide built-in authentication or TLS. Bind only to a
+# trusted management network, or place an authenticated proxy in front.
 # When set, platforms (Substrate, E2B orchestrators) can reach the daemon
 # over the network.  Example: "0.0.0.0:14159".
 # Default: "" (disabled).
@@ -46,7 +48,7 @@ http_addr = ""
 #   kata-qemu, runc, bubblewrap.
 firecracker = "/usr/bin/firecracker"
 bubblewrap = "/usr/bin/bwrap"
-# Phase 2+ backends (uncomment when spawner implementations land):
+# Optional backends (uncomment when their spawner implementations are available):
 # gvisor = "/usr/bin/runsc"
 # rund = "/usr/bin/rund"
 # kata-fc = "/usr/bin/containerd-shim-kata-v2"
@@ -68,7 +70,7 @@ dir = "/etc/anolisa/blaze/policies"
 on_load_error = "fail"
 
 # ---------------------------------------------------------------------------
-# Image storage settings.
+# Image and mutable instance storage settings.
 # ---------------------------------------------------------------------------
 [storage]
 # Primary directory for vmlinux kernels, rootfs base images, and memfile
@@ -81,29 +83,36 @@ images_dir = "/var/lib/blaze/images"
 instances_dir = "/var/lib/blaze/instances"
 
 # Storage provider backend. Currently supported: "file".
-# Additional providers may be registered at runtime.
+# "auto" currently probes and selects the file provider.
 provider = "file"
-
-# Sparse fallback sizes used when base artifacts are unavailable.
-rootfs_size = 8589934592
-mem_size = 4294967296
 
 # Number of pre-warmed storage slots to keep ready in the pool.
 pool_size = 0
 
-# Pre-start and pause a backend in each warm slot.
+# Pre-start and pause a backend in each warm slot. When false, only storage
+# is prepared. The pool is initialized after its first eligible policy.
 prefork = false
 
 # Interval between provider-owned artifact fsync sweeps.
 flush_interval = "30s"
 
+# Sparse fallback sizes used when images_dir does not contain rootfs.ext4
+# or mem.bin. Values are bytes.
+rootfs_size = 8589934592
+mem_size = 4294967296
+
 # ---------------------------------------------------------------------------
 # HTTP and guest-agent limits.
 # ---------------------------------------------------------------------------
 [api]
+# Maximum collected HTTP request body.
 max_body_bytes = 1048576
+
+# Maximum decoded guest file payload.
 max_file_bytes = 16777216
-# Exec reserves ten seconds of this value for protocol grace.
+
+# Total guest I/O deadline. Exec reserves 10 seconds of this value for
+# protocol/transport grace, so this must be at least 11 seconds.
 request_timeout = "30s"
 
 # ---------------------------------------------------------------------------
