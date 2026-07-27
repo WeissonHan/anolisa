@@ -28,7 +28,7 @@ anyhow = "1.0"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["net"] }
+tokio-util = { version = "0.7", features = ["net", "rt"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
