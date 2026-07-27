@@ -52,6 +52,9 @@ pub enum BlazeError {
 
     #[error("storage error: {msg}")]
     StorageError { msg: String },
+
+    #[error("checkpoint error: {msg}")]
+    CheckpointError { msg: String },
 }
 
 /// Internal wrapper that lets [`BlazeError::ConfigError`] carry either a
