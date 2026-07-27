@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Async warm pool that owns storage slots and optional paused backend VMs.
 
-#![allow(dead_code)] // The pool is exercised directly until daemon wiring owns it.
-
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

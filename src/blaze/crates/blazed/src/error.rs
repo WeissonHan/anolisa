@@ -54,6 +54,9 @@ pub enum BlazeDaemonError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("operation requires recovery: {0}")]
     RecoveryRequired(String),
 
@@ -67,6 +70,7 @@ impl BlazeDaemonError {
         match self {
             BlazeDaemonError::BadRequest(_) => 400,
             BlazeDaemonError::NotFound(_) => 404,
+            BlazeDaemonError::Conflict(_) => 409,
             BlazeDaemonError::RecoveryRequired(_) => 500,
             BlazeDaemonError::HttpStatus { status, .. } => *status,
             BlazeDaemonError::Core(blaze_core::BlazeError::PolicyEvalError { .. })

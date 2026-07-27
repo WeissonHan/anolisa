@@ -199,9 +199,15 @@ impl DaemonConfig {
         Ok(cfg)
     }
 
-    /// Validate cross-field invariants that serde cannot express.
+    /// Reject configurations that make lifecycle operations unsafe or timers invalid.
     pub fn validate(&self) -> Result<()> {
-        validate_storage_paths(&self.storage.images_dir, &self.storage.instances_dir)
+        validate_storage_paths(&self.storage.images_dir, &self.storage.instances_dir)?;
+        if self.storage.rootfs_size == 0 || self.storage.mem_size == 0 {
+            return Err(invalid_config(
+                "storage.rootfs_size and storage.mem_size must be greater than zero",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -211,15 +217,19 @@ pub fn validate_storage_paths(images_dir: &Path, instances_dir: &Path) -> Result
         || images_dir.starts_with(instances_dir)
         || instances_dir.starts_with(images_dir)
     {
-        return Err(BlazeError::ConfigError {
-            source: ConfigErrorSource::InvalidValue(format!(
-                "storage.images_dir ({}) and storage.instances_dir ({}) must be disjoint",
-                images_dir.display(),
-                instances_dir.display()
-            )),
-        });
+        return Err(invalid_config(format!(
+            "storage.images_dir ({}) and storage.instances_dir ({}) must be disjoint",
+            images_dir.display(),
+            instances_dir.display()
+        )));
     }
     Ok(())
+}
+
+fn invalid_config(message: impl Into<String>) -> BlazeError {
+    BlazeError::ConfigError {
+        source: ConfigErrorSource::InvalidValue(message.into()),
+    }
 }
 
 // ----- defaults -----
@@ -275,7 +285,6 @@ fn default_rootfs_size() -> u64 {
 fn default_mem_size() -> u64 {
     4 * 1024 * 1024 * 1024
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
