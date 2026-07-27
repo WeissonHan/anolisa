@@ -169,7 +169,7 @@ create 可接收可选 UUID。成功后以同一 UUID 和相同不可变参数�
 ```json
 {
   "status": "ok",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "backend": "mock",
   "storage_pool": { "ready": 0, "capacity": 0, "pending": 0 }
 }
