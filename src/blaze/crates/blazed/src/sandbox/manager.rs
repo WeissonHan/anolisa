@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use blaze_core::backend::{BackendKind, NetworkConfig, SpawnRequest};
+use blaze_core::checkpoint::CheckpointStore;
 use blaze_core::config::DaemonConfig;
 use blaze_core::lifecycle::{OperationKind, SandboxInstance, SandboxState, StartPath};
 use blaze_core::policy::{BackendConfigs, RuntimeDecision, VmConfig};
@@ -61,6 +62,7 @@ pub struct SandboxManager {
     pub(super) active_backend: BackendKind,
     pub(super) storage: Arc<dyn StorageProvider>,
     pub(super) state_dir: PathBuf,
+    pub(super) checkpoints: CheckpointStore,
     pub(super) cancellation: CancellationToken,
     pub(super) warm_pool: Arc<RuntimeWarmPool>,
     request_timeout: Duration,
@@ -97,6 +99,7 @@ impl SandboxManager {
             request_timeout,
             cancellation.clone(),
         );
+        let checkpoint_root = config.daemon.state_dir.join("checkpoints");
         Ok(Self {
             state_dir: config.daemon.state_dir.clone(),
             config,
@@ -105,6 +108,7 @@ impl SandboxManager {
             spawner,
             active_backend,
             storage,
+            checkpoints: CheckpointStore::new(checkpoint_root),
             cancellation,
             warm_pool,
             request_timeout,
@@ -462,6 +466,10 @@ impl SandboxManager {
             )));
         }
         if let Err(error) = remove_runtime_dir(&runtime_dir).await {
+            self.mark_recovery(id)?;
+            return Err(error);
+        }
+        if let Err(error) = self.cleanup_checkpoint_transactions(id).await {
             self.mark_recovery(id)?;
             return Err(error);
         }
@@ -968,6 +976,38 @@ mod tests {
         assert_eq!(created.instance.state, SandboxState::Running);
         assert!(manager.destroy(id).await.expect("destroy"));
         assert!(!manager.destroy(id).await.expect("idempotent destroy"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rollback_restores_rootfs() {
+        let temp = tempfile::tempdir().expect("temp");
+        let manager = manager(temp.path());
+        let id = Uuid::new_v4();
+        manager
+            .create(CreateSandbox {
+                requested_id: Some(id),
+                decision: decision(),
+                image_digest: "sha256:test".into(),
+                template_name: "base".into(),
+                binary_path: PathBuf::new(),
+            })
+            .await
+            .expect("create");
+        let runtime = manager.runtime(id).expect("runtime");
+        let rootfs_path = runtime.lock().await.storage.rootfs_path.clone();
+        tokio::fs::write(&rootfs_path, b"hello")
+            .await
+            .expect("write rootfs");
+        let checkpoint = manager.checkpoint(id).await.expect("checkpoint");
+        tokio::fs::write(&rootfs_path, b"mutated")
+            .await
+            .expect("mutate rootfs");
+        manager
+            .rollback(id, &checkpoint.id)
+            .await
+            .expect("rollback");
+        assert_eq!(tokio::fs::read(&rootfs_path).await.expect("read"), b"hello");
+        assert!(manager.destroy(id).await.expect("destroy"));
     }
 
     #[tokio::test]
