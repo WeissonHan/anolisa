@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! blaze-core: shared types and v0.1 in-memory implementations for the
-//! blaze sandbox-orchestration daemon.
+//! Shared contracts and state models for the Blaze sandbox daemon.
 //!
 //! This crate intentionally has no I/O surface beyond JSON/TOML on local
 //! filesystems. Network/UDS surfaces are implemented in the `blazed` daemon

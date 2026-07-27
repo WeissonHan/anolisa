@@ -40,7 +40,7 @@ workload_class = "agent-rl"
 backend_priority = ["firecracker", "bubblewrap"]
 
 # Kernel hooks to activate for this workload class.
-# Available hooks: "mm-template", "uffd-wp".
+# Available hooks are defined by the configured provider.
 # Empty list means no kernel hooks.  Default: [].
 kernel_hooks = []
 

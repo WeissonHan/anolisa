@@ -4,17 +4,19 @@
 
 面向 AI Agent 工作负载的单机 sandbox 编排 daemon。
 
-Blaze 通过 HTTP API 管理 sandbox 实例的完整生命周期，支持策略驱动的后端选择。
-它提供 warm pool 预分配、多后端回退（Firecracker → Bubblewrap → Mock）以及
-Prometheus 指标导出，设计为 E2B 类编排平台的单机执行代理。
+Blaze 通过 daemon-only HTTP API 管理 sandbox 生命周期，并由策略选择后端。
+它通过与后端无关的接口持有后端进程、guest 操作、warm runtime 容量、
+checkpoint 与 hibernate 事务，以及模板导入。
 
 ## 特性
 
-- **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + TCP (`:14159`)
+- **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + 可选 TCP
 - **策略驱动后端选择** — workload class → 后端优先级列表
-- **生命周期状态机** — 8 种状态（Pending → Creating → Running → Paused → Checkpointed → Reset → Warm → Destroyed）
-- **Warm pool 管理** — 预热实例 + 基于 TTL 的 GC
-- **模板注册表** — 内存中模板追踪，支持空闲驱逐
+- **生命周期事务** — 持久化 operation marker 与可恢复的资源持有关系
+- **运行时 warm pool** — 存储预分配或预启动 backend，并异步补充容量
+- **Guest 操作** — 有界的就绪检查、命令执行与文件传输
+- **Checkpoint 与 hibernate** — 制品校验、rollback、prune、hibernate 与 resume
+- **模板 API** — 事务式导入自包含模板制品
 - **内核 hook 注册** — 前/后置 hook 状态追踪
 - **Prometheus 指标** — 请求计数、实例 gauge、池大小
 - **Spawner 后端** — FirecrackerSpawner、BubblewrapSpawner、MockSpawner
@@ -37,7 +39,7 @@ sudo ./target/release/blazed daemon start --config examples/config.toml
 curl --unix-socket /run/blaze/api.sock http://localhost/v1/health
 
 # 创建 sandbox
-curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/instances \
+curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/sandboxes \
   -H 'Content-Type: application/json' \
   -d '{"workload_class":"agent-rl","image_digest":"sha256:..."}'
 ```
@@ -88,9 +90,16 @@ provider = "file"       # 存储 provider 选择。当前支持："file"、"auto
                         # 其他值将记录告警并回退到 file。
 images_dir = "/var/lib/blaze/images"
 instances_dir = "/var/lib/blaze/instances"
-# pool_size = 0           # [Reserved] 预热存储槽位数（尚未启用）
-# prefork = false         # [Reserved] 是否在槽位中预启动 VM（尚未启用）
+pool_size = 0            # ready slot 目标值
+prefork = false          # 为每个 ready slot 预启动 backend
 # flush_interval = "30s"  # [Reserved] 脏数据刷盘周期（尚未启用）
+rootfs_size = 8589934592
+mem_size = 4294967296
+
+[api]
+max_body_bytes = 1048576
+max_file_bytes = 16777216
+request_timeout = "30s"
 ```
 
 `file` provider 为每个实例提供独立的 root filesystem 和 memory 文件。
@@ -98,6 +107,8 @@ instances_dir = "/var/lib/blaze/instances"
 拒绝。独立副本会使用更多容量并增加 create 延迟，但不依赖其他实例文件也能
 保持有效。`StorageProvider` interface 允许其他实现优化这一取舍。`auto`
 当前等同于 `file`；无法识别的值会记录告警并回退到它。
+运行时池使用第一个符合条件的 policy 初始化；runtime prototype 不同的请求
+使用普通分配路径。
 
 ### 后端主机要求
 
@@ -113,23 +124,39 @@ Firecracker 需要 Linux、root 权限以及 `ip`、`unshare` 可执行文件。
 | 方法 | 路径 | 说明 |
 |--------|------|-------------|
 | GET | `/v1/health` | 健康检查 |
-| GET | `/v1/instances` | 列出所有实例 |
-| POST | `/v1/instances` | 创建新 sandbox 实例 |
-| GET | `/v1/instances/{id}` | 获取实例详情 |
-| POST | `/v1/instances/{id}/checkpoint` | 对实例做 checkpoint |
-| POST | `/v1/instances/{id}/reset` | 将实例重置到 checkpoint |
-| POST | `/v1/instances/{id}/destroy` | 销毁实例 |
-| GET | `/v1/pools` | 列出 warm pool |
-| GET | `/v1/pools/{backend}/{class}` | 获取 pool 状态 |
-| POST | `/v1/pools/{backend}/{class}/drain` | 排空 pool |
-| PUT | `/v1/pools/{backend}/{class}/sizing` | 调整 pool 大小 |
+| GET, POST | `/v1/sandboxes` | 列出或创建 sandbox |
+| GET, DELETE | `/v1/sandboxes/{id}` | 查看或幂等销毁 sandbox |
+| POST | `/v1/sandboxes/{id}/exec` | 执行 guest 命令 |
+| POST | `/v1/sandboxes/{id}/read` | 以标准 base64 读取 guest 文件 |
+| POST | `/v1/sandboxes/{id}/write` | 写入标准 base64 guest 文件 |
+| POST | `/v1/sandboxes/{id}/checkpoint` | 提交 checkpoint |
+| GET | `/v1/sandboxes/{id}/checkpoints` | 列出 checkpoint 与 HEAD 可达性 |
+| POST | `/v1/sandboxes/{id}/checkpoints/prune` | 删除 HEAD 不可达分支 |
+| POST | `/v1/sandboxes/{id}/rollback/{checkpoint}` | 校验并恢复 checkpoint |
+| POST | `/v1/sandboxes/{id}/hibernate` | 快照并停止 backend |
+| POST | `/v1/sandboxes/{id}/resume` | 恢复 hibernated backend |
+| GET | `/v1/pool/status` | 返回当前 ready、capacity 与 pending |
+| POST | `/v1/pool/cleanup` | 排空 ready 资源并触发 refill |
 | GET | `/v1/templates` | 列出模板 |
 | GET | `/v1/templates/{id}` | 查看模板详情 |
+| POST | `/v1/templates/import` | 事务式导入模板目录 |
 | POST | `/v1/templates/gc` | 触发模板 GC |
 | GET | `/v1/policies` | 列出已加载策略 |
 | GET | `/v1/hooks` | 列出内核 hook |
 | GET | `/v1/metrics` | Prometheus 指标 |
 | POST | `/v1/admin/reload` | 热加载策略 |
+
+`/v1/instances` 及现有 instance 操作继续作为兼容别名，并调用同一个
+sandbox manager。API 错误包含 `code`、`message`、`operation` 和
+`sandbox_id`。
+
+create 可接收可选 UUID。成功后以同一 UUID 和相同不可变参数重复创建会返回
+现有 running sandbox，参数不一致则返回 `409`。destroy 幂等。checkpoint
+每次成功都会提交新 ID；可以重复 rollback 到同一个 checkpoint。hibernate
+或 resume 成功后再次调用会因源状态前置条件不满足而返回 state conflict。
+
+请求契约、限制、模板布局和重试行为详见
+[Sandbox 管理 API](docs/design/management-api_zh.md)。
 
 #### 健康检查
 
@@ -139,6 +166,7 @@ Firecracker 需要 Linux、root 权限以及 `ip`、`unshare` 可执行文件。
 {
   "status": "ok",
   "version": "0.3.0",
+  "backend": "mock",
   "storage_pool": { "ready": 0, "capacity": 0, "pending": 0 }
 }
 ```
@@ -148,8 +176,8 @@ Firecracker 需要 Linux、root 权限以及 `ip`、`unshare` 可执行文件。
 ```
 src/blaze/
 ├── crates/
-│   ├── blaze-core/   # 库：策略、生命周期、池、模板、内核、配置
-│   └── blazed/       # 二进制：daemon、API server、spawner、指标
+│   ├── blaze-core/   # 契约：策略、生命周期、checkpoint、guest、storage
+│   └── blazed/       # daemon：API、manager、pool、guest client、spawner
 ├── examples/         # config.toml、policies/
 ├── dist/             # blazed.service、blaze.spec、tmpfiles
 └── manifests/        # 组件元数据

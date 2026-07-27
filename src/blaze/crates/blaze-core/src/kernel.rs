@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! # Kernel Coordinator (v0.1: state-only stub)
+//! # Kernel hook registry
 //!
-//! v0.1 maintains only a hook state machine; it does NOT push syscalls to `/proc/anolisa/...`.
-//! Phase 3 will integrate real kernel interfaces (mm-template register, UFFD-WP activate, etc.).
+//! This module records hook ownership and activation state. Host integration
+//! remains the responsibility of daemon-side adapters.
 //!
 //! ## Concurrency model
 //!
 //! HookRegistry itself contains no synchronization primitives. Callers (blaze daemon)
 //! must wrap it in `Mutex<HookRegistry>` or equivalent to ensure atomic activate/deactivate.
 //!
-//! Kernel hook registry.
-//!
-//! v0.1: state-only stub. The registry tracks per-hook activation but
-//! does **not** push commands to `/proc/anolisa/...`; that lands in
-//! Phase 3. Each hook kind is single-tenant: at most one instance can
-//! own activation at a time (the per-hook mutex requirement).
+//! Each hook kind is single-tenant: at most one instance can own activation
+//! at a time.
 
 use std::collections::HashMap;
 use std::fmt;
