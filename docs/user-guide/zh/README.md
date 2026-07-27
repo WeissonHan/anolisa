@@ -14,7 +14,7 @@ ANOLISA 为 AI Agent 提供完整的服务端运行时能力。通过 `anolisa` 
 │  anolisa-cli · cosh · os-skills                                    │
 ├──────────────────────────────────┬─────────────────────────────────┤
 │  Token 节省                       │  运行时                          │
-│  tokenless · agent-memory        │  skillfs · ws-ckpt              │
+│  tokenless · agent-memory        │  skillfs · ws-ckpt · blaze      │
 ├──────────────────────────────────┼─────────────────────────────────┤
 │  Agent 可观测                     │  Agent 安全                      │
 │  agentsight                      │  agent-sec-core                 │
@@ -68,6 +68,7 @@ ANOLISA 为 AI Agent 提供完整的服务端运行时能力。通过 `anolisa` 
 
 | 文档 | 组件 | 说明 |
 |------|------|------|
+| [Blaze](runtime/blaze/QUICKSTART.md) | blaze | Sandbox 生命周期、Guest I/O、checkpoint 与 pool CLI |
 | [工作区快照](runtime/ws-ckpt.md) | ws-ckpt | 秒级快照创建/回滚，基于 btrfs COW |
 | [技能文件系统](runtime/skillfs.md) | skillfs | FUSE 虚拟视图、渐进披露 |
 

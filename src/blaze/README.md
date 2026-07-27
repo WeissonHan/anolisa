@@ -2,16 +2,21 @@
 
 [中文版](README_zh.md)
 
-Per-host sandbox orchestrator daemon for AI Agent workloads.
+Per-host sandbox orchestration service and command-line client for AI Agent workloads.
 
-Blaze manages sandbox lifecycles through a daemon-only HTTP API with
-policy-driven backend selection. It owns backend processes, guest operations,
-warm runtime capacity, checkpoint and hibernate transactions, and template
-imports behind backend-neutral contracts.
+`blazed` owns sandbox state and exposes a daemon-only HTTP API with
+policy-driven backend selection. The separate `blazectl` binary is a bounded
+HTTP client for the supported remote lifecycle, guest I/O, checkpoint, and pool
+operations. Blaze also provides owned Firecracker processes, an asynchronous
+runtime warm pool, recoverable transactions, and background storage
+synchronization.
 
 ## Features
 
 - **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + optional TCP
+  (TCP has no built-in authentication or TLS and must stay on a trusted network)
+- **Command-line client** — 14 remote operations with stable text/JSON output,
+  binary-safe file transfer, and local version reporting
 - **Policy-driven backend selection** — workload class → backend priority list
 - **Lifecycle transactions** — persisted operation markers and recoverable ownership
 - **Runtime warm pool** — storage-only or pre-started backend capacity with asynchronous refill
@@ -24,26 +29,62 @@ imports behind backend-neutral contracts.
 
 ## Quick Start
 
+The preferred installation path is the ANOLISA component manager when its
+configured catalog contains Blaze. Blaze requires system mode:
+
 ```bash
-# Build
-cd src/blaze
-cargo build --release
-
-# Run daemon (dev: override policy.dir to use local examples)
-sudo ./target/release/blazed daemon start --config examples/config.toml
-# Note: the default config sets policy.dir = /etc/anolisa/blaze/policies.
-# For source-checkout testing, create a symlink or override:
-#   sudo mkdir -p /etc/anolisa/blaze
-#   sudo ln -s $(pwd)/examples/policies /etc/anolisa/blaze/policies
-
-# Health check
-curl --unix-socket /run/blaze/api.sock http://localhost/v1/health
-
-# Create a sandbox
-curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/sandboxes \
-  -H 'Content-Type: application/json' \
-  -d '{"workload_class":"agent-rl","image_digest":"sha256:..."}'
+sudo anolisa --install-mode system install blaze
+sudo systemctl enable --now blazed.service
 ```
+
+On supported RPM-based distributions whose configured repository contains the
+package:
+
+```bash
+sudo yum install blaze
+sudo systemctl enable --now blazed.service
+```
+
+Developers can build from source on Linux:
+
+```bash
+cd src/blaze
+cargo build --workspace --release --locked
+sudo install -d /etc/anolisa/blaze/policies
+sudo install -m 0644 examples/policies/*.toml /etc/anolisa/blaze/policies/
+```
+
+Start the daemon in one terminal:
+
+```bash
+sudo ./target/release/blazed daemon start --config examples/config.toml
+```
+
+Use the client from another terminal:
+
+```bash
+sudo ./target/release/blazectl --socket /run/blaze/api.sock list
+```
+
+Package/catalog availability depends on the configured Linux distribution
+repositories; the source tree does not publish or install a package by itself.
+
+## blazectl
+
+`blazectl` exposes exactly 14 remote commands: `create`, `exec`, `list`,
+`kill`, `hibernate`, `checkpoint`, `rollback`, `checkpoints`,
+`prune-checkpoints`, `resume`, `cleanup-devices`, `pool-status`, `read`, and
+`write`. `list` also accepts `ls`; `kill` also accepts `rm`. The local
+`version` command and `--version` flag do not contact the daemon.
+
+Successful output defaults to stable text. Use `--output json` or
+`BLAZECTL_OUTPUT=json` for one JSON value on stdout. The default endpoint is
+`/run/blaze/api.sock`; `--socket` and `--url` are mutually exclusive, and an
+explicit endpoint flag takes precedence over `BLAZED_URL`.
+
+See the [Blaze CLI user guide](../../docs/user-guide/en/runtime/blaze/QUICKSTART.md)
+for installation details, the complete command reference, binary I/O rules,
+endpoint security, output streams, and exit codes.
 
 ## Configuration
 
@@ -187,7 +228,8 @@ periodic provider contract and shutdown ordering.
 src/blaze/
 ├── crates/
 │   ├── blaze-core/   # Contracts: policy, lifecycle, checkpoint, guest, storage
-│   └── blazed/       # Daemon: API, manager, pool, guest client, spawners
+│   ├── blazed/       # Daemon: API, manager, pool, guest client, spawners
+│   └── blazectl/     # HTTP client: CLI, wire DTOs, output, integration tests
 ├── examples/         # config.toml, policies/
 ├── dist/             # blazed.service, blaze.spec, tmpfiles
 └── manifests/        # Component metadata

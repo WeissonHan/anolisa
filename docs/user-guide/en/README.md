@@ -14,7 +14,7 @@ ANOLISA provides a complete server-side runtime for AI Agent workloads. Componen
 │  anolisa-cli · cosh · os-skills                                    │
 ├──────────────────────────────────┬─────────────────────────────────┤
 │  Token Saving                    │  Runtime                        │
-│  tokenless · agent-memory        │  skillfs · ws-ckpt              │
+│  tokenless · agent-memory        │  skillfs · ws-ckpt · blaze      │
 ├──────────────────────────────────┼─────────────────────────────────┤
 │  Agent Observability             │  Agent Security                 │
 │  agentsight                      │  agent-sec-core                 │
@@ -68,6 +68,7 @@ ANOLISA provides a complete server-side runtime for AI Agent workloads. Componen
 
 | Document | Component | Description |
 |----------|-----------|-------------|
+| [Blaze](runtime/blaze/QUICKSTART.md) | blaze | Sandbox lifecycle, guest I/O, checkpoint, and pool CLI |
 | [Workspace Checkpoints](runtime/ws-ckpt.md) | ws-ckpt | Instant snapshot/rollback via btrfs COW |
 | [Skill Filesystem](runtime/skillfs.md) | skillfs | FUSE virtual views with progressive disclosure |
 

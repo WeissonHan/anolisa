@@ -2,15 +2,19 @@
 
 [English](README.md)
 
-面向 AI Agent 工作负载的单机 sandbox 编排 daemon。
+面向 AI Agent 工作负载的单机 sandbox 编排服务与命令行客户端。
 
-Blaze 通过 daemon-only HTTP API 管理 sandbox 生命周期，并由策略选择后端。
-它通过与后端无关的接口持有后端进程、guest 操作、warm runtime 容量、
-checkpoint 与 hibernate 事务，以及模板导入。
+`blazed` 持有 sandbox 状态，并通过 daemon-only HTTP API 提供策略驱动的
+后端选择。独立的 `blazectl` binary 是一个有界 HTTP client，只提供受支持的
+远程生命周期、Guest I/O、checkpoint 和 pool 操作。Blaze 还提供 Firecracker
+进程所有权、异步运行时 warm pool、可恢复事务和后台存储同步。
 
 ## 特性
 
 - **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + 可选 TCP
+  （TCP 不内置认证或 TLS，只能暴露在可信管理网络）
+- **命令行客户端** — 14 个远程操作、稳定 text/JSON 输出、binary-safe
+  文件传输和本地版本输出
 - **策略驱动后端选择** — workload class → 后端优先级列表
 - **生命周期事务** — 持久化 operation marker 与可恢复的资源持有关系
 - **运行时 warm pool** — 存储预分配或预启动 backend，并异步补充容量
@@ -23,26 +27,60 @@ checkpoint 与 hibernate 事务，以及模板导入。
 
 ## 快速开始
 
+当已配置的 ANOLISA component catalog 包含 Blaze 时，优先使用 component
+manager 安装。Blaze 需要 system mode：
+
 ```bash
-# 构建
-cd src/blaze
-cargo build --release
-
-# 运行 daemon（开发环境：覆盖 policy.dir 使用本地示例）
-sudo ./target/release/blazed daemon start --config examples/config.toml
-# 注意：默认配置设置 policy.dir = /etc/anolisa/blaze/policies。
-# 源码开发测试时，创建符号链接或覆盖：
-#   sudo mkdir -p /etc/anolisa/blaze
-#   sudo ln -s $(pwd)/examples/policies /etc/anolisa/blaze/policies
-
-# 健康检查
-curl --unix-socket /run/blaze/api.sock http://localhost/v1/health
-
-# 创建 sandbox
-curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/sandboxes \
-  -H 'Content-Type: application/json' \
-  -d '{"workload_class":"agent-rl","image_digest":"sha256:..."}'
+sudo anolisa --install-mode system install blaze
+sudo systemctl enable --now blazed.service
 ```
+
+在已配置仓库包含该 package 的受支持 RPM-based 发行版上：
+
+```bash
+sudo yum install blaze
+sudo systemctl enable --now blazed.service
+```
+
+开发者可以在 Linux 上从源码构建：
+
+```bash
+cd src/blaze
+cargo build --workspace --release --locked
+sudo install -d /etc/anolisa/blaze/policies
+sudo install -m 0644 examples/policies/*.toml /etc/anolisa/blaze/policies/
+```
+
+在一个 terminal 中启动 daemon：
+
+```bash
+sudo ./target/release/blazed daemon start --config examples/config.toml
+```
+
+在另一个 terminal 中使用 client：
+
+```bash
+sudo ./target/release/blazectl --socket /run/blaze/api.sock list
+```
+
+Package/catalog 是否可用取决于所配置的 Linux 发行版仓库；源码树本身不会
+发布或安装 package。
+
+## blazectl
+
+`blazectl` 恰好提供 14 个远程命令：`create`、`exec`、`list`、`kill`、
+`hibernate`、`checkpoint`、`rollback`、`checkpoints`、
+`prune-checkpoints`、`resume`、`cleanup-devices`、`pool-status`、`read`
+和 `write`。`list` 还接受 `ls` alias；`kill` 还接受 `rm` alias。本地
+`version` 命令和 `--version` flag 不连接 daemon。
+
+成功输出默认使用稳定 text。使用 `--output json` 或
+`BLAZECTL_OUTPUT=json` 可在 stdout 得到一个 JSON 值。默认 endpoint 是
+`/run/blaze/api.sock`；`--socket` 与 `--url` 互斥，显式 endpoint flag 的
+优先级高于 `BLAZED_URL`。
+
+安装细节、完整命令参考、binary I/O 规则、endpoint 安全、输出 stream 和
+退出码参见 [Blaze CLI 用户指南](../../docs/user-guide/zh/runtime/blaze/QUICKSTART.md)。
 
 ## 配置
 
@@ -181,7 +219,8 @@ create 可接收可选 UUID。成功后以同一 UUID 和相同不可变参数�
 src/blaze/
 ├── crates/
 │   ├── blaze-core/   # 契约：策略、生命周期、checkpoint、guest、storage
-│   └── blazed/       # daemon：API、manager、pool、guest client、spawner
+│   ├── blazed/       # daemon：API、manager、pool、guest client、spawner
+│   └── blazectl/     # HTTP client：CLI、wire DTO、output、integration tests
 ├── examples/         # config.toml、policies/
 ├── dist/             # blazed.service、blaze.spec、tmpfiles
 └── manifests/        # 组件元数据
