@@ -1,23 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! UDS HTTP API server.
-//!
-//! Routing is a hand-rolled `match` on `(method, path-segments)` rather
-//! than a router framework — the surface is small (~17 endpoints) and
-//! the cost of a fresh dependency outweighs the readability win.
+//! UDS/TCP HTTP API with canonical sandbox routes and compatibility aliases.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::str::FromStr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use blaze_core::backend::{
-    BackendKind, BackendStatus, NetworkConfig, SpawnRequest, select_backend,
-};
-use blaze_core::kernel::HookKind;
-use blaze_core::lifecycle::{SandboxInstance, SandboxState, StartPath};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use blaze_core::backend::{BackendKind, BackendStatus, select_backend};
+use blaze_core::lifecycle::SandboxInstance;
 use blaze_core::policy::{ImageMetadata, RuntimeDecision, WorkloadClass, parse_duration};
-use blaze_core::pool::{PoolConfig, PoolKey};
-use blaze_core::storage::AcquireOpts;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::CONTENT_TYPE;
@@ -27,35 +20,50 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
+use crate::sandbox::CreateSandbox;
 use crate::state::ServerState;
 
-/// Top-level request handler. Always returns `Ok(Response)`; internal
-/// errors are turned into JSON error bodies so hyper never sees a panic.
+/// Top-level request handler. Internal errors always become JSON responses.
 pub async fn handle(
     req: Request<Incoming>,
     state: Arc<ServerState>,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     state.metrics.inc(&state.metrics.requests_total);
-
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
-
-    let response = match collect_body(req).await {
+    let limit = state
+        .config
+        .lock()
+        .map(|config| config.api.max_body_bytes)
+        .unwrap_or(1024 * 1024);
+    let response = match collect_body(req, limit).await {
         Ok(body) => dispatch(&method, &path, &query, body, &state).await,
-        Err(e) => Err(e),
+        Err(error) => Err(error),
     };
-
-    let resp = match response {
-        Ok(r) => r,
-        Err(e) => error_response(&e),
-    };
-    Ok(resp)
+    Ok(match response {
+        Ok(response) => response,
+        Err(error) => error_response(&error, &method, &path),
+    })
 }
 
-async fn collect_body(req: Request<Incoming>) -> Result<Vec<u8>> {
-    let collected = req.into_body().collect().await?;
-    Ok(collected.to_bytes().to_vec())
+async fn collect_body(req: Request<Incoming>, limit: usize) -> Result<Vec<u8>> {
+    let mut body = req.into_body();
+    let mut collected = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Ok(data) = frame.into_data() {
+            let next = collected.len().saturating_add(data.len());
+            if next > limit {
+                return Err(BlazeDaemonError::PayloadTooLarge {
+                    actual: next,
+                    limit,
+                });
+            }
+            collected.extend_from_slice(&data);
+        }
+    }
+    Ok(collected)
 }
 
 async fn dispatch(
@@ -65,30 +73,58 @@ async fn dispatch(
     body: Vec<u8>,
     state: &Arc<ServerState>,
 ) -> Result<Response<Full<Bytes>>> {
-    let parts: Vec<&str> = path
+    let parts = path
         .trim_start_matches('/')
         .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    let m = method.as_str();
-
-    match (m, parts.as_slice()) {
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    match (method.as_str(), parts.as_slice()) {
         ("GET", ["v1", "health"]) => health(state),
-        ("GET", ["v1", "instances"]) => list_instances(state),
-        ("POST", ["v1", "instances"]) => create_instance(state, &body).await,
-        ("GET", ["v1", "instances", id]) => get_instance(state, id),
-        ("POST", ["v1", "instances", id, "checkpoint"]) => checkpoint(state, id),
-        ("POST", ["v1", "instances", id, "reset"]) => reset_instance(state, id),
-        ("POST", ["v1", "instances", id, "destroy"]) => destroy_instance(state, id).await,
-        ("GET", ["v1", "pools"]) => list_pools(state),
-        ("GET", ["v1", "pools", backend, class]) => pool_status(state, backend, class),
-        ("POST", ["v1", "pools", backend, class, "drain"]) => drain_pool(state, backend, class),
-        ("PUT", ["v1", "pools", backend, class, "sizing"]) => {
-            resize_pool(state, backend, class, &body)
+
+        ("GET", ["v1", "sandboxes"]) | ("GET", ["v1", "instances"]) => list_sandboxes(state),
+        ("POST", ["v1", "sandboxes"]) | ("POST", ["v1", "instances"]) => {
+            create_sandbox(state, &body).await
         }
-        ("POST", ["v1", "templates", "gc"]) => gc_templates(state),
+        ("GET", ["v1", "sandboxes", id]) | ("GET", ["v1", "instances", id]) => {
+            get_sandbox(state, id)
+        }
+        ("DELETE", ["v1", "sandboxes", id]) => destroy_sandbox(state, id, true).await,
+        ("DELETE", ["v1", "instances", id]) | ("POST", ["v1", "instances", id, "destroy"]) => {
+            destroy_sandbox(state, id, false).await
+        }
+        ("POST", ["v1", "sandboxes", id, "exec"]) | ("POST", ["v1", "instances", id, "exec"]) => {
+            exec_sandbox(state, id, &body).await
+        }
+        ("POST", ["v1", "sandboxes", id, "read"]) | ("POST", ["v1", "instances", id, "read"]) => {
+            read_file(state, id, &body).await
+        }
+        ("POST", ["v1", "sandboxes", id, "write"]) | ("POST", ["v1", "instances", id, "write"]) => {
+            write_file(state, id, &body).await
+        }
+        ("POST", ["v1", "sandboxes", id, "checkpoint"])
+        | ("POST", ["v1", "instances", id, "checkpoint"]) => checkpoint(state, id).await,
+        ("GET", ["v1", "sandboxes", id, "checkpoints"]) => list_checkpoints(state, id).await,
+        ("POST", ["v1", "sandboxes", id, "checkpoints", "prune"]) => {
+            prune_checkpoints(state, id).await
+        }
+        ("POST", ["v1", "sandboxes", id, "rollback", checkpoint_id]) => {
+            rollback(state, id, checkpoint_id).await
+        }
+        ("POST", ["v1", "instances", id, "reset"]) => reset_to_head(state, id).await,
+        ("POST", ["v1", "sandboxes", id, "hibernate"]) => hibernate(state, id).await,
+        ("POST", ["v1", "sandboxes", id, "resume"]) => resume(state, id).await,
+
+        ("GET", ["v1", "pool", "status"]) => pool_status(state),
+        ("POST", ["v1", "pool", "cleanup"]) => cleanup_pool(state).await,
+        ("GET", ["v1", "pools"]) => pool_status(state),
+        ("GET", ["v1", "pools", _, _]) => pool_status(state),
+        ("POST", ["v1", "pools", _, _, "drain"]) => cleanup_pool(state).await,
+
         ("GET", ["v1", "templates"]) => list_templates(state),
-        ("GET", ["v1", "templates", id]) => inspect_template(state, id),
+        ("GET", ["v1", "templates", id]) => get_template(state, id),
+        ("POST", ["v1", "templates", "import"]) => import_template(state, &body).await,
+        ("POST", ["v1", "templates", "gc"]) => gc_templates(state),
+
         ("GET", ["v1", "policies"]) => list_policies(state),
         ("GET", ["v1", "hooks"]) => list_hooks(state),
         ("GET", ["v1", "metrics"]) => metrics(state),
@@ -97,56 +133,16 @@ async fn dispatch(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Health / metrics / admin
-// ---------------------------------------------------------------------------
-
-fn health(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let pool_status = state.storage.pool_status();
-    json_ok(&json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-        "storage_pool": pool_status,
-    }))
-}
-
-fn metrics(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let body = state.metrics.render();
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/plain; version=0.0.4")
-        .body(Full::new(Bytes::from(body)))?)
-}
-
-fn admin_reload(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let policy_dir = {
-        let cfg = state
-            .config
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()))?;
-        cfg.policy.dir.clone()
-    };
-    let new_engine = blaze_core::policy::PolicyEngine::load_dir(&policy_dir)?;
-    let count = new_engine.policies().len();
-    {
-        let mut engine = state
-            .policy
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("policy lock poisoned".into()))?;
-        *engine = new_engine;
-    }
-    tracing::info!(policies = count, "policy engine reloaded");
-    json_ok(&json!({ "reloaded": true, "policies": count }))
-}
-
-// ---------------------------------------------------------------------------
-// Instances
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Deserialize)]
-struct CreateInstanceReq {
-    workload_class: WorkloadClass,
-    image_digest: String,
+struct CreateRequest {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    template: Option<String>,
+    #[serde(default)]
+    workload_class: Option<WorkloadClass>,
+    #[serde(default)]
+    image_digest: Option<String>,
     #[serde(default)]
     labels: HashMap<String, String>,
     #[serde(default)]
@@ -154,1531 +150,563 @@ struct CreateInstanceReq {
 }
 
 #[derive(Debug, Serialize)]
-struct CreateInstanceResp {
+struct CreateResponse {
+    id: Uuid,
+    status: String,
+    template: String,
     instance: SandboxInstance,
     decision: RuntimeDecision,
-    start_path: StartPath,
     selected_backend: BackendKind,
+    existing: bool,
 }
 
-fn list_instances(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let map = state
-        .instances
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?;
-    let list: Vec<&SandboxInstance> = map.values().collect();
-    json_ok(&list)
-}
-
-fn get_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
-    let uuid = parse_uuid(id)?;
-    let map = state
-        .instances
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?;
-    let inst = map
-        .get(&uuid)
-        .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {uuid}")))?;
-    json_ok(inst)
-}
-
-async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Response<Full<Bytes>>> {
-    let req: CreateInstanceReq = serde_json::from_slice(body)
-        .map_err(|e| BlazeDaemonError::BadRequest(format!("invalid create body: {e}")))?;
-
-    let img = ImageMetadata {
-        digest: req.image_digest.clone(),
-        workload_class: Some(req.workload_class),
-        kernel_version: req.kernel_version.clone(),
-    };
-
-    // 1. Policy evaluation.
-    let decision = {
-        let engine = state
-            .policy
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("policy lock poisoned".into()))?;
-        match engine.evaluate(&req.labels, &img) {
-            Ok(d) => d,
-            Err(e) => {
-                state.metrics.inc(&state.metrics.policy_eval_failures);
-                return Err(e.into());
-            }
+async fn create_sandbox(state: &Arc<ServerState>, body: &[u8]) -> Result<Response<Full<Bytes>>> {
+    let request: CreateRequest = if body.is_empty() {
+        CreateRequest {
+            id: None,
+            template: None,
+            workload_class: None,
+            image_digest: None,
+            labels: HashMap::new(),
+            kernel_version: None,
         }
+    } else {
+        serde_json::from_slice(body).map_err(|error| {
+            BlazeDaemonError::BadRequest(format!("invalid create body: {error}"))
+        })?
     };
-
-    // 2. Backend selection. Constrain availability to the daemon's active
-    // spawner — only the backend that was actually probed at boot can execute.
-    let availability: Vec<BackendStatus> = {
-        let cfg = state
-            .config
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()))?;
-        decision
-            .backend_priority
-            .iter()
-            .map(|kind| {
-                let available = *kind == state.active_backend
-                    && (state.active_backend == BackendKind::Mock
-                        || cfg
-                            .backends
-                            .get(kind.as_str())
-                            .map(|p| p.exists())
-                            .unwrap_or(false));
-                BackendStatus {
-                    kind: *kind,
-                    available,
-                    version: None,
-                }
-            })
-            .collect()
-    };
-    // Select backend from available options. If no match is found:
-    // - Mock mode: fall back to the first policy entry (dev convenience)
-    // - Real backend: propagate BackendUnavailable (policy does not permit
-    //   the active backend, refusing to silently bypass policy)
-    let backend = match select_backend(&decision.backend_priority, &availability) {
-        Ok(b) => b,
-        Err(e) => {
-            if state.active_backend == BackendKind::Mock {
-                *decision.backend_priority.first().ok_or_else(|| {
-                    BlazeDaemonError::Internal("policy has empty backend_priority".into())
-                })?
-            } else {
-                return Err(e.into());
-            }
-        }
-    };
-
-    // 3. Pool lookup.
-    let pool_key = PoolKey::new(backend, decision.workload_class, req.image_digest.clone());
-    let mut start_path = StartPath::Cold;
-    let mut reused: Option<Uuid> = None;
-    if decision.pool_eligible {
-        let mut pool = state
-            .pool
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("pool lock poisoned".into()))?;
-        if let Some(id) = pool.lookup(&pool_key) {
-            reused = Some(id);
-            start_path = StartPath::Warm;
+    let requested_id = request.id.as_deref().map(parse_uuid).transpose()?;
+    let template = request.template.unwrap_or_default();
+    validate_optional_name(&template, "template")?;
+    let workload_class = request.workload_class.unwrap_or(WorkloadClass::AgentTool);
+    let image_digest = request
+        .image_digest
+        .unwrap_or_else(|| format!("template:{}", default_if_empty(&template, "default")));
+    let decision = evaluate_request(
+        state,
+        workload_class,
+        &image_digest,
+        &request.labels,
+        request.kernel_version,
+    )?;
+    let binary_path = state
+        .config
+        .lock()
+        .map_err(|_| internal_lock("config"))?
+        .backends
+        .get(state.active_backend.as_str())
+        .cloned()
+        .unwrap_or_default();
+    let created = state
+        .manager
+        .create(CreateSandbox {
+            requested_id,
+            decision: decision.clone(),
+            image_digest,
+            template_name: template.clone(),
+            binary_path,
+        })
+        .await?;
+    if !created.existing {
+        state.metrics.inc(&state.metrics.instances_created);
+        if created.instance.start_path == blaze_core::lifecycle::StartPath::Warm {
             state.metrics.inc(&state.metrics.pool_hits);
         } else {
             state.metrics.inc(&state.metrics.pool_misses);
         }
     }
-
-    // 4. A warm hit already owns its backend and storage. Claiming it from
-    // the pool must not allocate another slot or start another backend.
-    if let Some(id) = reused {
-        let (instance, actual_backend) =
-            activate_warm_instance(state, pool_key.clone(), id).await?;
-        state.metrics.inc(&state.metrics.instances_created);
-        return json_created(&CreateInstanceResp {
-            instance,
-            decision,
-            start_path,
-            selected_backend: actual_backend,
-        });
-    }
-
-    let mut instance = SandboxInstance::new(
-        backend,
-        decision.workload_class,
-        req.image_digest.clone(),
-        StartPath::Cold,
-        decision.policy_name.clone(),
-    );
-    instance.transition(SandboxState::Creating)?;
-
-    // 5. Spawn the data-plane process via the BackendSpawner trait.
-    //    The daemon picks LinuxSandboxSpawner when the configured
-    //    backend binary exists; otherwise MockSpawner keeps the daemon
-    //    usable on macOS dev hosts and in CI.
-    let (binary_path, rootfs_size, mem_size) = {
-        let cfg = state
-            .config
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()))?;
-        (
-            cfg.backends
-                .get(state.active_backend.as_str())
-                .cloned()
-                .unwrap_or_else(std::path::PathBuf::new),
-            cfg.storage.rootfs_size,
-            cfg.storage.mem_size,
-        )
-    };
-    let storage = state
-        .storage
-        .acquire(&AcquireOpts {
-            instance_id: instance.id.to_string(),
-            rootfs_size,
-            mem_size,
-        })
-        .await?;
-    let work_dir = state.state_dir.join(instance.id.to_string());
-    let spawner = state.spawner.clone();
-    let actual_backend = match spawner
-        .spawn(SpawnRequest {
-            instance_id: instance.id,
-            run_dir: work_dir,
-            binary_path,
-            storage: storage.clone(),
-            backend: decision.backend.clone(),
-            vm: decision.vm.clone(),
-            network: decision
-                .backend
-                .firecracker
-                .as_ref()
-                .map(|config| NetworkConfig {
-                    enabled: config.enable_network,
-                    ..NetworkConfig::default()
-                }),
-        })
-        .await
-    {
-        Ok(backend_instance) => {
-            let real_backend = backend_instance.backend();
-            let mut backend_instance = Some(backend_instance);
-            let registered = match state.backend_instances.lock() {
-                Ok(mut instances) => {
-                    instances.insert(
-                        instance.id,
-                        backend_instance
-                            .take()
-                            .expect("backend instance is present"),
-                    );
-                    true
-                }
-                Err(_) => false,
-            };
-            if !registered {
-                let original = BlazeDaemonError::Internal("backend_instances lock poisoned".into());
-                return Err(cleanup_failed_create(
-                    state,
-                    &mut instance,
-                    storage,
-                    backend_instance,
-                    false,
-                    original,
-                )
-                .await);
-            }
-            real_backend
-        }
-        Err(err) => {
-            tracing::error!(instance = %instance.id, ?err, "spawn failed");
-            return Err(cleanup_failed_create(
-                state,
-                &mut instance,
-                storage,
-                None,
-                false,
-                err.into(),
-            )
-            .await);
-        }
-    };
-    if let Err(error) = instance.transition(SandboxState::Running) {
-        return Err(
-            cleanup_failed_create(state, &mut instance, storage, None, true, error.into()).await,
-        );
-    }
-    if let Err(error) = instance.persist(&state.state_dir) {
-        return Err(
-            cleanup_failed_create(state, &mut instance, storage, None, true, error.into()).await,
-        );
-    }
-
-    // 6. Done.
-    let inserted = match state.instances.lock() {
-        Ok(mut map) => {
-            map.insert(instance.id, instance.clone());
-            true
-        }
-        Err(_) => false,
-    };
-    if !inserted {
-        let original = BlazeDaemonError::Internal("instances lock poisoned".into());
-        return Err(
-            cleanup_failed_create(state, &mut instance, storage, None, true, original).await,
-        );
-    }
-    state.metrics.inc(&state.metrics.instances_created);
-
-    json_created(&CreateInstanceResp {
-        instance,
+    let response = CreateResponse {
+        id: created.instance.id,
+        status: created.instance.state.to_string(),
+        template,
+        instance: created.instance,
         decision,
-        start_path,
-        selected_backend: actual_backend,
-    })
-}
-
-async fn activate_warm_instance(
-    state: &Arc<ServerState>,
-    pool_key: PoolKey,
-    id: Uuid,
-) -> Result<(SandboxInstance, BackendKind)> {
-    let original = match state.instances.lock() {
-        Ok(mut instances) => match instances.remove(&id) {
-            Some(instance) => instance,
-            None => {
-                return Err(restore_warm_activation(
-                    state,
-                    pool_key,
-                    id,
-                    None,
-                    BlazeDaemonError::RecoveryRequired(format!(
-                        "warm instance {id} is missing lifecycle state"
-                    )),
-                ));
-            }
+        selected_backend: created.selected_backend,
+        existing: created.existing,
+    };
+    json_response(
+        if response.existing {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
         },
-        Err(_) => {
-            return Err(restore_warm_activation(
-                state,
-                pool_key,
-                id,
-                None,
-                BlazeDaemonError::Internal("instances lock poisoned".into()),
-            ));
-        }
-    };
-
-    if original.state != SandboxState::Warm {
-        let original_state = original.state;
-        return Err(restore_warm_activation(
-            state,
-            pool_key,
-            id,
-            Some(original),
-            BlazeDaemonError::RecoveryRequired(format!(
-                "warm instance {id} has lifecycle state {original_state}"
-            )),
-        ));
-    }
-
-    let actual_backend = match state.backend_instances.lock() {
-        Ok(instances) => match instances.get(&id) {
-            Some(backend) => backend.backend(),
-            None => {
-                return Err(restore_warm_activation(
-                    state,
-                    pool_key,
-                    id,
-                    Some(original),
-                    BlazeDaemonError::RecoveryRequired(format!(
-                        "warm instance {id} is missing its backend owner"
-                    )),
-                ));
-            }
-        },
-        Err(_) => {
-            return Err(restore_warm_activation(
-                state,
-                pool_key,
-                id,
-                Some(original),
-                BlazeDaemonError::Internal("backend_instances lock poisoned".into()),
-            ));
-        }
-    };
-
-    if let Err(error) = state.storage.reconstruct(&id.to_string()).await {
-        return Err(restore_warm_activation(
-            state,
-            pool_key,
-            id,
-            Some(original),
-            error.into(),
-        ));
-    }
-
-    let mut activated = original.clone();
-    if let Err(error) = activated.transition(SandboxState::Creating) {
-        return Err(restore_warm_activation(
-            state,
-            pool_key,
-            id,
-            Some(original),
-            error.into(),
-        ));
-    }
-    if let Err(error) = activated.transition(SandboxState::Running) {
-        return Err(restore_warm_activation(
-            state,
-            pool_key,
-            id,
-            Some(original),
-            error.into(),
-        ));
-    }
-    if let Err(error) = activated.persist(&state.state_dir) {
-        return Err(restore_warm_activation(
-            state,
-            pool_key,
-            id,
-            Some(original),
-            error.into(),
-        ));
-    }
-
-    match state.instances.lock() {
-        Ok(mut instances) => {
-            instances.insert(id, activated.clone());
-        }
-        Err(_) => {
-            return Err(restore_warm_activation(
-                state,
-                pool_key,
-                id,
-                Some(original),
-                BlazeDaemonError::Internal("instances lock poisoned".into()),
-            ));
-        }
-    }
-    Ok((activated, actual_backend))
+        &response,
+    )
 }
 
-fn restore_warm_activation(
+fn evaluate_request(
     state: &Arc<ServerState>,
-    pool_key: PoolKey,
-    id: Uuid,
-    original: Option<SandboxInstance>,
-    cause: BlazeDaemonError,
-) -> BlazeDaemonError {
-    let mut errors = Vec::new();
-    if let Some(instance) = original {
-        let instance_id = instance.id;
-        if let Err(error) = instance.persist(&state.state_dir) {
-            errors.push(format!("restore warm state persistence failed: {error}"));
-        }
-        match state.instances.lock() {
-            Ok(mut instances) => {
-                instances.insert(instance_id, instance);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().insert(instance_id, instance);
-                errors.push("instances map lock poisoned while restoring warm claim".to_string());
-            }
-        }
-        match state.pool.lock() {
-            Ok(mut pool) => pool.restore_lookup(pool_key, instance_id),
-            Err(poisoned) => {
-                poisoned.into_inner().restore_lookup(pool_key, instance_id);
-                errors.push("pool lock poisoned while restoring warm claim".to_string());
-            }
-        }
-    } else {
-        match state.pool.lock() {
-            Ok(mut pool) => pool.restore_lookup(pool_key, id),
-            Err(poisoned) => {
-                poisoned.into_inner().restore_lookup(pool_key, id);
-                errors.push("pool lock poisoned while restoring warm claim".to_string());
-            }
-        }
-    }
-    let details = if errors.is_empty() {
-        "warm claim restored".to_string()
-    } else {
-        errors.join("; ")
+    workload_class: WorkloadClass,
+    image_digest: &str,
+    labels: &HashMap<String, String>,
+    kernel_version: Option<String>,
+) -> Result<RuntimeDecision> {
+    let image = ImageMetadata {
+        digest: image_digest.to_string(),
+        workload_class: Some(workload_class),
+        kernel_version,
     };
-    BlazeDaemonError::RecoveryRequired(format!("{cause}; {details}"))
-}
-
-async fn cleanup_failed_create(
-    state: &Arc<ServerState>,
-    instance: &mut SandboxInstance,
-    storage: blaze_core::storage::StorageSlot,
-    backend: Option<crate::spawner::DynBackendInstance>,
-    registered: bool,
-    original: BlazeDaemonError,
-) -> BlazeDaemonError {
-    let mut cleanup_errors = Vec::new();
-    let backend = if registered {
-        match state.backend_instances.lock() {
-            Ok(mut instances) => instances.remove(&instance.id),
-            Err(poisoned) => poisoned.into_inner().remove(&instance.id),
-        }
-    } else {
-        backend
-    };
-    let mut backend_stopped = !registered || backend.is_some();
-    if registered && backend.is_none() {
-        backend_stopped = false;
-        cleanup_errors.push("registered backend owner is missing".to_string());
-    }
-    if let Some(backend) = backend.as_ref()
-        && let Err(error) = backend.kill().await
+    let decision = state
+        .policy
+        .lock()
+        .map_err(|_| internal_lock("policy"))?
+        .evaluate(labels, &image)
+        .map_err(|error| {
+            state.metrics.inc(&state.metrics.policy_eval_failures);
+            BlazeDaemonError::from(error)
+        })?;
+    let availability = decision
+        .backend_priority
+        .iter()
+        .map(|kind| BackendStatus {
+            kind: *kind,
+            available: *kind == state.active_backend || state.active_backend == BackendKind::Mock,
+            version: None,
+        })
+        .collect::<Vec<_>>();
+    if select_backend(&decision.backend_priority, &availability).is_err()
+        && state.active_backend != BackendKind::Mock
     {
-        backend_stopped = false;
-        cleanup_errors.push(format!("backend termination failed: {error}"));
+        return Err(blaze_core::BlazeError::BackendUnavailable {
+            requested: decision
+                .backend_priority
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            available: vec![state.active_backend.to_string()],
+        }
+        .into());
     }
+    Ok(decision)
+}
 
-    let mut storage_released = false;
-    if backend_stopped {
-        match state.storage.release(storage).await {
-            Ok(()) => storage_released = true,
-            Err(error) => cleanup_errors.push(format!("storage release failed: {error}")),
-        }
-    } else {
-        cleanup_errors.push("storage retained until backend termination succeeds".to_string());
-    }
+fn list_sandboxes(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    json_ok(&state.manager.list()?)
+}
 
-    if backend_stopped && storage_released {
-        if let Err(error) = instance.transition(SandboxState::Destroyed) {
-            let mut recovery_errors = vec![format!("lifecycle update failed: {error}")];
-            if let Err(persist_error) = instance.persist(&state.state_dir) {
-                recovery_errors.push(format!("state persistence failed: {persist_error}"));
-            }
-            if let Some(retain_error) = retain_instance_state(state, instance.clone()) {
-                recovery_errors.push(retain_error);
-            }
-            return BlazeDaemonError::RecoveryRequired(format!(
-                "{original}; cleanup completed but {}",
-                recovery_errors.join("; ")
-            ));
-        }
-        if let Err(error) = instance.persist(&state.state_dir) {
-            let mut recovery_errors = vec![format!("state persistence failed: {error}")];
-            if let Some(retain_error) = retain_instance_state(state, instance.clone()) {
-                recovery_errors.push(retain_error);
-            }
-            return BlazeDaemonError::RecoveryRequired(format!(
-                "{original}; cleanup completed but {}",
-                recovery_errors.join("; ")
-            ));
-        }
+fn get_sandbox(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    json_ok(&state.manager.get(parse_uuid(id)?)?)
+}
+
+async fn destroy_sandbox(
+    state: &Arc<ServerState>,
+    id: &str,
+    no_content: bool,
+) -> Result<Response<Full<Bytes>>> {
+    let id = parse_uuid(id)?;
+    let changed = state.manager.destroy(id).await?;
+    if changed {
         state.metrics.inc(&state.metrics.instances_destroyed);
-        return original;
     }
-
-    if let Some(backend) = backend
-        && let Some(error) = retain_backend_owner(state, instance.id, backend)
-    {
-        cleanup_errors.push(error);
-    }
-    if let Err(error) = instance.persist(&state.state_dir) {
-        cleanup_errors.push(format!("state persistence failed: {error}"));
-    }
-    if let Some(error) = retain_instance_state(state, instance.clone()) {
-        cleanup_errors.push(error);
-    }
-    BlazeDaemonError::RecoveryRequired(format!(
-        "{original}; cleanup incomplete: {}",
-        cleanup_errors.join("; ")
-    ))
-}
-
-fn retain_backend_owner(
-    state: &Arc<ServerState>,
-    id: Uuid,
-    backend: crate::spawner::DynBackendInstance,
-) -> Option<String> {
-    match state.backend_instances.lock() {
-        Ok(mut instances) => {
-            instances.insert(id, backend);
-            None
-        }
-        Err(poisoned) => {
-            poisoned.into_inner().insert(id, backend);
-            Some("backend owner retained in poisoned runtime map".to_string())
-        }
-    }
-}
-
-fn retain_instance_state(state: &Arc<ServerState>, instance: SandboxInstance) -> Option<String> {
-    match state.instances.lock() {
-        Ok(mut instances) => {
-            instances.insert(instance.id, instance);
-            None
-        }
-        Err(poisoned) => {
-            poisoned.into_inner().insert(instance.id, instance);
-            Some("instance state retained in poisoned lifecycle map".to_string())
-        }
-    }
-}
-
-fn checkpoint(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
-    let uuid = parse_uuid(id)?;
-    let mut map = state
-        .instances
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?;
-    let inst = map
-        .get_mut(&uuid)
-        .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {uuid}")))?;
-
-    if inst.state == SandboxState::Running {
-        inst.transition(SandboxState::Paused)?;
-    }
-    inst.transition(SandboxState::Checkpointed)?;
-    inst.persist(&state.state_dir)?;
-
-    let checkpoint_id = format!("ckpt-{}-{}", inst.id, chrono::Utc::now().timestamp());
-    json_ok(&json!({
-        "checkpoint_id": checkpoint_id,
-        "instance_id": inst.id,
-    }))
-}
-
-fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
-    let uuid = parse_uuid(id)?;
-    let mut map = state
-        .instances
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?;
-    let inst = map
-        .get_mut(&uuid)
-        .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {uuid}")))?;
-    // TODO(v0.2): perform actual data-plane reset (full-recreate or
-    // mm-template rollback per policy reset_mode) before returning to
-    // pool. Current implementation is control-plane state only.
-    inst.transition(SandboxState::Reset)?;
-    inst.transition(SandboxState::Warm)?;
-    inst.persist(&state.state_dir)?;
-
-    // return to pool keyed on (backend, class, image_digest)
-    let key = PoolKey::new(inst.backend, inst.workload_class, inst.image_digest.clone());
-    let inst_id = inst.id;
-    let snapshot = inst.clone();
-    drop(map);
-    {
-        let mut pool = state
-            .pool
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("pool lock poisoned".into()))?;
-        pool.return_to_pool(key, inst_id);
-    }
-    state.metrics.inc(&state.metrics.instances_resets);
-    json_ok(&snapshot)
-}
-
-async fn destroy_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
-    let uuid = parse_uuid(id)?;
-    let original = state
-        .instances
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?
-        .get(&uuid)
-        .cloned()
-        .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {uuid}")))?;
-    let backend = {
-        let instances = state
-            .backend_instances
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("backend_instances lock poisoned".into()))?;
-        instances.get(&uuid).cloned()
-    };
-
-    let stop_result = if let Some(backend) = backend.as_ref() {
-        backend.kill().await
+    if no_content {
+        empty_response(StatusCode::NO_CONTENT)
     } else {
-        state
-            .spawner
-            .cleanup_orphan(uuid, &state.state_dir.join(uuid.to_string()))
-            .await
-    };
-    if let Err(error) = stop_result {
-        return Err(BlazeDaemonError::RecoveryRequired(format!(
-            "destroy {uuid}: backend termination failed: {error}; owner and storage retained"
-        )));
+        json_ok(&json!({"destroyed": true, "instance_id": id, "existing": !changed}))
     }
-
-    if let Err(error) = state.storage.release_by_id(&uuid.to_string()).await {
-        return Err(BlazeDaemonError::RecoveryRequired(format!(
-            "destroy {uuid}: backend stopped but storage release failed: {error}; owner retained for retry"
-        )));
-    }
-
-    let mut destroyed = original;
-    if destroyed.state != SandboxState::Destroyed
-        && let Err(error) = destroyed.transition(SandboxState::Destroyed)
-    {
-        return Err(BlazeDaemonError::RecoveryRequired(format!(
-            "destroy {uuid}: resources released but lifecycle update failed: {error}"
-        )));
-    }
-    if let Err(error) = destroyed.persist(&state.state_dir) {
-        return Err(BlazeDaemonError::RecoveryRequired(format!(
-            "destroy {uuid}: resources released but state persistence failed: {error}"
-        )));
-    }
-
-    let mut recovery_errors = Vec::new();
-    match state.instances.lock() {
-        Ok(mut instances) => {
-            instances.insert(uuid, destroyed.clone());
-        }
-        Err(poisoned) => {
-            poisoned.into_inner().insert(uuid, destroyed.clone());
-            recovery_errors.push("lifecycle map lock poisoned".to_string());
-        }
-    }
-    match state.backend_instances.lock() {
-        Ok(mut instances) => {
-            instances.remove(&uuid);
-        }
-        Err(poisoned) => {
-            poisoned.into_inner().remove(&uuid);
-            recovery_errors.push("runtime owner map lock poisoned".to_string());
-        }
-    }
-    if !recovery_errors.is_empty() {
-        return Err(BlazeDaemonError::RecoveryRequired(format!(
-            "destroy {uuid}: resources released and state persisted but {}",
-            recovery_errors.join("; ")
-        )));
-    }
-
-    // Provider artifacts are released, while run_dir logs and configuration
-    // remain available for post-mortem diagnostics.
-    state.metrics.inc(&state.metrics.instances_destroyed);
-    json_ok(&json!({
-        "destroyed": true,
-        "instance_id": destroyed.id,
-    }))
 }
 
-// ---------------------------------------------------------------------------
-// Pools
-// ---------------------------------------------------------------------------
-
-fn list_pools(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let pool = state
-        .pool
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("pool lock poisoned".into()))?;
-    let listed: Vec<_> = pool
-        .list_pools()
-        .into_iter()
-        .map(|(k, s)| {
-            json!({
-                "key": {
-                    "backend": k.backend.as_str(),
-                    "workload_class": k.workload_class.as_str(),
-                    "image_digest": k.image_digest,
-                },
-                "stats": s,
-            })
-        })
-        .collect();
-    json_ok(&listed)
+#[derive(Debug, Deserialize)]
+struct ExecRequest {
+    cmd: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    timeout: Option<u32>,
 }
 
-fn pool_status(
+async fn exec_sandbox(
     state: &Arc<ServerState>,
-    backend: &str,
-    class: &str,
+    id: &str,
+    body: &[u8],
 ) -> Result<Response<Full<Bytes>>> {
-    let pool = state
-        .pool
+    let request: ExecRequest = parse_body(body, "exec")?;
+    if request.cmd.is_empty() {
+        return Err(BlazeDaemonError::BadRequest("cmd is required".to_string()));
+    }
+    let configured = state
+        .config
         .lock()
-        .map_err(|_| BlazeDaemonError::Internal("pool lock poisoned".into()))?;
-    let backend_kind = BackendKind::from_str(backend)
-        .map_err(|e| BlazeDaemonError::BadRequest(format!("backend: {e}")))?;
-    let class_kind = WorkloadClass::from_str(class)
-        .map_err(|e| BlazeDaemonError::BadRequest(format!("class: {e}")))?;
-
-    let listed: Vec<_> = pool
-        .list_pools()
-        .into_iter()
-        .filter(|(k, _)| k.backend == backend_kind && k.workload_class == class_kind)
-        .map(|(k, s)| {
-            json!({
-                "key": {
-                    "backend": k.backend.as_str(),
-                    "workload_class": k.workload_class.as_str(),
-                    "image_digest": k.image_digest,
-                },
-                "stats": s,
-            })
+        .map_err(|_| internal_lock("config"))?
+        .api
+        .request_timeout
+        .clone();
+    let max_secs = parse_duration(&configured)
+        .map(|duration| {
+            duration
+                .as_secs()
+                .saturating_sub(10)
+                .min(u64::from(u32::MAX)) as u32
         })
-        .collect();
-    json_ok(&listed)
-}
-
-fn drain_pool(
-    state: &Arc<ServerState>,
-    backend: &str,
-    class: &str,
-) -> Result<Response<Full<Bytes>>> {
-    let backend_kind = BackendKind::from_str(backend)
-        .map_err(|e| BlazeDaemonError::BadRequest(format!("backend: {e}")))?;
-    let class_kind = WorkloadClass::from_str(class)
-        .map_err(|e| BlazeDaemonError::BadRequest(format!("class: {e}")))?;
-    // TODO(v0.2): after removing instance IDs from the pool, walk
-    // spawn_handles and kill the underlying processes so that drain
-    // actually frees host resources.
-    let drained = {
-        let mut pool = state
-            .pool
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("pool lock poisoned".into()))?;
-        pool.drain(backend_kind, class_kind)
-    };
+        .unwrap_or(30);
+    let timeout = request.timeout.unwrap_or(max_secs);
+    if timeout == 0 || timeout > max_secs {
+        return Err(BlazeDaemonError::BadRequest(format!(
+            "timeout must be between 1 and {max_secs} seconds"
+        )));
+    }
+    let result = state
+        .manager
+        .exec(
+            parse_uuid(id)?,
+            request.cmd,
+            request.cwd,
+            request.env,
+            timeout,
+        )
+        .await?;
     json_ok(&json!({
-        "drained": drained,
-        "count": drained.len(),
+        "exit_code": result.exit_code,
+        "stdout": String::from_utf8_lossy(&result.stdout),
+        "stderr": String::from_utf8_lossy(&result.stderr)
     }))
 }
 
 #[derive(Debug, Deserialize)]
-struct ResizeReq {
+struct FileRequest {
+    path: String,
     #[serde(default)]
-    enabled: Option<bool>,
-    min: u32,
-    target: u32,
-    max: u32,
-    #[serde(default)]
-    image_digest: Option<String>,
-    #[serde(default)]
-    warm_ttl_secs: Option<u64>,
+    data_b64: Option<String>,
 }
 
-fn resize_pool(
+async fn read_file(
     state: &Arc<ServerState>,
-    backend: &str,
-    class: &str,
+    id: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>> {
-    let req: ResizeReq = serde_json::from_slice(body)
-        .map_err(|e| BlazeDaemonError::BadRequest(format!("invalid resize body: {e}")))?;
-    let backend_kind = BackendKind::from_str(backend)
-        .map_err(|e| BlazeDaemonError::BadRequest(format!("backend: {e}")))?;
-    let class_kind = WorkloadClass::from_str(class)
-        .map_err(|e| BlazeDaemonError::BadRequest(format!("class: {e}")))?;
-    let key = PoolKey::new(
-        backend_kind,
-        class_kind,
-        req.image_digest.clone().unwrap_or_default(),
-    );
-    let cfg = PoolConfig {
-        enabled: req.enabled.unwrap_or(true),
-        min: req.min,
-        target: req.target,
-        max: req.max,
-        warm_ttl: std::time::Duration::from_secs(req.warm_ttl_secs.unwrap_or(30 * 60)),
-        reset_mode: blaze_core::policy::ResetMode::default(),
-    };
-    {
-        let mut pool = state
-            .pool
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("pool lock poisoned".into()))?;
-        pool.resize(&key, cfg);
-    }
+    let request: FileRequest = parse_body(body, "read")?;
+    validate_guest_path(&request.path)?;
+    let data = state
+        .manager
+        .read_file(parse_uuid(id)?, request.path)
+        .await?;
+    json_ok(&json!({"data_b64": BASE64.encode(data)}))
+}
+
+async fn write_file(
+    state: &Arc<ServerState>,
+    id: &str,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>> {
+    let request: FileRequest = parse_body(body, "write")?;
+    validate_guest_path(&request.path)?;
+    let encoded = request
+        .data_b64
+        .ok_or_else(|| BlazeDaemonError::BadRequest("data_b64 is required".to_string()))?;
+    let data = BASE64
+        .decode(encoded)
+        .map_err(|error| BlazeDaemonError::BadRequest(format!("invalid base64: {error}")))?;
+    state
+        .manager
+        .write_file(parse_uuid(id)?, request.path, &data)
+        .await?;
+    empty_response(StatusCode::NO_CONTENT)
+}
+
+async fn checkpoint(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    let checkpoint = state.manager.checkpoint(parse_uuid(id)?).await?;
     json_ok(&json!({
-        "resized": true,
-        "backend": backend,
-        "class": class,
+        "status": "checkpointed",
+        "checkpoint": &checkpoint.id,
+        "checkpoint_id": &checkpoint.id
     }))
 }
 
-// ---------------------------------------------------------------------------
-// Templates
-// ---------------------------------------------------------------------------
-
-fn list_templates(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let reg = state
-        .template
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("template lock poisoned".into()))?;
-    json_ok(&reg.list())
-}
-
-fn inspect_template(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
-    let uuid = parse_uuid(id)?;
-    let reg = state
-        .template
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("template lock poisoned".into()))?;
-    let view = reg
-        .inspect(uuid)
-        .ok_or_else(|| BlazeDaemonError::NotFound(format!("template {uuid}")))?;
-    json_ok(&view)
-}
-
-fn gc_templates(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let idle_ttl = {
-        let cfg = state
-            .config
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()))?;
-        parse_duration(&cfg.template.idle_ttl).unwrap_or(std::time::Duration::from_secs(3600))
-    };
-    let collected = {
-        let mut reg = state
-            .template
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("template lock poisoned".into()))?;
-        reg.gc_unused(idle_ttl)
-    };
+async fn list_checkpoints(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
     json_ok(&json!({
-        "collected": collected,
-        "count": collected.len(),
+        "checkpoints": state.manager.list_checkpoints(parse_uuid(id)?).await?
     }))
 }
 
-// ---------------------------------------------------------------------------
-// Policies / hooks
-// ---------------------------------------------------------------------------
+async fn prune_checkpoints(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    let removed = state.manager.prune_checkpoints(parse_uuid(id)?).await?;
+    json_ok(&json!({
+        "status": "pruned",
+        "removed_count": removed.len(),
+        "removed": removed
+    }))
+}
+
+async fn rollback(
+    state: &Arc<ServerState>,
+    id: &str,
+    checkpoint_id: &str,
+) -> Result<Response<Full<Bytes>>> {
+    blaze_core::checkpoint::validate_checkpoint_id(checkpoint_id).map_err(|error| {
+        BlazeDaemonError::BadRequest(format!("invalid checkpoint identifier: {error}"))
+    })?;
+    state
+        .manager
+        .rollback(parse_uuid(id)?, checkpoint_id)
+        .await?;
+    json_ok(&json!({"status": "rolledback", "checkpoint": checkpoint_id}))
+}
+
+async fn reset_to_head(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    let id = parse_uuid(id)?;
+    let checkpoint = state.manager.reset_to_head(id).await?;
+    state.metrics.inc(&state.metrics.instances_resets);
+    json_ok(&json!({"status": "running", "checkpoint": checkpoint}))
+}
+
+async fn hibernate(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    state.manager.hibernate(parse_uuid(id)?).await?;
+    json_ok(&json!({"status": "hibernated"}))
+}
+
+async fn resume(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    state.manager.resume(parse_uuid(id)?).await?;
+    json_ok(&json!({"status": "running"}))
+}
+
+fn health(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    json_ok(&json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "backend": state.active_backend,
+        "storage_pool": state.manager.pool_status()
+    }))
+}
+
+fn pool_status(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    let status = state.manager.pool_status();
+    json_ok(&json!({
+        "ready": status.ready,
+        "capacity": status.capacity,
+        "pending": status.pending,
+        "quarantined": status.quarantined,
+        "pool_ready": status.ready,
+        "pool_size": status.capacity
+    }))
+}
+
+async fn cleanup_pool(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    let destroyed = state.manager.drain_pool().await?;
+    json_ok(&json!({"destroyed": destroyed, "message": "warm pool drained"}))
+}
+
+fn metrics(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Full::new(Bytes::from(state.metrics.render())))?)
+}
+
+fn admin_reload(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    let policy_dir = state
+        .config
+        .lock()
+        .map_err(|_| internal_lock("config"))?
+        .policy
+        .dir
+        .clone();
+    let engine = blaze_core::policy::PolicyEngine::load_dir(&policy_dir)?;
+    let count = engine.policies().len();
+    *state.policy.lock().map_err(|_| internal_lock("policy"))? = engine;
+    json_ok(&json!({"reloaded": true, "policies": count}))
+}
 
 fn list_policies(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let engine = state
-        .policy
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("policy lock poisoned".into()))?;
-    let names: Vec<_> = engine
-        .policies()
-        .iter()
-        .map(|p| {
-            json!({
-                "name": p.policy_name,
-                "priority": p.priority,
-                "workload_class": p.match_.workload_class.as_str(),
+    let engine = state.policy.lock().map_err(|_| internal_lock("policy"))?;
+    json_ok(
+        &engine
+            .policies()
+            .iter()
+            .map(|policy| {
+                json!({
+                    "name": policy.policy_name,
+                    "priority": policy.priority,
+                    "workload_class": policy.match_.workload_class
+                })
             })
-        })
-        .collect();
-    json_ok(&names)
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn list_hooks(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let reg = state
-        .hook
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("hook lock poisoned".into()))?;
-    json_ok(&reg.list())
+    json_ok(&state.hook.lock().map_err(|_| internal_lock("hook"))?.list())
 }
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
+fn list_templates(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    json_ok(&state.manager.list_templates()?)
+}
 
-fn parse_uuid(s: &str) -> Result<Uuid> {
-    Uuid::parse_str(s).map_err(|e| BlazeDaemonError::BadRequest(format!("invalid uuid: {e}")))
+fn get_template(state: &Arc<ServerState>, name: &str) -> Result<Response<Full<Bytes>>> {
+    validate_name(name, "template")?;
+    json_ok(&state.manager.get_template(name)?)
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportTemplateRequest {
+    name: String,
+    source_dir: PathBuf,
+    #[serde(default)]
+    description: String,
+}
+
+async fn import_template(state: &Arc<ServerState>, body: &[u8]) -> Result<Response<Full<Bytes>>> {
+    let request: ImportTemplateRequest = parse_body(body, "template import")?;
+    validate_name(&request.name, "template")?;
+    let imported = state
+        .manager
+        .import_template(request.name, request.source_dir, request.description)
+        .await?;
+    json_response(StatusCode::CREATED, &imported)
+}
+
+fn gc_templates(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    let idle_ttl = state
+        .config
+        .lock()
+        .map_err(|_| internal_lock("config"))?
+        .template
+        .idle_ttl
+        .clone();
+    let collected = state
+        .template
+        .lock()
+        .map_err(|_| internal_lock("template"))?
+        .gc_unused(parse_duration(&idle_ttl).unwrap_or(std::time::Duration::from_secs(3600)));
+    json_ok(&json!({"collected": collected, "count": collected.len()}))
+}
+
+fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8], operation: &str) -> Result<T> {
+    serde_json::from_slice(body)
+        .map_err(|error| BlazeDaemonError::BadRequest(format!("invalid {operation} body: {error}")))
+}
+
+fn parse_uuid(value: &str) -> Result<Uuid> {
+    Uuid::parse_str(value)
+        .map_err(|error| BlazeDaemonError::BadRequest(format!("invalid sandbox UUID: {error}")))
+}
+
+fn validate_optional_name(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_name(value, label)
+}
+
+fn validate_name(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+    {
+        return Err(BlazeDaemonError::BadRequest(format!(
+            "{label} must be one non-empty path component"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_guest_path(path: &str) -> Result<()> {
+    if path.is_empty() || !path.starts_with('/') || path.len() > 4096 || path.contains('\0') {
+        return Err(BlazeDaemonError::BadRequest(
+            "guest file path must be absolute, NUL-free, and at most 4096 bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn default_if_empty<'a>(value: &'a str, default: &'a str) -> &'a str {
+    if value.is_empty() { default } else { value }
 }
 
 fn json_ok<T: Serialize>(value: &T) -> Result<Response<Full<Bytes>>> {
     json_response(StatusCode::OK, value)
 }
 
-fn json_created<T: Serialize>(value: &T) -> Result<Response<Full<Bytes>>> {
-    json_response(StatusCode::CREATED, value)
-}
-
 fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Result<Response<Full<Bytes>>> {
-    let body = serde_json::to_vec_pretty(value)?;
     Ok(Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))?)
+        .body(Full::new(Bytes::from(serde_json::to_vec_pretty(value)?)))?)
 }
 
-fn error_response(err: &BlazeDaemonError) -> Response<Full<Bytes>> {
+fn empty_response(status: StatusCode) -> Result<Response<Full<Bytes>>> {
+    Ok(Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()))?)
+}
+
+fn error_response(error: &BlazeDaemonError, method: &Method, path: &str) -> Response<Full<Bytes>> {
     let status =
-        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let sandbox_id = path
+        .split('/')
+        .find(|segment| Uuid::parse_str(segment).is_ok())
+        .map(str::to_string);
+    let operation = format!("{} {}", method.as_str(), path);
     let body = json!({
-        "error": err.to_string(),
-        "status": status.as_u16(),
+        "code": error.code(),
+        "message": error.to_string(),
+        "operation": operation,
+        "sandbox_id": sandbox_id
     });
-    let bytes = serde_json::to_vec_pretty(&body)
-        .unwrap_or_else(|_| br#"{"error":"serialize_failed"}"#.to_vec());
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(bytes)))
-        .unwrap_or_else(|_| {
-            // Hyper's builder can fail on invalid header values; this branch
-            // should be unreachable. Fall back to a status-only response.
-            Response::new(Full::new(Bytes::from_static(b"{}")))
-        })
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec_pretty(&body)
+                .unwrap_or_else(|_| br#"{"code":"internal_error"}"#.to_vec()),
+        )))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from_static(b"{}"))))
 }
 
-// Keep the unused-import lint quiet when `HookKind` is gated behind
-// future-only hook registration paths.
-#[allow(dead_code)]
-fn _hookkind_marker(_k: HookKind) {}
+fn internal_lock(name: &str) -> BlazeDaemonError {
+    BlazeDaemonError::Internal(format!("{name} lock poisoned"))
+}
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use async_trait::async_trait;
-    use blaze_core::backend::{
-        BackendKind, FlushResult, SnapshotRequest, SnapshotResult, SpawnRequest,
-    };
     use blaze_core::config::DaemonConfig;
     use blaze_core::kernel::HookRegistry;
     use blaze_core::policy::{
         BackendConfigs, FallbackOnMissingHook, PolicyEngine, PolicyFile, PolicyHooks, PolicyMatch,
-        PolicyPool, PolicySelect, WorkloadClass,
+        PolicySelect,
     };
-    use blaze_core::pool::PoolManager;
     use blaze_core::template::TemplateRegistry;
-    use blaze_core::{BlazeError, Result as CoreResult};
 
     use crate::file_provider::FileStorageProvider;
-    use crate::spawner::{
-        BackendInstance, BackendSpawner, DynBackendInstance, MockSpawner, SpawnResult,
-    };
-    use crate::state::ServerState;
+    use crate::spawner::MockSpawner;
 
     use super::*;
 
-    /// When multiple backend binaries exist on disk but the daemon probed
-    /// Firecracker at boot, only Firecracker should be reported available
-    /// and selected — even if policy prioritizes bubblewrap higher.
-    #[tokio::test]
-    async fn availability_constrained_to_active_backend() {
-        // Create temp files to simulate both binaries existing.
-        let tmp = std::env::temp_dir().join("blaze-test-active-backend");
-        let _ = std::fs::create_dir_all(&tmp);
-        let fc_bin = tmp.join("firecracker");
-        let bwrap_bin = tmp.join("bwrap");
-        std::fs::write(&fc_bin, b"fake-fc").unwrap();
-        std::fs::write(&bwrap_bin, b"fake-bwrap").unwrap();
-
-        // Minimal config with both backends present.
+    fn state(temp: &std::path::Path) -> Arc<ServerState> {
+        let images = temp.join("images");
+        let instances = temp.join("instances");
+        let policy_dir = temp.join("policies");
+        let template_dir = temp.join("templates");
+        for directory in [&images, &instances, &policy_dir, &template_dir] {
+            std::fs::create_dir_all(directory).expect("dir");
+        }
         let mut config = DaemonConfig::default();
-        config.daemon.state_dir = tmp.join("state");
-        config.storage.rootfs_size = 1024;
-        config.storage.mem_size = 512;
-        let _ = std::fs::create_dir_all(&config.daemon.state_dir);
-        config.backends.insert("firecracker".into(), fc_bin.clone());
-        config
-            .backends
-            .insert("bubblewrap".into(), bwrap_bin.clone());
-
-        // Policy that prioritizes bubblewrap over firecracker.
-        let policy_file = PolicyFile {
+        config.daemon.state_dir = temp.join("state");
+        config.storage.images_dir = images.clone();
+        config.storage.instances_dir = instances.clone();
+        config.storage.rootfs_size = 64;
+        config.storage.mem_size = 32;
+        config.policy.dir = policy_dir;
+        config.template.dir = template_dir;
+        std::fs::create_dir_all(&config.daemon.state_dir).expect("state");
+        let policy = PolicyFile {
             manifest_version: 1,
-            policy_name: "test-multi-backend".into(),
-            priority: 100,
+            policy_name: "test".into(),
+            priority: 1,
             match_: PolicyMatch {
-                workload_class: WorkloadClass::AgentRl,
-                image_labels: HashMap::new(),
-            },
-            select: PolicySelect {
-                backend_priority: vec![BackendKind::Bubblewrap, BackendKind::Firecracker],
-                kernel_hooks: vec![],
-                templates: vec![],
-                fallback_on_missing_hook: FallbackOnMissingHook::default(),
-            },
-            pool: None,
-            checkpoint: None,
-            quota: None,
-            hooks: PolicyHooks::default(),
-            backend: BackendConfigs::default(),
-            vm: None,
-        };
-        let engine = PolicyEngine::with_policies(vec![policy_file]);
-
-        // Build state with active_backend = Firecracker (simulating probe
-        // selected FC at boot) but using MockSpawner for test portability.
-        let spawner: crate::spawner::DynSpawner = Arc::new(MockSpawner);
-        let storage_dir = tmp.join("storage");
-        let _ = std::fs::create_dir_all(&storage_dir);
-        let storage: Arc<dyn blaze_core::storage::StorageProvider> =
-            Arc::new(FileStorageProvider::new(storage_dir));
-        let state = Arc::new(ServerState::build(
-            config,
-            engine,
-            PoolManager::new(),
-            TemplateRegistry::new(),
-            HookRegistry::new(),
-            spawner,
-            BackendKind::Firecracker,
-            storage,
-        ));
-
-        // Create instance request for AgentRl workload.
-        let req_body = serde_json::to_vec(&serde_json::json!({
-            "workload_class": "agent-rl",
-            "image_digest": "sha256:abc123",
-        }))
-        .unwrap();
-
-        let resp = create_instance(&state, &req_body).await.unwrap();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let resp_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        // The instance should be created with backend = firecracker,
-        // NOT bubblewrap (even though bwrap was higher priority in policy)
-        // because only the active backend is reported as available.
-        assert_eq!(
-            resp_json["instance"]["backend"].as_str().unwrap(),
-            "firecracker",
-            "instance backend should be the active backend (firecracker), \
-             not the higher-priority bubblewrap"
-        );
-
-        // Cleanup.
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[tokio::test]
-    async fn spawn_failure_releases_acquired_storage() {
-        let temp = tempfile::tempdir().expect("temp");
-        let state_dir = temp.path().join("state");
-        let storage_dir = temp.path().join("storage");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        std::fs::create_dir_all(&storage_dir).expect("storage dir");
-        let state = test_state(
-            &state_dir,
-            &storage_dir,
-            Arc::new(FailingSpawner),
-            BackendKind::Mock,
-        );
-
-        let error = create_instance(&state, &create_request())
-            .await
-            .expect_err("spawn must fail");
-
-        assert!(error.to_string().contains("injected spawn failure"));
-        assert!(directory_is_empty(&storage_dir));
-        let persisted = only_persisted_instance(&state_dir);
-        assert_eq!(persisted.state, SandboxState::Destroyed);
-    }
-
-    #[tokio::test]
-    async fn backend_registration_failure_cleans_backend_and_storage() {
-        let temp = tempfile::tempdir().expect("temp");
-        let state_dir = temp.path().join("state");
-        let storage_dir = temp.path().join("storage");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        std::fs::create_dir_all(&storage_dir).expect("storage dir");
-        let state = test_state(
-            &state_dir,
-            &storage_dir,
-            Arc::new(MockSpawner),
-            BackendKind::Mock,
-        );
-        let poison_target = state.clone();
-        std::thread::spawn(move || {
-            let _guard = poison_target
-                .backend_instances
-                .lock()
-                .expect("backend map lock");
-            panic!("poison backend map");
-        })
-        .join()
-        .expect_err("poison thread must panic");
-
-        let error = create_instance(&state, &create_request())
-            .await
-            .expect_err("registration must fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("backend_instances lock poisoned")
-        );
-        assert!(directory_is_empty(&storage_dir));
-        let persisted = only_persisted_instance(&state_dir);
-        assert_eq!(persisted.state, SandboxState::Destroyed);
-        assert!(
-            !state_dir
-                .join(persisted.id.to_string())
-                .join("vsock.uds")
-                .exists()
-        );
-    }
-
-    #[tokio::test]
-    async fn warm_reuse_preserves_backend_and_storage() {
-        let temp = tempfile::tempdir().expect("temp");
-        let state_dir = temp.path().join("state");
-        let storage_dir = temp.path().join("storage");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        std::fs::create_dir_all(&storage_dir).expect("storage dir");
-        let spawner = ControlledSpawner::new(0, None);
-        let state = test_state_with_policy(
-            &state_dir,
-            &storage_dir,
-            Arc::new(spawner.clone()),
-            BackendKind::Mock,
-            test_pool_policy(),
-        );
-
-        let first = response_json(
-            create_instance(&state, &create_request())
-                .await
-                .expect("cold create"),
-        )
-        .await;
-        let id =
-            Uuid::parse_str(first["instance"]["id"].as_str().expect("instance id")).expect("uuid");
-        reset_instance(&state, &id.to_string()).expect("reset");
-        assert_eq!(
-            state
-                .pool
-                .lock()
-                .expect("pool")
-                .stats(&pool_key())
-                .warm_count,
-            1
-        );
-
-        let second = response_json(
-            create_instance(&state, &create_request())
-                .await
-                .expect("warm create"),
-        )
-        .await;
-
-        let id_string = id.to_string();
-        assert_eq!(second["instance"]["id"].as_str(), Some(id_string.as_str()));
-        assert_eq!(second["start_path"].as_str(), Some("warm"));
-        assert_eq!(spawner.spawn_count(), 1);
-        assert_eq!(state.backend_instances.lock().expect("backends").len(), 1);
-        assert!(storage_dir.join(id.to_string()).is_dir());
-        assert_eq!(
-            state
-                .pool
-                .lock()
-                .expect("pool")
-                .stats(&pool_key())
-                .warm_count,
-            0
-        );
-
-        destroy_instance(&state, &id.to_string())
-            .await
-            .expect("destroy reused instance");
-    }
-
-    #[tokio::test]
-    async fn create_map_failure_keeps_owner_and_storage_when_kill_fails() {
-        let temp = tempfile::tempdir().expect("temp");
-        let state_dir = temp.path().join("state");
-        let storage_dir = temp.path().join("storage");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        std::fs::create_dir_all(&storage_dir).expect("storage dir");
-        let spawner = ControlledSpawner::new(1, None);
-        let state = test_state(
-            &state_dir,
-            &storage_dir,
-            Arc::new(spawner),
-            BackendKind::Mock,
-        );
-        let poison_target = state.clone();
-        std::thread::spawn(move || {
-            let _guard = poison_target.instances.lock().expect("instances map lock");
-            panic!("poison instances map");
-        })
-        .join()
-        .expect_err("poison thread must panic");
-
-        let error = create_instance(&state, &create_request())
-            .await
-            .expect_err("map update must fail");
-        assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
-
-        let id = {
-            let retained = state
-                .instances
-                .lock()
-                .expect_err("instances map remains poisoned")
-                .into_inner();
-            let (id, instance) = retained.iter().next().expect("retained instance");
-            assert_eq!(instance.state, SandboxState::Running);
-            assert!(storage_dir.join(id.to_string()).is_dir());
-            assert!(
-                state
-                    .backend_instances
-                    .lock()
-                    .expect("backends")
-                    .contains_key(id)
-            );
-            *id
-        };
-        state.instances.clear_poison();
-
-        destroy_instance(&state, &id.to_string())
-            .await
-            .expect("retry destroy");
-        assert!(!storage_dir.join(id.to_string()).exists());
-    }
-
-    #[tokio::test]
-    async fn create_persist_failure_rolls_back_backend_and_storage() {
-        let temp = tempfile::tempdir().expect("temp");
-        let state_dir = temp.path().join("state");
-        let storage_dir = temp.path().join("storage");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        std::fs::create_dir_all(&storage_dir).expect("storage dir");
-        let spawner = ControlledSpawner::new(0, Some(state_dir.clone()));
-        let state = test_state(
-            &state_dir,
-            &storage_dir,
-            Arc::new(spawner),
-            BackendKind::Mock,
-        );
-
-        let error = create_instance(&state, &create_request())
-            .await
-            .expect_err("persist must fail");
-
-        assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
-        assert!(directory_is_empty(&storage_dir));
-        assert!(state.backend_instances.lock().expect("backends").is_empty());
-        let instances = state.instances.lock().expect("instances");
-        assert_eq!(instances.len(), 1);
-        assert_eq!(
-            instances.values().next().expect("retained state").state,
-            SandboxState::Destroyed
-        );
-    }
-
-    #[tokio::test]
-    async fn destroy_failure_retains_owner_state_and_storage_for_retry() {
-        let temp = tempfile::tempdir().expect("temp");
-        let state_dir = temp.path().join("state");
-        let storage_dir = temp.path().join("storage");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        std::fs::create_dir_all(&storage_dir).expect("storage dir");
-        let spawner = ControlledSpawner::new(1, None);
-        let state = test_state(
-            &state_dir,
-            &storage_dir,
-            Arc::new(spawner),
-            BackendKind::Mock,
-        );
-        let created = response_json(
-            create_instance(&state, &create_request())
-                .await
-                .expect("create"),
-        )
-        .await;
-        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("instance id"))
-            .expect("uuid");
-
-        let error = destroy_instance(&state, &id.to_string())
-            .await
-            .expect_err("first termination must fail");
-
-        assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
-        assert_eq!(
-            state
-                .instances
-                .lock()
-                .expect("instances")
-                .get(&id)
-                .expect("instance")
-                .state,
-            SandboxState::Running
-        );
-        assert!(
-            state
-                .backend_instances
-                .lock()
-                .expect("backends")
-                .contains_key(&id)
-        );
-        assert!(storage_dir.join(id.to_string()).is_dir());
-
-        destroy_instance(&state, &id.to_string())
-            .await
-            .expect("retry destroy");
-        assert_eq!(
-            state
-                .instances
-                .lock()
-                .expect("instances")
-                .get(&id)
-                .expect("instance")
-                .state,
-            SandboxState::Destroyed
-        );
-        assert!(
-            !state
-                .backend_instances
-                .lock()
-                .expect("backends")
-                .contains_key(&id)
-        );
-        assert!(!storage_dir.join(id.to_string()).exists());
-    }
-
-    struct FailingSpawner;
-
-    #[async_trait]
-    impl BackendSpawner for FailingSpawner {
-        async fn spawn(&self, _request: SpawnRequest) -> CoreResult<DynBackendInstance> {
-            Err(BlazeError::BackendError {
-                msg: "injected spawn failure".to_string(),
-            })
-        }
-
-        async fn probe(&self, _binary_path: &std::path::Path) -> CoreResult<bool> {
-            Ok(true)
-        }
-    }
-
-    #[derive(Clone)]
-    struct ControlledSpawner {
-        spawns: Arc<AtomicUsize>,
-        kill_failures: Arc<AtomicUsize>,
-        sabotage_state_dir: Option<PathBuf>,
-    }
-
-    impl ControlledSpawner {
-        fn new(kill_failures: usize, sabotage_state_dir: Option<PathBuf>) -> Self {
-            Self {
-                spawns: Arc::new(AtomicUsize::new(0)),
-                kill_failures: Arc::new(AtomicUsize::new(kill_failures)),
-                sabotage_state_dir,
-            }
-        }
-
-        fn spawn_count(&self) -> usize {
-            self.spawns.load(Ordering::Acquire)
-        }
-    }
-
-    #[async_trait]
-    impl BackendSpawner for ControlledSpawner {
-        async fn spawn(&self, request: SpawnRequest) -> CoreResult<DynBackendInstance> {
-            self.spawns.fetch_add(1, Ordering::AcqRel);
-            let backend = MockSpawner.spawn(request).await?;
-            if let Some(state_dir) = self.sabotage_state_dir.as_ref() {
-                tokio::fs::remove_dir_all(state_dir).await?;
-                tokio::fs::write(state_dir, b"not a directory").await?;
-            }
-            Ok(Arc::new(ControlledInstance {
-                backend,
-                kill_failures: self.kill_failures.clone(),
-            }))
-        }
-
-        async fn probe(&self, _binary_path: &Path) -> CoreResult<bool> {
-            Ok(true)
-        }
-    }
-
-    struct ControlledInstance {
-        backend: DynBackendInstance,
-        kill_failures: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl BackendInstance for ControlledInstance {
-        fn instance_id(&self) -> Uuid {
-            self.backend.instance_id()
-        }
-
-        fn backend(&self) -> BackendKind {
-            self.backend.backend()
-        }
-
-        fn version(&self) -> Option<&str> {
-            self.backend.version()
-        }
-
-        fn pid(&self) -> Option<u32> {
-            self.backend.pid()
-        }
-
-        fn guest_socket_path(&self) -> &Path {
-            self.backend.guest_socket_path()
-        }
-
-        async fn wait(&self) -> CoreResult<SpawnResult> {
-            self.backend.wait().await
-        }
-
-        async fn pause(&self) -> CoreResult<()> {
-            self.backend.pause().await
-        }
-
-        async fn resume(&self) -> CoreResult<()> {
-            self.backend.resume().await
-        }
-
-        async fn snapshot(&self, request: SnapshotRequest) -> CoreResult<SnapshotResult> {
-            self.backend.snapshot(request).await
-        }
-
-        async fn flush_dirty(&self) -> CoreResult<FlushResult> {
-            self.backend.flush_dirty().await
-        }
-
-        async fn kill(&self) -> CoreResult<()> {
-            let injected = self
-                .kill_failures
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok();
-            if injected {
-                return Err(BlazeError::BackendError {
-                    msg: "injected backend termination failure".to_string(),
-                });
-            }
-            self.backend.kill().await
-        }
-    }
-
-    fn test_state(
-        state_dir: &std::path::Path,
-        storage_dir: &std::path::Path,
-        spawner: crate::spawner::DynSpawner,
-        active_backend: BackendKind,
-    ) -> Arc<ServerState> {
-        test_state_with_policy(
-            state_dir,
-            storage_dir,
-            spawner,
-            active_backend,
-            test_policy(),
-        )
-    }
-
-    fn test_state_with_policy(
-        state_dir: &std::path::Path,
-        storage_dir: &std::path::Path,
-        spawner: crate::spawner::DynSpawner,
-        active_backend: BackendKind,
-        policy: PolicyFile,
-    ) -> Arc<ServerState> {
-        let mut config = DaemonConfig::default();
-        config.daemon.state_dir = state_dir.to_path_buf();
-        config.storage.rootfs_size = 1024;
-        config.storage.mem_size = 512;
-        let storage: Arc<dyn blaze_core::storage::StorageProvider> =
-            Arc::new(FileStorageProvider::new(storage_dir.to_path_buf()));
-        Arc::new(ServerState::build(
-            config,
-            PolicyEngine::with_policies(vec![policy]),
-            PoolManager::new(),
-            TemplateRegistry::new(),
-            HookRegistry::new(),
-            spawner,
-            active_backend,
-            storage,
-        ))
-    }
-
-    fn test_policy() -> PolicyFile {
-        PolicyFile {
-            manifest_version: 1,
-            policy_name: "test-create-cleanup".into(),
-            priority: 100,
-            match_: PolicyMatch {
-                workload_class: WorkloadClass::AgentRl,
+                workload_class: WorkloadClass::AgentTool,
                 image_labels: HashMap::new(),
             },
             select: PolicySelect {
                 backend_priority: vec![BackendKind::Mock],
-                kernel_hooks: vec![],
-                templates: vec![],
-                fallback_on_missing_hook: FallbackOnMissingHook::default(),
+                kernel_hooks: Vec::new(),
+                templates: Vec::new(),
+                fallback_on_missing_hook: FallbackOnMissingHook::Fail,
             },
             pool: None,
             checkpoint: None,
@@ -1686,36 +714,31 @@ mod tests {
             hooks: PolicyHooks::default(),
             backend: BackendConfigs::default(),
             vm: None,
-        }
-    }
-
-    fn test_pool_policy() -> PolicyFile {
-        let mut policy = test_policy();
-        policy.pool = Some(PolicyPool {
-            enabled: true,
-            min: 0,
-            target: 1,
-            max: 1,
-            warm_ttl: "30m".to_string(),
-            reset_mode: Default::default(),
-        });
-        policy
-    }
-
-    fn pool_key() -> PoolKey {
-        PoolKey::new(
-            BackendKind::Mock,
-            WorkloadClass::AgentRl,
-            "sha256:test".to_string(),
+        };
+        Arc::new(
+            ServerState::build(
+                config,
+                PolicyEngine::with_policies(vec![policy]),
+                TemplateRegistry::new(),
+                HookRegistry::new(),
+                Arc::new(MockSpawner),
+                BackendKind::Mock,
+                Arc::new(FileStorageProvider::with_images(images, instances)),
+            )
+            .expect("state"),
         )
     }
 
-    fn create_request() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "workload_class": "agent-rl",
-            "image_digest": "sha256:test",
-        }))
-        .expect("request")
+    async fn route_status(
+        state: &Arc<ServerState>,
+        method: Method,
+        path: &str,
+        body: &[u8],
+    ) -> StatusCode {
+        match dispatch(&method, path, "", body.to_vec(), state).await {
+            Ok(response) => response.status(),
+            Err(error) => StatusCode::from_u16(error.status_code()).expect("error status"),
+        }
     }
 
     async fn response_json(response: Response<Full<Bytes>>) -> serde_json::Value {
@@ -1723,26 +746,275 @@ mod tests {
             .into_body()
             .collect()
             .await
-            .expect("collect response")
+            .expect("body")
             .to_bytes();
-        serde_json::from_slice(&body).expect("response json")
+        serde_json::from_slice(&body).expect("json")
     }
 
-    fn directory_is_empty(path: &std::path::Path) -> bool {
-        std::fs::read_dir(path)
-            .expect("read directory")
-            .next()
-            .is_none()
+    #[tokio::test]
+    async fn every_sandbox_route_reaches_its_registered_handler() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = state(temp.path());
+        let checkpoint_id = "ckpt-00000000-0000-4000-8000-000000000000";
+        let cases = [
+            (Method::POST, "/v1/sandboxes", b"{".as_slice(), 400),
+            (Method::GET, "/v1/sandboxes", b"".as_slice(), 200),
+            (Method::GET, "/v1/sandboxes/not-a-uuid", b"", 400),
+            (Method::DELETE, "/v1/sandboxes/not-a-uuid", b"", 400),
+            (
+                Method::POST,
+                "/v1/sandboxes/not-a-uuid/exec",
+                br#"{"cmd":"true"}"#,
+                400,
+            ),
+            (Method::POST, "/v1/sandboxes/not-a-uuid/hibernate", b"", 400),
+            (
+                Method::POST,
+                "/v1/sandboxes/not-a-uuid/checkpoint",
+                b"",
+                400,
+            ),
+            (
+                Method::GET,
+                "/v1/sandboxes/not-a-uuid/checkpoints",
+                b"",
+                400,
+            ),
+            (
+                Method::POST,
+                "/v1/sandboxes/not-a-uuid/checkpoints/prune",
+                b"",
+                400,
+            ),
+            (
+                Method::POST,
+                &format!("/v1/sandboxes/not-a-uuid/rollback/{checkpoint_id}"),
+                b"",
+                400,
+            ),
+            (Method::POST, "/v1/sandboxes/not-a-uuid/resume", b"", 400),
+            (
+                Method::POST,
+                "/v1/sandboxes/not-a-uuid/read",
+                br#"{"path":"/tmp/x"}"#,
+                400,
+            ),
+            (
+                Method::POST,
+                "/v1/sandboxes/not-a-uuid/write",
+                br#"{"path":"/tmp/x","data_b64":""}"#,
+                400,
+            ),
+            (Method::GET, "/v1/templates", b"", 200),
+            (Method::GET, "/v1/templates/missing", b"", 404),
+            (Method::POST, "/v1/templates/import", b"{}", 400),
+            (Method::GET, "/v1/health", b"", 200),
+            (Method::POST, "/v1/pool/cleanup", b"", 200),
+            (Method::GET, "/v1/pool/status", b"", 200),
+        ];
+        for (method, path, body, expected) in cases {
+            assert_eq!(
+                route_status(&state, method.clone(), path, body).await,
+                StatusCode::from_u16(expected).expect("expected status"),
+                "{method} {path}"
+            );
+        }
     }
 
-    fn only_persisted_instance(state_dir: &std::path::Path) -> SandboxInstance {
-        let mut entries = std::fs::read_dir(state_dir).expect("read state dir");
-        let entry = entries
-            .next()
-            .expect("one persisted instance")
-            .expect("state entry");
-        assert!(entries.next().is_none());
-        let id = Uuid::parse_str(entry.file_name().to_str().expect("utf-8 id")).expect("uuid");
-        SandboxInstance::load(state_dir, id).expect("load state")
+    #[tokio::test]
+    async fn compatibility_and_documented_extension_routes_are_registered() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = state(temp.path());
+        let cases = [
+            (Method::GET, "/v1/instances", b"".as_slice(), 200),
+            (Method::POST, "/v1/instances", b"{".as_slice(), 400),
+            (Method::GET, "/v1/instances/not-a-uuid", b"", 400),
+            (Method::DELETE, "/v1/instances/not-a-uuid", b"", 400),
+            (Method::POST, "/v1/instances/not-a-uuid/destroy", b"", 400),
+            (
+                Method::POST,
+                "/v1/instances/not-a-uuid/exec",
+                br#"{"cmd":"true"}"#,
+                400,
+            ),
+            (
+                Method::POST,
+                "/v1/instances/not-a-uuid/read",
+                br#"{"path":"/tmp/x"}"#,
+                400,
+            ),
+            (
+                Method::POST,
+                "/v1/instances/not-a-uuid/write",
+                br#"{"path":"/tmp/x","data_b64":""}"#,
+                400,
+            ),
+            (
+                Method::POST,
+                "/v1/instances/not-a-uuid/checkpoint",
+                b"",
+                400,
+            ),
+            (Method::POST, "/v1/instances/not-a-uuid/reset", b"", 400),
+            (Method::GET, "/v1/pools", b"", 200),
+            (Method::GET, "/v1/pools/mock/agent-tool", b"", 200),
+            (Method::POST, "/v1/pools/mock/agent-tool/drain", b"", 200),
+            (Method::POST, "/v1/templates/gc", b"", 200),
+            (Method::GET, "/v1/policies", b"", 200),
+            (Method::GET, "/v1/hooks", b"", 200),
+            (Method::GET, "/v1/metrics", b"", 200),
+            (Method::POST, "/v1/admin/reload", b"", 200),
+        ];
+        for (method, path, body, expected) in cases {
+            assert_eq!(
+                route_status(&state, method.clone(), path, body).await,
+                StatusCode::from_u16(expected).expect("expected status"),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_and_compatibility_create_share_manager() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = state(temp.path());
+        let id = Uuid::new_v4();
+        let body = serde_json::to_vec(&json!({
+            "id": id,
+            "workload_class": "agent-tool",
+            "image_digest": "sha256:test"
+        }))
+        .expect("body");
+        let created = dispatch(&Method::POST, "/v1/sandboxes", "", body.clone(), &state)
+            .await
+            .expect("canonical");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let repeated = dispatch(&Method::POST, "/v1/instances", "", body, &state)
+            .await
+            .expect("compatibility");
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(state.manager.list().expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_retry_semantics_are_explicit() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = state(temp.path());
+        let id = Uuid::new_v4();
+        let body = serde_json::to_vec(&json!({
+            "id": id,
+            "workload_class": "agent-tool",
+            "image_digest": "sha256:idempotency"
+        }))
+        .expect("body");
+        assert_eq!(
+            dispatch(&Method::POST, "/v1/sandboxes", "", body.clone(), &state)
+                .await
+                .expect("create")
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            dispatch(&Method::POST, "/v1/sandboxes", "", body, &state)
+                .await
+                .expect("idempotent create")
+                .status(),
+            StatusCode::OK
+        );
+
+        let checkpoint_path = format!("/v1/sandboxes/{id}/checkpoint");
+        let first = dispatch(&Method::POST, &checkpoint_path, "", Vec::new(), &state)
+            .await
+            .expect("first checkpoint");
+        let first_id = response_json(first).await["checkpoint_id"]
+            .as_str()
+            .expect("first id")
+            .to_string();
+        let second = dispatch(&Method::POST, &checkpoint_path, "", Vec::new(), &state)
+            .await
+            .expect("second checkpoint");
+        let second_id = response_json(second).await["checkpoint_id"]
+            .as_str()
+            .expect("second id")
+            .to_string();
+        assert_ne!(first_id, second_id, "checkpoint POST is non-idempotent");
+
+        let rollback_path = format!("/v1/sandboxes/{id}/rollback/{first_id}");
+        for _ in 0..2 {
+            assert_eq!(
+                dispatch(&Method::POST, &rollback_path, "", Vec::new(), &state)
+                    .await
+                    .expect("repeatable rollback")
+                    .status(),
+                StatusCode::OK
+            );
+        }
+
+        let hibernate_path = format!("/v1/sandboxes/{id}/hibernate");
+        assert_eq!(
+            dispatch(&Method::POST, &hibernate_path, "", Vec::new(), &state)
+                .await
+                .expect("hibernate")
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            route_status(&state, Method::POST, &hibernate_path, b"").await,
+            StatusCode::CONFLICT
+        );
+        let resume_path = format!("/v1/sandboxes/{id}/resume");
+        assert_eq!(
+            dispatch(&Method::POST, &resume_path, "", Vec::new(), &state)
+                .await
+                .expect("resume")
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            route_status(&state, Method::POST, &resume_path, b"").await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            dispatch(
+                &Method::DELETE,
+                &format!("/v1/sandboxes/{id}"),
+                "",
+                Vec::new(),
+                &state,
+            )
+            .await
+            .expect("destroy")
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_use_frozen_shape() {
+        let response = error_response(
+            &BlazeDaemonError::NotFound("sandbox".into()),
+            &Method::GET,
+            "/v1/sandboxes/00000000-0000-0000-0000-000000000000",
+        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).expect("content type"),
+            "application/json"
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["code"], "not_found");
+        assert_eq!(value["message"], "not found: sandbox");
+        assert_eq!(
+            value["operation"],
+            "GET /v1/sandboxes/00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(value["sandbox_id"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(value.as_object().expect("object").len(), 4);
     }
 }

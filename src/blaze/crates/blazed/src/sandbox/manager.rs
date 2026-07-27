@@ -11,7 +11,7 @@ use blaze_core::backend::{BackendKind, NetworkConfig, SpawnRequest};
 use blaze_core::checkpoint::CheckpointStore;
 use blaze_core::config::DaemonConfig;
 use blaze_core::lifecycle::{OperationKind, SandboxInstance, SandboxState, StartPath};
-use blaze_core::policy::{BackendConfigs, RuntimeDecision, VmConfig};
+use blaze_core::policy::{BackendConfigs, RuntimeDecision, VmConfig, parse_duration};
 use blaze_core::storage::{AcquireOpts, PoolStatus, StorageProvider, StorageSlot};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -78,8 +78,6 @@ impl SandboxManager {
         active_backend: BackendKind,
         storage: Arc<dyn StorageProvider>,
         cancellation: CancellationToken,
-        request_timeout: Duration,
-        max_file_bytes: usize,
     ) -> Result<Self> {
         for instance in instances.values_mut() {
             if !matches!(
@@ -90,6 +88,12 @@ impl SandboxManager {
                 instance.persist(&config.daemon.state_dir)?;
             }
         }
+        let request_timeout = parse_duration(&config.api.request_timeout).ok_or_else(|| {
+            BlazeDaemonError::Internal(
+                "validated api.request_timeout could not be parsed".to_string(),
+            )
+        })?;
+        let max_file_bytes = config.api.max_file_bytes;
         let warm_pool = RuntimeWarmPool::new(
             config.storage.pool_size,
             config.storage.prefork,
@@ -1016,8 +1020,6 @@ mod tests {
                 BackendKind::Mock,
                 Arc::new(FileStorageProvider::with_images(images, instances)),
                 CancellationToken::new(),
-                Duration::from_secs(30),
-                16 * 1024 * 1024,
             )
             .expect("manager"),
         )

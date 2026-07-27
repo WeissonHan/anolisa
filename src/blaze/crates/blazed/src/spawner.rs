@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Backend process ownership and runtime lifecycle abstraction.
 
-#![allow(dead_code)] // Runtime foundations are wired by the lifecycle layer.
-
 pub mod firecracker;
 pub mod netns;
 
