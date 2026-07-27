@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
-use crate::guest::GuestClient;
+use crate::guest::{GuestClient, GuestExecResult};
 use crate::runtime_pool::{PoolPrototype, RuntimePoolSlot, RuntimeWarmPool};
 use crate::spawner::{DynBackendInstance, DynSpawner};
 
@@ -66,6 +66,7 @@ pub struct SandboxManager {
     pub(super) cancellation: CancellationToken,
     pub(super) warm_pool: Arc<RuntimeWarmPool>,
     request_timeout: Duration,
+    max_file_bytes: usize,
 }
 
 impl SandboxManager {
@@ -78,6 +79,7 @@ impl SandboxManager {
         storage: Arc<dyn StorageProvider>,
         cancellation: CancellationToken,
         request_timeout: Duration,
+        max_file_bytes: usize,
     ) -> Result<Self> {
         for instance in instances.values_mut() {
             if !matches!(
@@ -112,6 +114,7 @@ impl SandboxManager {
             cancellation,
             warm_pool,
             request_timeout,
+            max_file_bytes,
         })
     }
 
@@ -207,6 +210,46 @@ impl SandboxManager {
             .get(&id)
             .cloned()
             .ok_or_else(|| BlazeDaemonError::NotFound(format!("sandbox {id}")))
+    }
+
+    /// Execute one command through the running sandbox guest.
+    pub async fn exec(
+        &self,
+        id: Uuid,
+        command: String,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        timeout_secs: u32,
+    ) -> Result<GuestExecResult> {
+        let runtime = self.runtime(id)?;
+        let runtime = runtime.lock().await;
+        self.require_state(id, SandboxState::Running)?;
+        self.guest_client(id, &runtime)?
+            .exec(command, cwd, env, timeout_secs)
+            .await
+            .map_err(BlazeDaemonError::from)
+    }
+
+    /// Read one file through the running sandbox guest.
+    pub async fn read_file(&self, id: Uuid, path: String) -> Result<Vec<u8>> {
+        let runtime = self.runtime(id)?;
+        let runtime = runtime.lock().await;
+        self.require_state(id, SandboxState::Running)?;
+        self.guest_client(id, &runtime)?
+            .read_file(path)
+            .await
+            .map_err(BlazeDaemonError::from)
+    }
+
+    /// Replace one file through the running sandbox guest.
+    pub async fn write_file(&self, id: Uuid, path: String, data: &[u8]) -> Result<()> {
+        let runtime = self.runtime(id)?;
+        let runtime = runtime.lock().await;
+        self.require_state(id, SandboxState::Running)?;
+        self.guest_client(id, &runtime)?
+            .write_file(path, data)
+            .await
+            .map_err(BlazeDaemonError::from)
     }
 
     /// Create and wait for a usable sandbox runtime.
@@ -659,6 +702,23 @@ impl SandboxManager {
         self.request_timeout
     }
 
+    fn guest_client(&self, id: Uuid, runtime: &SandboxRuntime) -> Result<GuestClient> {
+        let backend = runtime.backend.as_ref().ok_or_else(|| {
+            BlazeDaemonError::Conflict(format!("sandbox {id} has no backend instance"))
+        })?;
+        let metadata = self.get(id)?;
+        if !guest_enabled(backend.backend(), &metadata.backend_config) {
+            return Err(BlazeDaemonError::Conflict(format!(
+                "sandbox {id} has no guest agent"
+            )));
+        }
+        Ok(GuestClient::new(
+            backend.guest_socket_path().to_path_buf(),
+            self.request_timeout(),
+        )
+        .with_file_limit(self.max_file_bytes))
+    }
+
     pub(super) fn binary_path(&self) -> PathBuf {
         self.config
             .backends
@@ -957,6 +1017,7 @@ mod tests {
                 Arc::new(FileStorageProvider::with_images(images, instances)),
                 CancellationToken::new(),
                 Duration::from_secs(30),
+                16 * 1024 * 1024,
             )
             .expect("manager"),
         )
@@ -1050,6 +1111,60 @@ mod tests {
         assert_eq!(tokio::fs::read(&rootfs_path).await.expect("read"), b"hello");
         assert!(manager.destroy(id).await.expect("destroy"));
         assert!(!hibernate_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn guest_operations_follow_runtime_replacement() {
+        let temp = tempfile::tempdir().expect("temp");
+        let manager = manager(temp.path());
+        let id = Uuid::new_v4();
+        manager
+            .create(CreateSandbox {
+                requested_id: Some(id),
+                decision: decision(),
+                image_digest: "sha256:test".into(),
+                template_name: "base".into(),
+                binary_path: PathBuf::new(),
+            })
+            .await
+            .expect("create");
+
+        let exec = manager
+            .exec(id, "echo managed".into(), None, None, 1)
+            .await
+            .expect("exec");
+        assert_eq!(exec.stdout, b"echo managed");
+        manager
+            .write_file(id, "/tmp/value".into(), b"checkpointed")
+            .await
+            .expect("write");
+        let checkpoint = manager.checkpoint(id).await.expect("checkpoint");
+        manager
+            .write_file(id, "/tmp/value".into(), b"mutated")
+            .await
+            .expect("mutate");
+        manager
+            .rollback(id, &checkpoint.id)
+            .await
+            .expect("rollback");
+        assert_eq!(
+            manager
+                .read_file(id, "/tmp/value".into())
+                .await
+                .expect("read rollback"),
+            b"checkpointed"
+        );
+
+        manager.hibernate(id).await.expect("hibernate");
+        manager.resume(id).await.expect("resume");
+        assert_eq!(
+            manager
+                .read_file(id, "/tmp/value".into())
+                .await
+                .expect("read resume"),
+            b"checkpointed"
+        );
+        assert!(manager.destroy(id).await.expect("destroy"));
     }
 
     #[tokio::test]
