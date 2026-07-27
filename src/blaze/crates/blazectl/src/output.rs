@@ -11,7 +11,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::cli::OutputMode;
-use crate::protocol::{DaemonErrorResponse, ExecResponse, ReadResponse, SandboxSummary};
+use crate::protocol::{
+    CheckpointListResponse, DaemonErrorResponse, ExecResponse, ReadResponse, SandboxSummary,
+};
 
 /// Write exactly one compact JSON value followed by one newline.
 ///
@@ -68,6 +70,81 @@ pub fn write_sandbox_list(
         .map_err(|source| OutputError::Write { source })
 }
 
+/// Write stable labeled text fields, one field per line.
+///
+/// Labels are reviewed static strings. Values have control characters escaped
+/// so one value cannot inject another field or row.
+///
+/// # Errors
+///
+/// Returns [`OutputError`] when writing fails.
+pub fn write_text_fields(
+    mut writer: impl Write,
+    fields: &[(&'static str, String)],
+) -> Result<(), OutputError> {
+    let mut rendered = String::new();
+    for (label, value) in fields {
+        rendered.push_str(label);
+        rendered.push('\t');
+        push_text_cell(&mut rendered, value);
+        rendered.push('\n');
+    }
+    writer
+        .write_all(rendered.as_bytes())
+        .map_err(|source| OutputError::Write { source })
+}
+
+/// Write deterministic checkpoint columns or one sorted JSON object.
+///
+/// # Errors
+///
+/// Returns [`OutputError`] when serialization or writing fails.
+pub fn write_checkpoint_list(
+    mut writer: impl Write,
+    mode: OutputMode,
+    response: &CheckpointListResponse,
+) -> Result<(), OutputError> {
+    let mut checkpoints = response.checkpoints.clone();
+    checkpoints.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if mode == OutputMode::Json {
+        return write_json(writer, &CheckpointListResponse { checkpoints });
+    }
+
+    let mut rendered = String::from("ID\tPARENT\tCREATED\tSIZE_BYTES\tHEAD\tON_HEAD_CHAIN\n");
+    for checkpoint in checkpoints {
+        push_text_cell(&mut rendered, &checkpoint.id);
+        rendered.push('\t');
+        match checkpoint.parent {
+            Some(parent) => push_text_cell(&mut rendered, &parent),
+            None => rendered.push('-'),
+        }
+        rendered.push('\t');
+        rendered.push_str(
+            &checkpoint
+                .created_at
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+        );
+        rendered.push('\t');
+        rendered.push_str(&checkpoint.size_bytes.to_string());
+        rendered.push('\t');
+        rendered.push_str(if checkpoint.is_head { "true" } else { "false" });
+        rendered.push('\t');
+        rendered.push_str(if checkpoint.on_head_chain {
+            "true"
+        } else {
+            "false"
+        });
+        rendered.push('\n');
+    }
+    writer
+        .write_all(rendered.as_bytes())
+        .map_err(|source| OutputError::Write { source })
+}
+
 /// Write guest command output without invoking or interpreting a local shell.
 ///
 /// Text mode preserves the daemon stdout/stderr split and adds no bytes. JSON
@@ -107,12 +184,12 @@ pub fn write_read(
     mode: OutputMode,
     response: &ReadResponse,
 ) -> Result<(), OutputError> {
-    if mode == OutputMode::Json {
-        return write_json(stdout, response);
-    }
     let bytes = BASE64
         .decode(response.data_b64.as_bytes())
         .map_err(|source| OutputError::InvalidBase64 { source })?;
+    if mode == OutputMode::Json {
+        return write_json(stdout, response);
+    }
     stdout
         .write_all(&bytes)
         .map_err(|source| OutputError::Write { source })
@@ -237,6 +314,8 @@ mod tests {
     use chrono::{DateTime, Utc};
     use serde_json::{Value, json};
 
+    use crate::protocol::CheckpointSummary;
+
     use super::*;
 
     #[test]
@@ -296,6 +375,44 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_output_has_stable_columns_and_order() {
+        let response = CheckpointListResponse {
+            checkpoints: vec![
+                checkpoint(2, "2026-01-02T00:00:00Z", false),
+                checkpoint(1, "2026-01-01T00:00:00Z", true),
+            ],
+        };
+        let mut text = Vec::new();
+        write_checkpoint_list(&mut text, OutputMode::Text, &response).expect("text checkpoints");
+        assert_eq!(
+            text,
+            concat!(
+                "ID\tPARENT\tCREATED\tSIZE_BYTES\tHEAD\tON_HEAD_CHAIN\n",
+                "ckpt-00000000-0000-4000-8000-000000000001\t-\t",
+                "2026-01-01T00:00:00Z\t1\ttrue\ttrue\n",
+                "ckpt-00000000-0000-4000-8000-000000000002\t-\t",
+                "2026-01-02T00:00:00Z\t2\tfalse\ttrue\n"
+            )
+            .as_bytes()
+        );
+
+        let mut json = Vec::new();
+        write_checkpoint_list(&mut json, OutputMode::Json, &response).expect("JSON checkpoints");
+        assert_eq!(
+            json_values(&json)[0]["checkpoints"][0]["id"],
+            "ckpt-00000000-0000-4000-8000-000000000001"
+        );
+    }
+
+    #[test]
+    fn labeled_text_fields_escape_control_characters() {
+        let fields = [("STATUS", "run\nning".to_string())];
+        let mut output = Vec::new();
+        write_text_fields(&mut output, &fields).expect("fields");
+        assert_eq!(output, b"STATUS\trun\\nning\n");
+    }
+
+    #[test]
     fn exec_text_preserves_the_two_daemon_streams() {
         let response = ExecResponse {
             exit_code: 7,
@@ -349,11 +466,12 @@ mod tests {
         let response = ReadResponse {
             data_b64: "not standard base64".to_string(),
         };
-        let mut output = Vec::new();
-        let error =
-            write_read(&mut output, OutputMode::Text, &response).expect_err("invalid base64");
-        assert!(matches!(error, OutputError::InvalidBase64 { .. }));
-        assert!(output.is_empty());
+        for mode in [OutputMode::Text, OutputMode::Json] {
+            let mut output = Vec::new();
+            let error = write_read(&mut output, mode, &response).expect_err("invalid base64");
+            assert!(matches!(error, OutputError::InvalidBase64 { .. }));
+            assert!(output.is_empty());
+        }
     }
 
     #[test]
@@ -460,6 +578,19 @@ mod tests {
             created_at: DateTime::parse_from_rfc3339(created_at)
                 .expect("timestamp")
                 .with_timezone(&Utc),
+        }
+    }
+
+    fn checkpoint(suffix: u128, created_at: &str, is_head: bool) -> CheckpointSummary {
+        CheckpointSummary {
+            id: format!("ckpt-{}", id(suffix)),
+            parent: None,
+            created_at: DateTime::parse_from_rfc3339(created_at)
+                .expect("timestamp")
+                .with_timezone(&Utc),
+            size_bytes: suffix as u64,
+            is_head,
+            on_head_chain: true,
         }
     }
 

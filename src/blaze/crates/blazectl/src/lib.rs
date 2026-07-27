@@ -5,6 +5,8 @@ use std::io::{self, Write};
 
 pub mod cli;
 pub mod client;
+pub mod commands;
+pub mod input;
 pub mod output;
 pub mod protocol;
 pub mod response;

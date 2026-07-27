@@ -11,6 +11,10 @@ publish.workspace = true
 name = "blazectl"
 path = "src/main.rs"
 
+[features]
+default = []
+integration = []
+
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -23,4 +27,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 uuid = { workspace = true }

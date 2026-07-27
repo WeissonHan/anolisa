@@ -295,6 +295,9 @@ pub enum ClientError {
     /// The complete request deadline elapsed.
     #[error("daemon request timed out")]
     RequestTimeout,
+    /// The caller cancelled the command.
+    #[error("daemon request was cancelled")]
+    Cancelled,
     /// A response exceeded the configured collection bound.
     #[error("daemon response exceeded the configured size limit")]
     ResponseTooLarge,
