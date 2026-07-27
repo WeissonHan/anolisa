@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BlazeError, ConfigErrorSource, Result};
+use crate::policy::parse_duration;
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -29,6 +30,8 @@ pub struct DaemonConfig {
     pub template: TemplateSection,
     #[serde(default)]
     pub metrics: MetricsSection,
+    #[serde(default)]
+    pub api: ApiSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,12 +154,10 @@ pub struct StorageSection {
     pub provider: String,
 
     /// Warm pool target size (0 = no pool).
-    /// NOTE: Reserved for future use. Not yet wired into runtime.
     #[serde(default)]
     pub pool_size: usize,
 
     /// Whether to pre-start VMs in pool slots.
-    /// NOTE: Reserved for future use. Not yet wired into runtime.
     #[serde(default)]
     pub prefork: bool,
 
@@ -189,6 +190,30 @@ impl Default for StorageSection {
     }
 }
 
+/// Management request and guest-I/O limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiSection {
+    /// Maximum accepted HTTP request body.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Maximum decoded payload for guest read and write operations.
+    #[serde(default = "default_max_file_bytes")]
+    pub max_file_bytes: usize,
+    /// Upper bound for one management operation.
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: String,
+}
+
+impl Default for ApiSection {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: default_max_body_bytes(),
+            max_file_bytes: default_max_file_bytes(),
+            request_timeout: default_request_timeout(),
+        }
+    }
+}
+
 impl DaemonConfig {
     /// Load and parse a daemon configuration file at `path`.
     pub fn load(path: &Path) -> Result<Self> {
@@ -205,6 +230,12 @@ impl DaemonConfig {
         if self.storage.rootfs_size == 0 || self.storage.mem_size == 0 {
             return Err(invalid_config(
                 "storage.rootfs_size and storage.mem_size must be greater than zero",
+            ));
+        }
+        validate_duration("api.request_timeout", &self.api.request_timeout, 11)?;
+        if self.api.max_body_bytes == 0 || self.api.max_file_bytes == 0 {
+            return Err(invalid_config(
+                "api.max_body_bytes and api.max_file_bytes must be greater than zero",
             ));
         }
         Ok(())
@@ -224,6 +255,17 @@ pub fn validate_storage_paths(images_dir: &Path, instances_dir: &Path) -> Result
         )));
     }
     Ok(())
+}
+
+fn validate_duration(name: &str, value: &str, minimum_secs: u64) -> Result<std::time::Duration> {
+    let duration = parse_duration(value)
+        .ok_or_else(|| invalid_config(format!("{name} must be a positive duration")))?;
+    if duration.as_secs() < minimum_secs {
+        return Err(invalid_config(format!(
+            "{name} must be at least {minimum_secs}s"
+        )));
+    }
+    Ok(duration)
 }
 
 fn invalid_config(message: impl Into<String>) -> BlazeError {
@@ -285,6 +327,15 @@ fn default_rootfs_size() -> u64 {
 fn default_mem_size() -> u64 {
     4 * 1024 * 1024 * 1024
 }
+fn default_max_body_bytes() -> usize {
+    1024 * 1024
+}
+fn default_max_file_bytes() -> usize {
+    16 * 1024 * 1024
+}
+fn default_request_timeout() -> String {
+    "30s".to_string()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +347,7 @@ mod tests {
         assert_eq!(cfg.policy.on_load_error, PolicyLoadErrorMode::Fail);
         assert!(cfg.backends.is_empty());
         assert_ne!(cfg.storage.images_dir, cfg.storage.instances_dir);
+        assert_eq!(cfg.api.max_body_bytes, 1024 * 1024);
     }
 
     #[test]
@@ -333,5 +385,12 @@ mod tests {
             let error = cfg.validate().expect_err("overlapping paths");
             assert!(error.to_string().contains("must be disjoint"));
         }
+    }
+
+    #[test]
+    fn validation_rejects_short_request_timeout() {
+        let mut cfg = DaemonConfig::default();
+        cfg.api.request_timeout = "10s".into();
+        assert!(cfg.validate().is_err());
     }
 }

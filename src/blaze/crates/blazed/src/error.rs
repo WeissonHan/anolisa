@@ -57,6 +57,9 @@ pub enum BlazeDaemonError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("request body too large: {actual} bytes exceeds {limit}")]
+    PayloadTooLarge { actual: usize, limit: usize },
+
     #[error("operation requires recovery: {0}")]
     RecoveryRequired(String),
 
@@ -71,6 +74,7 @@ impl BlazeDaemonError {
             BlazeDaemonError::BadRequest(_) => 400,
             BlazeDaemonError::NotFound(_) => 404,
             BlazeDaemonError::Conflict(_) => 409,
+            BlazeDaemonError::PayloadTooLarge { .. } => 413,
             BlazeDaemonError::RecoveryRequired(_) => 500,
             BlazeDaemonError::HttpStatus { status, .. } => *status,
             BlazeDaemonError::Core(blaze_core::BlazeError::PolicyEvalError { .. })
@@ -82,6 +86,33 @@ impl BlazeDaemonError {
             BlazeDaemonError::Guest(crate::guest::GuestError::Cancelled) => 503,
             BlazeDaemonError::Guest(_) => 502,
             _ => 500,
+        }
+    }
+
+    /// Stable machine-readable API error code.
+    pub fn code(&self) -> &'static str {
+        match self {
+            BlazeDaemonError::BadRequest(_) => "invalid_request",
+            BlazeDaemonError::NotFound(_) => "not_found",
+            BlazeDaemonError::Conflict(_) => "state_conflict",
+            BlazeDaemonError::PayloadTooLarge { .. } => "payload_too_large",
+            BlazeDaemonError::RecoveryRequired(_) => "recovery_required",
+            BlazeDaemonError::Guest(crate::guest::GuestError::InvalidArgument(_)) => {
+                "invalid_request"
+            }
+            BlazeDaemonError::Guest(crate::guest::GuestError::Timeout(_)) => "guest_timeout",
+            BlazeDaemonError::Guest(crate::guest::GuestError::PayloadTooLarge { .. }) => {
+                "payload_too_large"
+            }
+            BlazeDaemonError::Guest(crate::guest::GuestError::Cancelled) => "shutting_down",
+            BlazeDaemonError::Guest(_) => "guest_error",
+            BlazeDaemonError::Core(blaze_core::BlazeError::BackendUnavailable { .. }) => {
+                "backend_unavailable"
+            }
+            BlazeDaemonError::Core(blaze_core::BlazeError::InvalidStateTransition { .. }) => {
+                "invalid_state_transition"
+            }
+            _ => "internal_error",
         }
     }
 }
