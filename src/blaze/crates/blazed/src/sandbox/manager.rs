@@ -469,6 +469,10 @@ impl SandboxManager {
             self.mark_recovery(id)?;
             return Err(error);
         }
+        if let Err(error) = self.cleanup_hibernate_artifacts(id).await {
+            self.mark_recovery(id)?;
+            return Err(error);
+        }
         if let Err(error) = self.cleanup_checkpoint_transactions(id).await {
             self.mark_recovery(id)?;
             return Err(error);
@@ -1008,6 +1012,86 @@ mod tests {
             .expect("rollback");
         assert_eq!(tokio::fs::read(&rootfs_path).await.expect("read"), b"hello");
         assert!(manager.destroy(id).await.expect("destroy"));
+    }
+
+    #[tokio::test]
+    async fn hibernate_resume_preserves_provider_data() {
+        let temp = tempfile::tempdir().expect("temp");
+        let manager = manager(temp.path());
+        let id = Uuid::new_v4();
+        manager
+            .create(CreateSandbox {
+                requested_id: Some(id),
+                decision: decision(),
+                image_digest: "sha256:test".into(),
+                template_name: "base".into(),
+                binary_path: PathBuf::new(),
+            })
+            .await
+            .expect("create");
+        let runtime = manager.runtime(id).expect("runtime");
+        let rootfs_path = runtime.lock().await.storage.rootfs_path.clone();
+        tokio::fs::write(&rootfs_path, b"hello")
+            .await
+            .expect("write rootfs");
+        manager.hibernate(id).await.expect("hibernate");
+        assert_eq!(
+            manager.get(id).expect("hibernated metadata").state,
+            SandboxState::Hibernated
+        );
+        let hibernate_dir = temp
+            .path()
+            .join("state")
+            .join(id.to_string())
+            .join("hibernate");
+        assert!(hibernate_dir.join("vmstate.snap").is_file());
+        assert!(hibernate_dir.join("mem.diff").is_file());
+        manager.resume(id).await.expect("resume");
+        assert_eq!(tokio::fs::read(&rootfs_path).await.expect("read"), b"hello");
+        assert!(manager.destroy(id).await.expect("destroy"));
+        assert!(!hibernate_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn destroy_recovery_required_resume_removes_hibernate_artifacts() {
+        let temp = tempfile::tempdir().expect("temp");
+        let manager = manager(temp.path());
+        let id = Uuid::new_v4();
+        manager
+            .create(CreateSandbox {
+                requested_id: Some(id),
+                decision: decision(),
+                image_digest: "sha256:test".into(),
+                template_name: "base".into(),
+                binary_path: PathBuf::new(),
+            })
+            .await
+            .expect("create");
+        manager.hibernate(id).await.expect("hibernate");
+
+        let hibernate_dir = temp
+            .path()
+            .join("state")
+            .join(id.to_string())
+            .join("hibernate");
+        assert!(hibernate_dir.join("vmstate.snap").is_file());
+        assert!(hibernate_dir.join("mem.diff").is_file());
+        manager
+            .update_instance(id, |metadata| {
+                metadata.begin_operation(OperationKind::Resume, None);
+                metadata.transition(SandboxState::Resuming)?;
+                metadata.transition(SandboxState::RecoveryRequired)?;
+                Ok(())
+            })
+            .expect("mark interrupted resume");
+        manager.runtimes.lock().expect("runtimes").remove(&id);
+
+        assert!(manager.destroy(id).await.expect("recovery destroy"));
+        assert!(!hibernate_dir.exists());
+        let metadata = manager.get(id).expect("destroyed metadata");
+        assert_eq!(metadata.state, SandboxState::Destroyed);
+        assert!(metadata.operation.is_none());
+        assert!(!manager.destroy(id).await.expect("idempotent destroy"));
     }
 
     #[tokio::test]
