@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Firecracker-vsock guest readiness client.
+//! Firecracker-vsock guest agent client.
 
 pub mod client;
 
 pub use client::GuestClient;
+pub use client::GuestExecResult;
 
 use thiserror::Error;
 
-/// Guest readiness protocol and transport failures.
+/// Guest protocol and transport failures.
 #[derive(Debug, Error)]
 pub enum GuestError {
     /// Unix socket I/O failed.
@@ -19,16 +20,19 @@ pub enum GuestError {
     /// Firecracker vsock or guest framing was invalid.
     #[error("guest protocol error: {0}")]
     Protocol(String),
-    /// A bounded readiness operation timed out.
-    #[error("guest readiness timed out: {0}")]
+    /// Caller supplied an invalid guest operation argument.
+    #[error("invalid guest request: {0}")]
+    InvalidArgument(String),
+    /// A bounded guest operation timed out.
+    #[error("guest operation timed out: {0}")]
     Timeout(String),
     /// The guest returned an application error.
-    #[error("guest readiness failed: {0}")]
+    #[error("guest operation failed: {0}")]
     Rejected(String),
-    /// Framed data exceeded the configured protocol limit.
+    /// Framed or decoded data exceeded the configured limit.
     #[error("guest payload too large: {actual} bytes exceeds {limit}")]
     PayloadTooLarge {
-        /// Framed byte count.
+        /// Framed, encoded, or decoded byte count.
         actual: usize,
         /// Configured limit.
         limit: usize,
@@ -38,5 +42,5 @@ pub enum GuestError {
     Cancelled,
 }
 
-/// Result alias for guest readiness operations.
+/// Result alias for guest operations.
 pub type Result<T> = std::result::Result<T, GuestError>;

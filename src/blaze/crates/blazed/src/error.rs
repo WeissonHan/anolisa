@@ -76,6 +76,7 @@ impl BlazeDaemonError {
             BlazeDaemonError::Core(blaze_core::BlazeError::PolicyEvalError { .. })
             | BlazeDaemonError::Core(blaze_core::BlazeError::InvalidStateTransition { .. }) => 422,
             BlazeDaemonError::Core(blaze_core::BlazeError::BackendUnavailable { .. }) => 503,
+            BlazeDaemonError::Guest(crate::guest::GuestError::InvalidArgument(_)) => 400,
             BlazeDaemonError::Guest(crate::guest::GuestError::Timeout(_)) => 504,
             BlazeDaemonError::Guest(crate::guest::GuestError::PayloadTooLarge { .. }) => 413,
             BlazeDaemonError::Guest(crate::guest::GuestError::Cancelled) => 503,

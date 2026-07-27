@@ -43,6 +43,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 semver = "1.0"
 sha2 = "0.10"
+base64 = "0.22"
 
 # Internal crates
 blaze-core = { path = "crates/blaze-core" }

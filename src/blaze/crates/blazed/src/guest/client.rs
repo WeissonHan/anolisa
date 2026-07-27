@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! JSON-line readiness client layered over Firecracker's vsock proxy.
+//! JSON-line client layered over Firecracker's vsock proxy.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use blaze_core::guest_protocol::{
     DEFAULT_GUEST_PORT, DEFAULT_MAX_RESPONSE_BYTES, GuestOp, GuestRequest, GuestResponse,
 };
@@ -15,25 +18,45 @@ use uuid::Uuid;
 use super::{GuestError, Result};
 
 const READY_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+const PROTOCOL_GRACE: Duration = Duration::from_secs(10);
 
-/// Client for checking one Firecracker guest agent.
+/// Result of one command executed by the guest agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestExecResult {
+    /// Guest process exit status.
+    pub exit_code: i32,
+    /// Decoded stdout bytes.
+    pub stdout: Vec<u8>,
+    /// Decoded stderr bytes.
+    pub stderr: Vec<u8>,
+}
+
+/// Client for one Firecracker guest agent.
 #[derive(Debug, Clone)]
 pub struct GuestClient {
     vsock_path: PathBuf,
     port: u32,
     io_timeout: Duration,
     max_response_bytes: usize,
+    max_file_bytes: usize,
 }
 
 impl GuestClient {
-    /// Create a readiness client with production protocol defaults.
+    /// Create a client with production protocol defaults.
     pub fn new(vsock_path: PathBuf, io_timeout: Duration) -> Self {
         Self {
             vsock_path,
             port: DEFAULT_GUEST_PORT,
             io_timeout,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_file_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
+    }
+
+    /// Apply the decoded read and write limit supplied by the management layer.
+    pub fn with_file_limit(mut self, max_file_bytes: usize) -> Self {
+        self.max_file_bytes = max_file_bytes;
+        self
     }
 
     /// Override the response limit for focused framing tests.
@@ -99,15 +122,105 @@ impl GuestClient {
         )))
     }
 
+    /// Execute one shell command in the guest.
+    pub async fn exec(
+        &self,
+        command: String,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        timeout_secs: u32,
+    ) -> Result<GuestExecResult> {
+        if command.is_empty() {
+            return Err(GuestError::InvalidArgument(
+                "exec command is empty".to_string(),
+            ));
+        }
+        let mut request = GuestRequest::new(Uuid::new_v4().to_string(), GuestOp::Exec);
+        request.cmd = Some(command);
+        request.cwd = Some(cwd.unwrap_or_else(|| "/".to_string()));
+        request.env = env;
+        request.timeout = Some(timeout_secs);
+        let timeout = operation_timeout(timeout_secs);
+        if timeout > self.io_timeout {
+            return Err(GuestError::InvalidArgument(format!(
+                "exec timeout plus protocol grace ({timeout:?}) exceeds configured limit {:?}",
+                self.io_timeout
+            )));
+        }
+        let response = self.send_recv_with_timeout(&request, timeout).await?;
+        let stdout = decode_limited(
+            response.stdout_b64.as_deref().unwrap_or_default(),
+            self.max_response_bytes,
+        )?;
+        let stderr = decode_limited(
+            response.stderr_b64.as_deref().unwrap_or_default(),
+            self.max_response_bytes,
+        )?;
+        Ok(GuestExecResult {
+            exit_code: response.rc.unwrap_or_default(),
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Read one guest file.
+    pub async fn read_file(&self, path: String) -> Result<Vec<u8>> {
+        validate_guest_path(&path)?;
+        let mut request = GuestRequest::new(Uuid::new_v4().to_string(), GuestOp::Read);
+        request.path = Some(path);
+        let guest_timeout = request_timeout_secs(self.io_timeout);
+        request.timeout = Some(guest_timeout);
+        let response = self
+            .send_recv_with_timeout(
+                &request,
+                operation_timeout(guest_timeout).min(self.io_timeout),
+            )
+            .await?;
+        decode_limited(
+            response.data_b64.as_deref().unwrap_or_default(),
+            self.max_file_bytes,
+        )
+    }
+
+    /// Replace one guest file.
+    pub async fn write_file(&self, path: String, data: &[u8]) -> Result<()> {
+        validate_guest_path(&path)?;
+        if data.len() > self.max_file_bytes {
+            return Err(GuestError::PayloadTooLarge {
+                actual: data.len(),
+                limit: self.max_file_bytes,
+            });
+        }
+        let mut request = GuestRequest::new(Uuid::new_v4().to_string(), GuestOp::Write);
+        request.path = Some(path);
+        request.data_b64 = Some(BASE64.encode(data));
+        let guest_timeout = request_timeout_secs(self.io_timeout);
+        request.timeout = Some(guest_timeout);
+        self.send_recv_with_timeout(
+            &request,
+            operation_timeout(guest_timeout).min(self.io_timeout),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn send_recv(&self, request: &GuestRequest) -> Result<GuestResponse> {
-        tokio::time::timeout(self.io_timeout, self.send_recv_inner(request))
+        self.send_recv_with_timeout(request, self.io_timeout).await
+    }
+
+    async fn send_recv_with_timeout(
+        &self,
+        request: &GuestRequest,
+        timeout: Duration,
+    ) -> Result<GuestResponse> {
+        tokio::time::timeout(timeout, self.send_recv_inner(request))
             .await
             .map_err(|_| {
                 GuestError::Timeout(format!(
                     "{:?} request to {} exceeded {:?}",
                     request.op,
                     self.vsock_path.display(),
-                    self.io_timeout
+                    timeout
                 ))
             })?
     }
@@ -152,6 +265,17 @@ impl GuestClient {
     }
 }
 
+fn operation_timeout(guest_timeout_secs: u32) -> Duration {
+    Duration::from_secs(u64::from(guest_timeout_secs)).saturating_add(PROTOCOL_GRACE)
+}
+
+fn request_timeout_secs(io_timeout: Duration) -> u32 {
+    io_timeout
+        .saturating_sub(PROTOCOL_GRACE)
+        .as_secs()
+        .clamp(1, u64::from(u32::MAX)) as u32
+}
+
 async fn read_line<R>(stream: &mut R, limit: usize) -> Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
@@ -176,6 +300,35 @@ where
     Err(GuestError::Protocol(
         "connection closed before newline delimiter".to_string(),
     ))
+}
+
+fn decode_limited(encoded: &str, limit: usize) -> Result<Vec<u8>> {
+    let encoded_limit = limit.div_ceil(3).saturating_mul(4);
+    if encoded.len() > encoded_limit {
+        return Err(GuestError::PayloadTooLarge {
+            actual: encoded.len(),
+            limit: encoded_limit,
+        });
+    }
+    let decoded = BASE64
+        .decode(encoded)
+        .map_err(|error| GuestError::Protocol(format!("invalid base64 payload: {error}")))?;
+    if decoded.len() > limit {
+        return Err(GuestError::PayloadTooLarge {
+            actual: decoded.len(),
+            limit,
+        });
+    }
+    Ok(decoded)
+}
+
+fn validate_guest_path(path: &str) -> Result<()> {
+    if path.is_empty() || !path.starts_with('/') || path.len() > 4096 || path.contains('\0') {
+        return Err(GuestError::InvalidArgument(
+            "guest file path must be absolute, NUL-free, and at most 4096 bytes".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -242,6 +395,102 @@ mod tests {
             .ping()
             .await
             .expect("ping");
+    }
+
+    #[tokio::test]
+    async fn operations_use_bounded_correlated_frames() {
+        let temp = tempfile::tempdir().expect("temp");
+        let socket = temp.path().join("vsock.uds");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        spawn_server(
+            socket.clone(),
+            Arc::new(move |request| {
+                server_requests.fetch_add(1, Ordering::Relaxed);
+                match request["op"].as_str().expect("op") {
+                    "exec" => json!({
+                        "id": request["id"],
+                        "ok": true,
+                        "rc": 7,
+                        "stdout_b64": BASE64.encode(b"out"),
+                        "stderr_b64": BASE64.encode(b"err")
+                    }),
+                    "read" => {
+                        assert_eq!(request["timeout"], 5);
+                        json!({
+                            "id": request["id"],
+                            "ok": true,
+                            "data_b64": BASE64.encode(b"data")
+                        })
+                    }
+                    "write" => {
+                        assert_eq!(request["timeout"], 5);
+                        assert_eq!(request["data_b64"], BASE64.encode(b"data"));
+                        json!({"id": request["id"], "ok": true})
+                    }
+                    _ => json!({"id": request["id"], "ok": true}),
+                }
+            }),
+        )
+        .await;
+
+        let client = GuestClient::new(socket, Duration::from_secs(15)).with_file_limit(4);
+        let exec = client
+            .exec("exit 7".into(), None, None, 1)
+            .await
+            .expect("exec");
+        assert_eq!(exec.exit_code, 7);
+        assert_eq!(exec.stdout, b"out");
+        assert_eq!(exec.stderr, b"err");
+        assert_eq!(
+            client.read_file("/tmp/x".into()).await.expect("read"),
+            b"data"
+        );
+        client
+            .write_file("/tmp/x".into(), b"data")
+            .await
+            .expect("write");
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn operation_arguments_are_rejected_before_connecting() {
+        let temp = tempfile::tempdir().expect("temp");
+        let client = GuestClient::new(temp.path().join("missing.uds"), Duration::from_secs(15))
+            .with_file_limit(4);
+
+        assert!(matches!(
+            client.exec(String::new(), None, None, 1).await,
+            Err(GuestError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            client.read_file("relative".into()).await,
+            Err(GuestError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            client.write_file("/tmp/x".into(), b"12345").await,
+            Err(GuestError::PayloadTooLarge {
+                actual: 5,
+                limit: 4
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_base64_response_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp");
+        let socket = temp.path().join("vsock.uds");
+        spawn_server(
+            socket.clone(),
+            Arc::new(|request| json!({"id": request["id"], "ok": true, "data_b64": "not/base64!"})),
+        )
+        .await;
+        let error = GuestClient::new(socket, Duration::from_secs(15))
+            .with_file_limit(16)
+            .read_file("/tmp/x".into())
+            .await
+            .expect_err("invalid base64");
+        assert!(matches!(error, GuestError::Protocol(_)));
     }
 
     #[tokio::test]
