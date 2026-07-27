@@ -8,6 +8,9 @@ sandbox 被销毁或进程退出。后端特定的启动、暂停、snapshot、r
 行为均保留在这些 trait 后面，使生命周期层能在后续步骤失败时补偿已经完成的
 步骤。
 
+受管 create、destroy、就绪检查与 warm-pool 持有规则详见
+[受管 Sandbox 生命周期](managed-lifecycle_zh.md)。
+
 ## 进程持有与恢复
 
 真实后端进程会收到 `BLAZE_INSTANCE_ID`，并在实例 run directory 中写入

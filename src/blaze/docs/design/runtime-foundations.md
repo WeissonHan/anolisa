@@ -9,6 +9,9 @@ startup, pause, snapshot, restore, and cleanup behavior remains behind those
 traits so the lifecycle layer can compensate completed steps when a later step
 fails.
 
+Managed create, destroy, readiness, and warm-pool ownership are specified in
+[Managed Sandbox Lifecycle](managed-lifecycle.md).
+
 ## Process ownership and recovery
 
 Real backend processes receive `BLAZE_INSTANCE_ID` and write a backend-specific
