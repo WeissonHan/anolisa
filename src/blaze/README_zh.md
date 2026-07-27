@@ -92,7 +92,7 @@ images_dir = "/var/lib/blaze/images"
 instances_dir = "/var/lib/blaze/instances"
 pool_size = 0            # ready slot 目标值
 prefork = false          # 为每个 ready slot 预启动 backend
-# flush_interval = "30s"  # [Reserved] 脏数据刷盘周期（尚未启用）
+flush_interval = "30s"   # 同步 running provider slot
 rootfs_size = 8589934592
 mem_size = 4294967296
 
@@ -109,6 +109,8 @@ request_timeout = "30s"
 当前等同于 `file`；无法识别的值会记录告警并回退到它。
 运行时池使用第一个符合条件的 policy 初始化；runtime prototype 不同的请求
 使用普通分配路径。
+daemon 按配置间隔同步每个 running slot。单个 provider 失败会被报告，但不会
+终止剩余 sweep；关闭时会在清理 runtime 之前等待该循环退出。
 
 ### 后端主机要求
 
@@ -157,6 +159,8 @@ create 可接收可选 UUID。成功后以同一 UUID 和相同不可变参数�
 
 请求契约、限制、模板布局和重试行为详见
 [Sandbox 管理 API](docs/design/management-api_zh.md)。
+[存储同步](docs/design/storage-synchronization_zh.md)说明周期性 provider
+契约与关闭顺序。
 
 #### 健康检查
 

@@ -93,7 +93,7 @@ images_dir = "/var/lib/blaze/images"
 instances_dir = "/var/lib/blaze/instances"
 pool_size = 0            # Ready slot target
 prefork = false          # Pre-start a backend for each ready slot
-# flush_interval = "30s"  # [Reserved] Dirty data flush period (not yet active)
+flush_interval = "30s"   # Synchronize running provider slots
 rootfs_size = 8589934592
 mem_size = 4294967296
 
@@ -111,6 +111,9 @@ allows other implementations to optimize this tradeoff. The `auto` provider
 currently resolves to `file`; unrecognized values log a warning and fall back
 to it. The runtime pool is initialized from the first eligible policy;
 requests with a different runtime prototype use the normal allocation path.
+The daemon synchronizes each running slot on the configured interval. One
+provider failure is reported without stopping the remaining sweep, and
+shutdown joins the loop before runtime teardown.
 
 ### Backend Host Requirements
 
@@ -162,6 +165,8 @@ conflict because its source-state precondition no longer holds.
 
 See [Sandbox Management API](docs/design/management-api.md) for request
 contracts, limits, template layout, and retry behavior.
+See [Storage Synchronization](docs/design/storage-synchronization.md) for the
+periodic provider contract and shutdown ordering.
 
 #### Health Check
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use blaze_core::backend::BackendKind;
 use blaze_core::config::{DaemonConfig, PolicyLoadErrorMode};
 use blaze_core::kernel::HookRegistry;
-use blaze_core::policy::PolicyEngine;
+use blaze_core::policy::{PolicyEngine, parse_duration};
 use blaze_core::storage::StorageProvider;
 use blaze_core::template::TemplateRegistry;
 use hyper::server::conn::http1;
@@ -28,6 +28,11 @@ use crate::state::ServerState;
 /// bind the API socket, and run the accept loop until SIGTERM/SIGINT.
 pub async fn run(config_path: &Path) -> Result<()> {
     let config = DaemonConfig::load(config_path)?;
+    let flush_interval = parse_duration(&config.storage.flush_interval).ok_or_else(|| {
+        BlazeDaemonError::Internal(
+            "validated storage.flush_interval could not be parsed".to_string(),
+        )
+    })?;
     crate::failpoint::announce();
     tracing::info!(?config_path, "loaded daemon config");
 
@@ -105,7 +110,14 @@ pub async fn run(config_path: &Path) -> Result<()> {
         None
     };
 
+    let flush_task = state.manager.start_flush_loop(flush_interval);
     let mut result = serve(listener, tcp_listener, state.clone()).await;
+    if let Err(error) = state.manager.stop_flush_loop(flush_task).await {
+        tracing::error!(%error, "provider flush loop shutdown failed");
+        if result.is_ok() {
+            result = Err(error);
+        }
+    }
     if let Err(error) = state.manager.shutdown().await {
         tracing::error!(%error, "sandbox manager shutdown failed");
         if result.is_ok() {

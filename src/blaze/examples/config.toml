@@ -95,8 +95,8 @@ pool_size = 0
 # is prepared. The pool is initialized after its first eligible policy.
 prefork = false
 
-# Interval between flush-dirty sweeps.
-# flush_interval = "30s"   # [Reserved] Dirty data flush period (not yet active)
+# Interval between provider-owned artifact fsync sweeps.
+flush_interval = "30s"
 
 # ---------------------------------------------------------------------------
 # HTTP and guest-operation limits.

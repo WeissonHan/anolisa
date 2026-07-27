@@ -161,8 +161,7 @@ pub struct StorageSection {
     #[serde(default)]
     pub prefork: bool,
 
-    /// Interval for flushing dirty data.
-    /// NOTE: Reserved for future use. Not yet wired into runtime.
+    /// Interval for synchronizing provider-owned runtime data.
     #[serde(default = "default_flush_interval")]
     pub flush_interval: String,
 
@@ -232,6 +231,7 @@ impl DaemonConfig {
                 "storage.rootfs_size and storage.mem_size must be greater than zero",
             ));
         }
+        validate_duration("storage.flush_interval", &self.storage.flush_interval, 1)?;
         validate_duration("api.request_timeout", &self.api.request_timeout, 11)?;
         if self.api.max_body_bytes == 0 || self.api.max_file_bytes == 0 {
             return Err(invalid_config(
@@ -392,5 +392,18 @@ mod tests {
         let mut cfg = DaemonConfig::default();
         cfg.api.request_timeout = "10s".into();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_invalid_flush_interval() {
+        for interval in ["0s", "not-a-duration"] {
+            let mut cfg = DaemonConfig::default();
+            cfg.storage.flush_interval = interval.into();
+            let error = cfg.validate().expect_err("invalid flush interval");
+            assert!(
+                error.to_string().contains("storage.flush_interval"),
+                "{error}"
+            );
+        }
     }
 }
