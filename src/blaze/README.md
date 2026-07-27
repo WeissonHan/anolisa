@@ -4,18 +4,20 @@
 
 Per-host sandbox orchestrator daemon for AI Agent workloads.
 
-Blaze manages sandbox instance lifecycles via HTTP API with policy-driven
-backend selection. It supports warm-pool pre-allocation, multi-backend
-fallback (Firecracker → Bubblewrap → Mock), and Prometheus metrics export.
-Designed as the per-host agent for E2B-style orchestrator platforms.
+Blaze manages sandbox lifecycles through a daemon-only HTTP API with
+policy-driven backend selection. It owns backend processes, guest operations,
+warm runtime capacity, checkpoint and hibernate transactions, and template
+imports behind backend-neutral contracts.
 
 ## Features
 
-- **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + TCP (`:14159`)
+- **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + optional TCP
 - **Policy-driven backend selection** — workload class → backend priority list
-- **Lifecycle state machine** — 8 states (Pending → Creating → Running → Paused → Checkpointed → Reset → Warm → Destroyed)
-- **Warm pool management** — pre-warmed instances with TTL-based GC
-- **Template registry** — in-memory template tracking with idle eviction
+- **Lifecycle transactions** — persisted operation markers and recoverable ownership
+- **Runtime warm pool** — storage-only or pre-started backend capacity with asynchronous refill
+- **Guest operations** — bounded readiness, command execution, and file transfer
+- **Checkpoint and hibernate** — verified snapshots, rollback, prune, hibernate, and resume
+- **Template APIs** — transactional import of self-contained template artifacts
 - **Kernel hook registry** — state tracking for pre/post hooks
 - **Prometheus metrics** — request counts, instance gauges, pool sizes
 - **Spawners** — FirecrackerSpawner, BubblewrapSpawner, MockSpawner
@@ -38,7 +40,7 @@ sudo ./target/release/blazed daemon start --config examples/config.toml
 curl --unix-socket /run/blaze/api.sock http://localhost/v1/health
 
 # Create a sandbox
-curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/instances \
+curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/sandboxes \
   -H 'Content-Type: application/json' \
   -d '{"workload_class":"agent-rl","image_digest":"sha256:..."}'
 ```
@@ -89,9 +91,16 @@ provider = "file"       # Storage provider selection. Currently supported: "file
                         # Other values will log a warning and fall back to file.
 images_dir = "/var/lib/blaze/images"
 instances_dir = "/var/lib/blaze/instances"
-# pool_size = 0           # [Reserved] Warm pool slots (not yet active)
-# prefork = false         # [Reserved] Pre-start VMs in pool (not yet active)
+pool_size = 0            # Ready slot target
+prefork = false          # Pre-start a backend for each ready slot
 # flush_interval = "30s"  # [Reserved] Dirty data flush period (not yet active)
+rootfs_size = 8589934592
+mem_size = 4294967296
+
+[api]
+max_body_bytes = 1048576
+max_file_bytes = 16777216
+request_timeout = "30s"
 ```
 
 The `file` provider gives each instance independent root filesystem and memory
@@ -100,7 +109,8 @@ are rejected. Independent copies use more capacity and add create latency, but
 remain valid without another instance's files. The `StorageProvider` interface
 allows other implementations to optimize this tradeoff. The `auto` provider
 currently resolves to `file`; unrecognized values log a warning and fall back
-to it.
+to it. The runtime pool is initialized from the first eligible policy;
+requests with a different runtime prototype use the normal allocation path.
 
 ### Backend Host Requirements
 
@@ -117,23 +127,41 @@ ownership, storage, networking, and recovery behavior.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/v1/health` | Health check |
-| GET | `/v1/instances` | List all instances |
-| POST | `/v1/instances` | Create a new sandbox instance |
-| GET | `/v1/instances/{id}` | Get instance details |
-| POST | `/v1/instances/{id}/checkpoint` | Checkpoint an instance |
-| POST | `/v1/instances/{id}/reset` | Reset instance to checkpoint |
-| POST | `/v1/instances/{id}/destroy` | Destroy an instance |
-| GET | `/v1/pools` | List warm pools |
-| GET | `/v1/pools/{backend}/{class}` | Get pool status |
-| POST | `/v1/pools/{backend}/{class}/drain` | Drain a pool |
-| PUT | `/v1/pools/{backend}/{class}/sizing` | Resize a pool |
+| GET, POST | `/v1/sandboxes` | List or create sandboxes |
+| GET, DELETE | `/v1/sandboxes/{id}` | Inspect or idempotently destroy a sandbox |
+| POST | `/v1/sandboxes/{id}/exec` | Execute a guest command |
+| POST | `/v1/sandboxes/{id}/read` | Read a guest file as standard base64 |
+| POST | `/v1/sandboxes/{id}/write` | Write a standard-base64 guest file |
+| POST | `/v1/sandboxes/{id}/checkpoint` | Commit a checkpoint |
+| GET | `/v1/sandboxes/{id}/checkpoints` | List checkpoints and HEAD reachability |
+| POST | `/v1/sandboxes/{id}/checkpoints/prune` | Remove branches unreachable from HEAD |
+| POST | `/v1/sandboxes/{id}/rollback/{checkpoint}` | Verify and restore a checkpoint |
+| POST | `/v1/sandboxes/{id}/hibernate` | Snapshot and stop the backend |
+| POST | `/v1/sandboxes/{id}/resume` | Restore a hibernated backend |
+| GET | `/v1/pool/status` | Get current ready, capacity, and pending values |
+| POST | `/v1/pool/cleanup` | Drain ready resources and trigger refill |
 | GET | `/v1/templates` | List templates |
 | GET | `/v1/templates/{id}` | Inspect a template |
+| POST | `/v1/templates/import` | Transactionally import a template directory |
 | POST | `/v1/templates/gc` | Trigger template GC |
 | GET | `/v1/policies` | List loaded policies |
 | GET | `/v1/hooks` | List kernel hooks |
 | GET | `/v1/metrics` | Prometheus metrics |
 | POST | `/v1/admin/reload` | Hot-reload policies |
+
+`/v1/instances` and the existing instance operations remain compatibility
+aliases and call the same sandbox manager. API errors contain `code`,
+`message`, `operation`, and `sandbox_id`.
+
+Create accepts an optional UUID. Repeating a successful create with that UUID
+returns the existing running sandbox when its immutable parameters match, and
+returns `409` when they differ. Destroy is idempotent. Checkpoint creation
+commits a new ID on every success; rollback to the same checkpoint is
+repeatable. Repeating hibernate or resume after success returns a state
+conflict because its source-state precondition no longer holds.
+
+See [Sandbox Management API](docs/design/management-api.md) for request
+contracts, limits, template layout, and retry behavior.
 
 #### Health Check
 
@@ -143,6 +171,7 @@ ownership, storage, networking, and recovery behavior.
 {
   "status": "ok",
   "version": "0.3.0",
+  "backend": "mock",
   "storage_pool": { "ready": 0, "capacity": 0, "pending": 0 }
 }
 ```
@@ -152,8 +181,8 @@ ownership, storage, networking, and recovery behavior.
 ```
 src/blaze/
 ├── crates/
-│   ├── blaze-core/   # Library: policy, lifecycle, pool, template, kernel, config
-│   └── blazed/       # Binary: daemon, API server, spawners, metrics
+│   ├── blaze-core/   # Contracts: policy, lifecycle, checkpoint, guest, storage
+│   └── blazed/       # Daemon: API, manager, pool, guest client, spawners
 ├── examples/         # config.toml, policies/
 ├── dist/             # blazed.service, blaze.spec, tmpfiles
 └── manifests/        # Component metadata

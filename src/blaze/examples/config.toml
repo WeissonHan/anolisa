@@ -46,7 +46,7 @@ http_addr = ""
 #   kata-qemu, runc, bubblewrap.
 firecracker = "/usr/bin/firecracker"
 bubblewrap = "/usr/bin/bwrap"
-# Phase 2+ backends (uncomment when spawner implementations land):
+# Optional backends (uncomment when their spawner implementations are available):
 # gvisor = "/usr/bin/runsc"
 # rund = "/usr/bin/rund"
 # kata-fc = "/usr/bin/containerd-shim-kata-v2"
@@ -68,7 +68,7 @@ dir = "/etc/anolisa/blaze/policies"
 on_load_error = "fail"
 
 # ---------------------------------------------------------------------------
-# Image storage settings.
+# Image and mutable instance storage settings.
 # ---------------------------------------------------------------------------
 [storage]
 # Primary directory for vmlinux kernels, rootfs base images, and memfile
@@ -89,13 +89,28 @@ rootfs_size = 8589934592
 mem_size = 4294967296
 
 # Number of pre-warmed storage slots to keep ready in the pool.
-# pool_size = 0           # [Reserved] Warm pool slots (not yet active)
+pool_size = 0
 
-# Whether to prefork (pre-allocate) storage slots at daemon startup.
-# prefork = false         # [Reserved] Pre-start VMs in pool (not yet active)
+# Pre-start and pause a backend in each warm slot. When false, only storage
+# is prepared. The pool is initialized after its first eligible policy.
+prefork = false
 
 # Interval between flush-dirty sweeps.
 # flush_interval = "30s"   # [Reserved] Dirty data flush period (not yet active)
+
+# ---------------------------------------------------------------------------
+# HTTP and guest-operation limits.
+# ---------------------------------------------------------------------------
+[api]
+# Maximum collected HTTP request body.
+max_body_bytes = 1048576
+
+# Maximum decoded guest file payload.
+max_file_bytes = 16777216
+
+# Total guest operation deadline. Exec reserves 10 seconds for protocol
+# completion, so this value must be at least 11 seconds.
+request_timeout = "30s"
 
 # ---------------------------------------------------------------------------
 # Instance pool settings (global defaults for warm-pool recycling).

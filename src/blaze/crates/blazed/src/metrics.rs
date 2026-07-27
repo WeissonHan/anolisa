@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! In-process counters surfaced via `GET /v1/metrics` (Prometheus text
-//! exposition). v0.1 ships a small, fixed set; richer histograms wait
-//! for an opinion-graded collector in Phase 2.
+//! Fixed in-process counters surfaced through the Prometheus text endpoint.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
