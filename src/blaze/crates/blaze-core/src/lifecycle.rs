@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Sandbox lifecycle state machine + JSON persistence.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -10,7 +11,7 @@ use uuid::Uuid;
 
 use crate::backend::BackendKind;
 use crate::error::{BlazeError, Result};
-use crate::policy::WorkloadClass;
+use crate::policy::{BackendConfigs, VmConfig, WorkloadClass};
 
 /// All known states. Transitions are enforced by [`SandboxInstance::transition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +22,11 @@ pub enum SandboxState {
     Running,
     Paused,
     Checkpointed,
+    Hibernating,
+    Hibernated,
+    Resuming,
+    RollingBack,
+    RecoveryRequired,
     Reset,
     Warm,
     Destroyed,
@@ -34,11 +40,46 @@ impl SandboxState {
             SandboxState::Running => "running",
             SandboxState::Paused => "paused",
             SandboxState::Checkpointed => "checkpointed",
+            SandboxState::Hibernating => "hibernating",
+            SandboxState::Hibernated => "hibernated",
+            SandboxState::Resuming => "resuming",
+            SandboxState::RollingBack => "rolling-back",
+            SandboxState::RecoveryRequired => "recovery-required",
             SandboxState::Reset => "reset",
             SandboxState::Warm => "warm",
             SandboxState::Destroyed => "destroyed",
         }
     }
+}
+
+/// Persisted multi-step operation used for crash diagnosis and recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperationKind {
+    /// Sandbox creation is acquiring resources or starting a backend.
+    Create,
+    /// A point-in-time checkpoint is being committed.
+    Checkpoint,
+    /// A running sandbox is being converted into a hibernated sandbox.
+    Hibernate,
+    /// A hibernated sandbox is being restored.
+    Resume,
+    /// A checkpoint is replacing the current runtime.
+    Rollback,
+    /// Runtime resources are being destroyed.
+    Destroy,
+}
+
+/// Durable journal entry for one active lifecycle operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationJournal {
+    /// Operation being performed.
+    pub kind: OperationKind,
+    /// UTC time at which the operation became externally visible.
+    pub started_at: DateTime<Utc>,
+    /// Optional checkpoint involved in the operation.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
 }
 
 impl std::fmt::Display for SandboxState {
@@ -67,6 +108,21 @@ pub struct SandboxInstance {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub policy_name: String,
+    /// User-visible template name when creation used the canonical API.
+    #[serde(default)]
+    pub template_name: String,
+    /// Most recently committed or selected checkpoint.
+    #[serde(default)]
+    pub last_checkpoint: Option<String>,
+    /// Active multi-step operation, if any.
+    #[serde(default)]
+    pub operation: Option<OperationJournal>,
+    /// Backend-specific policy needed for exact hibernate/rollback restore.
+    #[serde(default)]
+    pub backend_config: BackendConfigs,
+    /// Generic VM resources needed for exact restore.
+    #[serde(default)]
+    pub vm_config: Option<VmConfig>,
 }
 
 impl SandboxInstance {
@@ -91,7 +147,51 @@ impl SandboxInstance {
             created_at: now,
             updated_at: now,
             policy_name,
+            template_name: String::new(),
+            last_checkpoint: None,
+            operation: None,
+            backend_config: BackendConfigs::default(),
+            vm_config: None,
         }
+    }
+
+    /// Create an instance using a caller-supplied UUID.
+    ///
+    /// UUID-only IDs keep the persisted directory layout unambiguous while
+    /// still supporting idempotent platform requests.
+    pub fn new_with_id(
+        id: Uuid,
+        backend: BackendKind,
+        workload_class: WorkloadClass,
+        image_digest: String,
+        start_path: StartPath,
+        policy_name: String,
+    ) -> Self {
+        let mut instance = Self::new(
+            backend,
+            workload_class,
+            image_digest,
+            start_path,
+            policy_name,
+        );
+        instance.id = id;
+        instance
+    }
+
+    /// Persist an operation before starting its first data-plane mutation.
+    pub fn begin_operation(&mut self, kind: OperationKind, checkpoint_id: Option<String>) {
+        self.operation = Some(OperationJournal {
+            kind,
+            started_at: Utc::now(),
+            checkpoint_id,
+        });
+        self.updated_at = Utc::now();
+    }
+
+    /// Clear the durable operation marker after the final state is persisted.
+    pub fn finish_operation(&mut self) {
+        self.operation = None;
+        self.updated_at = Utc::now();
     }
 
     /// Apply a state transition. Returns
@@ -107,14 +207,10 @@ impl SandboxInstance {
         let prev = self.state;
         self.state = target;
         self.updated_at = Utc::now();
-        // entering `creating` re-classifies the start path: warm-pool
-        // reuse goes warm → creating, fresh boots go pending → creating.
-        if target == SandboxState::Creating {
-            self.start_path = if prev == SandboxState::Warm {
-                StartPath::Warm
-            } else {
-                StartPath::Cold
-            };
+        // A durable warm → creating transition always records the warm path;
+        // pending → creating preserves the caller's pre-classification.
+        if target == SandboxState::Creating && prev == SandboxState::Warm {
+            self.start_path = StartPath::Warm;
         }
         tracing::info!(
             instance = %self.id,
@@ -135,8 +231,14 @@ impl SandboxInstance {
         let final_path = dir.join("state.json");
         let tmp_path = dir.join("state.json.tmp");
         let json = serde_json::to_vec_pretty(self)?;
-        fs::write(&tmp_path, &json)?;
+        {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&json)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+        }
         fs::rename(&tmp_path, &final_path)?;
+        File::open(&dir)?.sync_all()?;
         Ok(())
     }
 
@@ -150,18 +252,34 @@ impl SandboxInstance {
 }
 
 fn is_valid_transition(from: SandboxState, to: SandboxState) -> bool {
-    use SandboxState::{Checkpointed, Creating, Destroyed, Paused, Pending, Reset, Running, Warm};
+    use SandboxState::{
+        Checkpointed, Creating, Destroyed, Hibernated, Hibernating, Paused, Pending,
+        RecoveryRequired, Reset, Resuming, RollingBack, Running, Warm,
+    };
     if to == Destroyed {
         // `* → destroyed` is always valid (terminal sink).
         return from != Destroyed;
+    }
+    if to == RecoveryRequired {
+        return !matches!(from, Destroyed | RecoveryRequired);
     }
     match (from, to) {
         (Pending, Creating) => true,
         (Creating, Running) => true,
         (Running, Paused) => true,
+        (Running, Hibernating) => true,
+        (Hibernating, Running) => true,
+        (Hibernating, Hibernated) => true,
+        (Hibernated, Resuming) => true,
+        (Resuming, Hibernated) => true,
+        (Resuming, Running) => true,
+        (Running, RollingBack) => true,
+        (Checkpointed, RollingBack) => true,
+        (RollingBack, Running) => true,
         (Running, Reset) => true,
         (Paused, Checkpointed) => true,
         (Paused, Running) => true, // resume
+        (Checkpointed, Running) => true,
         (Reset, Warm) => true,
         (Warm, Creating) => true, // pool reuse / warm path
         _ => false,
@@ -258,5 +376,60 @@ mod tests {
         assert_eq!(loaded.id, inst.id);
         assert_eq!(loaded.state, SandboxState::Creating);
         assert_eq!(loaded.policy_name, inst.policy_name);
+    }
+
+    #[test]
+    fn legacy_state_without_optional_fields_deserializes() {
+        let inst = fresh();
+        let value = serde_json::json!({
+            "id": inst.id,
+            "state": "running",
+            "backend": "mock",
+            "workload_class": "agent-rl",
+            "image_digest": "sha256:old",
+            "start_path": "cold",
+            "created_at": inst.created_at,
+            "updated_at": inst.updated_at,
+            "policy_name": "legacy"
+        });
+        let loaded: SandboxInstance = serde_json::from_value(value).expect("legacy state");
+        assert!(loaded.template_name.is_empty());
+        assert!(loaded.last_checkpoint.is_none());
+        assert!(loaded.operation.is_none());
+    }
+
+    #[test]
+    fn extended_lifecycle_paths_are_legal() {
+        let mut hibernate = fresh();
+        hibernate
+            .transition(SandboxState::Creating)
+            .expect("create");
+        hibernate.transition(SandboxState::Running).expect("run");
+        hibernate
+            .transition(SandboxState::Hibernating)
+            .expect("hibernate");
+        hibernate
+            .transition(SandboxState::Hibernated)
+            .expect("hibernated");
+        hibernate
+            .transition(SandboxState::Resuming)
+            .expect("resume");
+        hibernate
+            .transition(SandboxState::Running)
+            .expect("running");
+
+        let mut checkpoint = fresh();
+        checkpoint
+            .transition(SandboxState::Creating)
+            .expect("create");
+        checkpoint.transition(SandboxState::Running).expect("run");
+        checkpoint.transition(SandboxState::Paused).expect("pause");
+        checkpoint
+            .transition(SandboxState::Checkpointed)
+            .expect("checkpoint");
+        checkpoint
+            .transition(SandboxState::RollingBack)
+            .expect("rollback");
+        checkpoint.transition(SandboxState::Running).expect("run");
     }
 }
