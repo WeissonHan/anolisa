@@ -31,6 +31,32 @@ sudo yum install blaze
 sudo systemctl enable --now blazed.service
 ```
 
+Package 契约如下：
+
+| Artifact | Owner/mode | 用途 |
+|----------|------------|------|
+| `/usr/bin/blazectl` | `root:root`, `0755` | 管理员 HTTP client |
+| `/usr/libexec/anolisa/blazed` | `root:root`, `0755` | Daemon-only server |
+| `/run/blaze/api.sock` | service ownership, `0660` | 默认本地 API socket |
+| `/etc/anolisa/blaze/config.toml` | 使用 `noreplace` 语义的 package config | Daemon 配置 |
+| `/var/lib/blaze` | 保留的 state directory | Daemon 持有的 sandbox 状态 |
+
+`blazed.service` 仍只启动 `blazed`。安装 `blazectl` 不会添加 client service、
+改变 socket ownership 或启用 TCP。
+
+### 升级与卸载
+
+Upgrade 会替换两个版本匹配的 binary，同时保留 daemon 配置。Removal 删除
+package-owned binary 和 service file，但不删除 `/var/lib/blaze` 下不属于
+package 的 state。
+
+```bash
+sudo yum upgrade blaze
+blazectl --version
+/usr/libexec/anolisa/blazed --version
+sudo yum remove blaze
+```
+
 ### 从源码构建 client
 
 构建必须在 Linux 上执行：

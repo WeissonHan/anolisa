@@ -37,7 +37,7 @@ anolisa list
 ## Install Components
 
 Install components on demand. The current `agentsight`, `agent-sec-core`,
-`ws-ckpt`, and `skillfs` artifacts require system mode; the other examples
+`ws-ckpt`, `skillfs`, and `blaze` artifacts require system mode; the other examples
 below support user mode.
 
 ```bash
@@ -58,6 +58,9 @@ anolisa install agent-memory
 
 # Skill filesystem (FUSE virtual views)
 sudo anolisa --install-mode system install skillfs
+
+# Sandbox orchestration daemon and client
+sudo anolisa --install-mode system install blaze
 
 # OS skill library
 anolisa install os-skills
@@ -130,6 +133,7 @@ anolisa adapter enable ws-ckpt hermes       # ws-ckpt → Hermes
 
 ### Runtime & Token Saving
 
+- [Blaze Sandbox CLI](user-guide/en/runtime/blaze/QUICKSTART.md)
 - [Workspace Checkpoints](user-guide/en/runtime/ws-ckpt.md)
 - [Skill Filesystem](user-guide/en/runtime/skillfs.md)
 - [Token Optimization](user-guide/en/token-saving/tokenless/QUICKSTART.md)

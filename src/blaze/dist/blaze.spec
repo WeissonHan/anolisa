@@ -4,7 +4,7 @@
 Name:           blaze
 Version:        0.3.0
 Release:        %{anolis_release}%{?dist}
-Summary:        Per-host sandbox orchestrator daemon for AI Agent workloads
+Summary:        Per-host sandbox orchestrator daemon and client
 
 License:        Apache-2.0
 URL:            https://github.com/alibaba/anolisa
@@ -17,16 +17,16 @@ BuildRequires:  systemd-rpm-macros
 Provides:       anolisa-component(blaze)
 
 %description
-Blaze is the ANOLISA per-host sandbox orchestrator daemon. It manages sandbox
-instance lifecycles via HTTP API with policy-driven backend selection, supporting
-Firecracker microVM, Bubblewrap, and Mock backends. Features include warm-pool
-pre-allocation, multi-backend fallback, and Prometheus metrics export.
+Blaze provides the per-host sandbox orchestrator daemon and its HTTP client.
+The daemon manages sandbox lifecycles with policy-driven backend selection,
+including Firecracker microVM, Bubblewrap, and Mock backends. The blazectl
+client exposes the supported remote management operations.
 
 %prep
 %setup -q
 
 %build
-cargo build --release --locked
+cargo build --workspace --release --locked
 
 %install
 rm -rf $RPM_BUILD_ROOT
@@ -39,6 +39,7 @@ install -d -m 0755 %{buildroot}%{_tmpfilesdir}
 install -d -m 0755 %{buildroot}/var/lib/blaze
 
 install -Dm755 target/release/blazed %{buildroot}%{_libexecdir}/anolisa/blazed
+install -Dm755 target/release/blazectl %{buildroot}%{_bindir}/blazectl
 install -p -m 0644 dist/blazed.service %{buildroot}%{_unitdir}/
 install -Dm644 dist/tmpfiles-blaze.conf %{buildroot}%{_tmpfilesdir}/blaze.conf
 install -Dm644 .anolisa/component.toml %{buildroot}%{_datadir}/anolisa/components/blaze/component.toml
@@ -62,6 +63,7 @@ install -p -m 0644 LICENSE %{buildroot}%{_docdir}/blaze/
 %files
 %defattr(0644,root,root,0755)
 %attr(0755,root,root) %{_libexecdir}/anolisa/blazed
+%attr(0755,root,root) %{_bindir}/blazectl
 %config(noreplace) %{_sysconfdir}/anolisa/blaze/config.toml
 %dir %{_sysconfdir}/anolisa/blaze/policies
 %config(noreplace) %{_sysconfdir}/anolisa/blaze/policies/agent-rl.toml
@@ -73,16 +75,3 @@ install -p -m 0644 LICENSE %{buildroot}%{_docdir}/blaze/
 %doc %{_docdir}/blaze/README.md
 %doc %{_docdir}/blaze/README_zh.md
 %license %{_docdir}/blaze/LICENSE
-
-%changelog
-* Mon Jul 21 2026 Caspar Zhang <caspar@linux.alibaba.com> - 0.2.1-1
-- Rebrand: component renamed from Anvil to Blaze
-- Firecracker vCPU upper bound validation (1-32)
-- Register component in project manifests
-- Document VM resource config fallback chain
-
-* Mon Jun 30 2026 Caspar Zhang <caspar@linux.alibaba.com> - 0.2.0-1
-- Add FirecrackerSpawner backend with auto-detection
-- Add TCP remote API on port 14159
-- Add prioritized backend selection
-- Add packaging skeleton (systemd, RPM spec, tmpfiles)

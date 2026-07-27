@@ -32,7 +32,8 @@ anolisa env
 anolisa list
 ```
 
-按需安装组件。当前 `agentsight`、`agent-sec-core`、`ws-ckpt` 和 `skillfs`
+按需安装组件。当前 `agentsight`、`agent-sec-core`、`ws-ckpt`、`skillfs` 和
+`blaze`
 制品要求 system mode；下列其他示例支持 user mode。
 
 ```bash
@@ -53,6 +54,9 @@ anolisa install agent-memory
 
 # 技能文件系统（FUSE 虚拟视图）
 sudo anolisa --install-mode system install skillfs
+
+# Sandbox 编排 daemon 与 client
+sudo anolisa --install-mode system install blaze
 
 # OS 技能库
 anolisa install os-skills
@@ -125,6 +129,7 @@ anolisa adapter enable ws-ckpt hermes       # ws-ckpt → Hermes
 
 ### 运行时与 Token 节省
 
+- [Blaze Sandbox CLI](user-guide/zh/runtime/blaze/QUICKSTART.md)
 - [工作区快照](user-guide/zh/runtime/ws-ckpt.md)
 - [技能文件系统](user-guide/zh/runtime/skillfs.md)
 - [Token 优化](user-guide/zh/token-saving/tokenless/QUICKSTART.md)

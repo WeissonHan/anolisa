@@ -9,6 +9,8 @@ const GUIDE_ZH: &str =
     include_str!("../../../../../docs/user-guide/zh/runtime/blaze/QUICKSTART.md");
 const INDEX_EN: &str = include_str!("../../../../../docs/user-guide/en/README.md");
 const INDEX_ZH: &str = include_str!("../../../../../docs/user-guide/zh/README.md");
+const QUICKSTART_EN: &str = include_str!("../../../../../docs/QUICKSTART.md");
+const QUICKSTART_ZH: &str = include_str!("../../../../../docs/QUICKSTART_zh.md");
 
 const REMOTE_COMMANDS: [&str; 14] = [
     "create",
@@ -157,6 +159,36 @@ fn component_readmes_expose_the_client_without_expanding_its_scope() {
         for forbidden in ["`blazectl template", "`blazectl policy", "`blazectl admin"] {
             assert!(!readme.contains(forbidden));
         }
+    }
+}
+
+#[test]
+fn bilingual_docs_cover_the_packaged_client_contract() {
+    for guide in [GUIDE_EN, GUIDE_ZH] {
+        for required in [
+            "/usr/bin/blazectl",
+            "/usr/libexec/anolisa/blazed",
+            "root:root",
+            "0755",
+            "0660",
+            "yum upgrade blaze",
+            "yum remove blaze",
+        ] {
+            assert!(guide.contains(required), "guide misses {required}");
+        }
+    }
+    for readme in [README, README_ZH] {
+        assert!(readme.contains("/usr/bin/blazectl"));
+        assert!(readme.contains("/usr/libexec/anolisa/blazed"));
+    }
+    assert!(AGENTS.contains("## Packaging"));
+    assert!(AGENTS.contains("`blazed.service` as the only service entry point"));
+    for quickstart in [QUICKSTART_EN, QUICKSTART_ZH] {
+        assert!(quickstart.contains("sudo anolisa --install-mode system install blaze"));
+        assert!(
+            quickstart.contains("user-guide/en/runtime/blaze/QUICKSTART.md")
+                || quickstart.contains("user-guide/zh/runtime/blaze/QUICKSTART.md")
+        );
     }
 }
 

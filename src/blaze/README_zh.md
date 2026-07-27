@@ -33,6 +33,8 @@ manager 安装。Blaze 需要 system mode：
 ```bash
 sudo anolisa --install-mode system install blaze
 sudo systemctl enable --now blazed.service
+blazectl version
+sudo blazectl list
 ```
 
 在已配置仓库包含该 package 的受支持 RPM-based 发行版上：
@@ -40,6 +42,8 @@ sudo systemctl enable --now blazed.service
 ```bash
 sudo yum install blaze
 sudo systemctl enable --now blazed.service
+blazectl --version
+sudo blazectl list
 ```
 
 开发者可以在 Linux 上从源码构建：
@@ -63,8 +67,9 @@ sudo ./target/release/blazed daemon start --config examples/config.toml
 sudo ./target/release/blazectl --socket /run/blaze/api.sock list
 ```
 
-Package/catalog 是否可用取决于所配置的 Linux 发行版仓库；源码树本身不会
-发布或安装 package。
+RPM 将 client 安装到 `/usr/bin/blazectl`，daemon 保持在
+`/usr/libexec/anolisa/blazed`。Package/catalog 是否可用取决于所配置的
+Linux 发行版仓库；源码树本身不会发布或安装 package。
 
 ## blazectl
 

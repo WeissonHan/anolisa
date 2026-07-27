@@ -75,6 +75,13 @@ Development config: `src/blaze/examples/config.toml` + `src/blaze/examples/polic
 
 When modifying config schema, update both the Rust struct in `config.rs` and the example files.
 
+## Packaging
+
+The RPM installs `blazed` at `/usr/libexec/anolisa/blazed`, `blazectl` at
+`/usr/bin/blazectl`, and keeps `blazed.service` as the only service entry point.
+The default UDS remains `/run/blaze/api.sock` with mode `0660`; the client must
+not change its owner, group, mode, or listener configuration.
+
 ## Commit Scope
 
 Use scope `blaze` for all changes under `src/blaze/`. Examples:

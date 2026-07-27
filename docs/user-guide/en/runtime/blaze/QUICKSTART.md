@@ -34,6 +34,32 @@ sudo yum install blaze
 sudo systemctl enable --now blazed.service
 ```
 
+The package contract is:
+
+| Artifact | Owner/mode | Purpose |
+|----------|------------|---------|
+| `/usr/bin/blazectl` | `root:root`, `0755` | Administrator HTTP client |
+| `/usr/libexec/anolisa/blazed` | `root:root`, `0755` | Daemon-only server |
+| `/run/blaze/api.sock` | service ownership, `0660` | Default local API socket |
+| `/etc/anolisa/blaze/config.toml` | package config with `noreplace` semantics | Daemon configuration |
+| `/var/lib/blaze` | preserved state directory | Daemon-owned sandbox state |
+
+`blazed.service` continues to start only `blazed`. Installing `blazectl` does
+not add a client service, change socket ownership, or enable TCP.
+
+### Upgrade and removal
+
+Upgrades replace both version-matched binaries while preserving daemon
+configuration. Removal deletes package-owned binaries and service files but
+does not delete non-package-owned state beneath `/var/lib/blaze`.
+
+```bash
+sudo yum upgrade blaze
+blazectl --version
+/usr/libexec/anolisa/blazed --version
+sudo yum remove blaze
+```
+
 ### Build the client from source
 
 Builds must run on Linux:

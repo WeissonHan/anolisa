@@ -35,6 +35,8 @@ configured catalog contains Blaze. Blaze requires system mode:
 ```bash
 sudo anolisa --install-mode system install blaze
 sudo systemctl enable --now blazed.service
+blazectl version
+sudo blazectl list
 ```
 
 On supported RPM-based distributions whose configured repository contains the
@@ -43,6 +45,8 @@ package:
 ```bash
 sudo yum install blaze
 sudo systemctl enable --now blazed.service
+blazectl --version
+sudo blazectl list
 ```
 
 Developers can build from source on Linux:
@@ -66,8 +70,10 @@ Use the client from another terminal:
 sudo ./target/release/blazectl --socket /run/blaze/api.sock list
 ```
 
-Package/catalog availability depends on the configured Linux distribution
-repositories; the source tree does not publish or install a package by itself.
+The RPM installs the client at `/usr/bin/blazectl` and keeps the daemon at
+`/usr/libexec/anolisa/blazed`. Package/catalog availability depends on the
+configured Linux distribution repositories; the source tree does not publish
+or install a package by itself.
 
 ## blazectl
 
