@@ -6,5 +6,6 @@
 mod checkpoint;
 mod hibernate;
 mod manager;
+mod template;
 
 pub use manager::{CreateSandbox, SandboxManager};
