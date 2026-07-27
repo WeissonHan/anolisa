@@ -2,6 +2,7 @@
 //! Sandbox runtime manager and lifecycle transactions.
 
 mod checkpoint;
+mod flush;
 mod hibernate;
 mod manager;
 mod template;
