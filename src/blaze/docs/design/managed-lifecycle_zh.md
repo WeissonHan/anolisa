@@ -75,8 +75,8 @@ builder 失败时会尽可能释放资源。若 release 也失败，slot 会进�
 
 本设计中的 manager 负责 create、list、inspect、destroy、pool status、pool
 cleanup、启动 reconciliation 和 shutdown cleanup。持久化状态词汇还预留了
-checkpoint 与 hibernation 服务使用的事务状态，但这些服务分别定义自己的
-操作顺序。
+checkpoint 与 hibernation 服务使用的事务状态；其操作顺序详见
+[恢复事务](recovery-transactions_zh.md)。
 
 每个 manager 同时只使用一个 warm-pool prototype。file provider 为各 slot
 使用自包含文件，因此 warm allocation 会增加容量占用和复制时间，以换取独立

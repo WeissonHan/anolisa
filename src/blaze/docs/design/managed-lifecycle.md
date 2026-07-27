@@ -86,7 +86,8 @@ capacity loss over reusing a resource with uncertain ownership.
 The manager in this design owns create, list, inspect, destroy, pool status,
 pool cleanup, startup reconciliation, and shutdown cleanup. The persisted state
 vocabulary also reserves transactional states used by checkpoint and
-hibernation services, but those services define their own operation sequences.
+hibernation services; their operation sequences are specified in
+[Recovery Transactions](recovery-transactions.md).
 
 Only one warm-pool prototype is active per manager. The file provider uses
 self-contained slot files, so warm allocation trades additional capacity and
