@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Readiness wire DTOs shared with the Blaze guest agent.
+//! Wire DTOs shared with the Blaze guest agent.
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -9,24 +11,48 @@ pub const DEFAULT_GUEST_PORT: u32 = 5000;
 /// Maximum accepted JSON response line, excluding the newline delimiter.
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Guest operation needed before a runtime can enter the ready pool.
+/// Operations implemented by the Blaze guest agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GuestOp {
     /// Check whether the guest agent can serve requests.
     Ping,
+    /// Execute one shell command.
+    Exec,
+    /// Read one guest file.
+    Read,
+    /// Replace one guest file.
+    Write,
 }
 
-/// One newline-delimited readiness request.
+/// One newline-delimited request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuestRequest {
     /// Correlation identifier echoed by the guest.
     pub id: String,
     /// Requested guest operation.
     pub op: GuestOp,
+    /// Shell command for [`GuestOp::Exec`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    /// Working directory for command execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Environment additions for command execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+    /// Guest-side timeout in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+    /// Guest path for file operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Standard-base64 file bytes for [`GuestOp::Write`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_b64: Option<String>,
 }
 
-/// One newline-delimited readiness response.
+/// One newline-delimited response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuestResponse {
     /// Correlation identifier copied from the request.
@@ -38,12 +64,33 @@ pub struct GuestResponse {
     /// Guest error message when `ok` is false.
     #[serde(default)]
     pub err: Option<String>,
+    /// Command exit status.
+    #[serde(default)]
+    pub rc: Option<i32>,
+    /// Standard-base64 command stdout.
+    #[serde(default)]
+    pub stdout_b64: Option<String>,
+    /// Standard-base64 command stderr.
+    #[serde(default)]
+    pub stderr_b64: Option<String>,
+    /// Standard-base64 file bytes.
+    #[serde(default)]
+    pub data_b64: Option<String>,
 }
 
 impl GuestRequest {
-    /// Build a readiness request.
+    /// Build a request with operation-specific fields initially absent.
     pub fn new(id: String, op: GuestOp) -> Self {
-        Self { id, op }
+        Self {
+            id,
+            op,
+            cmd: None,
+            cwd: None,
+            env: None,
+            timeout: None,
+            path: None,
+            data_b64: None,
+        }
     }
 }
 
@@ -54,25 +101,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn readiness_request_uses_the_ping_wire_name() {
-        let request = GuestRequest::new("request-1".to_string(), GuestOp::Ping);
+    fn request_uses_wire_operation_names_and_omits_absent_fields() {
+        let request = GuestRequest::new("request-1".to_string(), GuestOp::Exec);
 
         assert_eq!(
             serde_json::to_value(request).expect("serialize request"),
             json!({
                 "id": "request-1",
-                "op": "ping",
+                "op": "exec",
             })
         );
     }
 
     #[test]
-    fn readiness_response_defaults_optional_wire_fields() {
+    fn response_defaults_optional_wire_fields() {
         let response: GuestResponse =
             serde_json::from_value(json!({"id": "request-1"})).expect("deserialize response");
 
         assert_eq!(response.id, "request-1");
         assert!(!response.ok);
         assert!(response.err.is_none());
+        assert!(response.rc.is_none());
+        assert!(response.stdout_b64.is_none());
+        assert!(response.stderr_b64.is_none());
+        assert!(response.data_b64.is_none());
     }
 }
