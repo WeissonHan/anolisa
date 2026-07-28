@@ -119,6 +119,7 @@ impl StorageProvider for FileStorageProvider {
         &self,
         opts: &AcquireOpts,
     ) -> std::result::Result<StorageSlot, StorageAcquireError> {
+        crate::failpoint::storage("storage-acquire")?;
         let slot = self.slot_for_id(&opts.instance_id)?;
         let instance_dir = slot.instance_dir.clone();
 
@@ -156,14 +157,18 @@ impl StorageProvider for FileStorageProvider {
             .await?;
             tokio::fs::File::create(&slot.mem_diff_path).await?;
             tokio::fs::File::create(&slot.rootfs_diff_path).await?;
+            crate::failpoint::storage("storage-acquire-artifacts")?;
             Ok::<(), BlazeError>(())
         }
         .await;
 
         if let Err(e) = result {
-            let rollback = tokio::fs::remove_dir_all(&instance_dir)
-                .await
-                .map_err(BlazeError::from);
+            let rollback = match crate::failpoint::storage("storage-acquire-rollback") {
+                Ok(()) => tokio::fs::remove_dir_all(&instance_dir)
+                    .await
+                    .map_err(BlazeError::from),
+                Err(error) => Err(error),
+            };
             let source = match rollback {
                 Ok(()) => BlazeError::StorageError {
                     msg: format!(
@@ -191,6 +196,7 @@ impl StorageProvider for FileStorageProvider {
     }
 
     async fn release(&self, slot: StorageSlot) -> Result<()> {
+        crate::failpoint::storage("storage-release")?;
         // Re-derive the canonical path from instances_dir + slot.id. Do not
         // trust path strings carried in a persisted or externally built slot.
         let canonical_dir = self.slot_for_id(&slot.id)?.instance_dir;
@@ -224,6 +230,7 @@ impl StorageProvider for FileStorageProvider {
     }
 
     async fn flush_dirty(&self, slot: &StorageSlot) -> Result<()> {
+        crate::failpoint::storage("flush-storage")?;
         // Never trust paths carried by a runtime or persisted slot. Rebuild
         // the complete provider-owned artifact set from the validated ID.
         let canonical = self.slot_for_id(&slot.id)?;
