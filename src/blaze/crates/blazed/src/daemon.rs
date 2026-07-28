@@ -48,9 +48,13 @@ pub async fn run(config_path: &Path) -> Result<()> {
     }
     let storage: Arc<dyn StorageProvider> = {
         use crate::file_provider::FileStorageProvider;
-        // Ensure base_dir exists (acquire uses create_dir, not create_dir_all)
+        // Keep immutable images and provider-owned runtime slots separate.
         tokio::fs::create_dir_all(&config.storage.images_dir).await?;
-        let fp = FileStorageProvider::new(config.storage.images_dir.clone());
+        tokio::fs::create_dir_all(&config.storage.instances_dir).await?;
+        let fp = FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        );
         match fp.probe().await {
             Ok(true) => {
                 tracing::info!(dir = %config.storage.images_dir.display(), "storage provider ready");
@@ -99,8 +103,14 @@ pub async fn run(config_path: &Path) -> Result<()> {
 }
 
 fn ensure_dirs(cfg: &DaemonConfig) -> Result<()> {
+    cfg.validate()?;
     std::fs::create_dir_all(&cfg.daemon.state_dir)?;
     std::fs::create_dir_all(&cfg.template.dir)?;
+    std::fs::create_dir_all(&cfg.storage.images_dir)?;
+    std::fs::create_dir_all(&cfg.storage.instances_dir)?;
+    let images_dir = std::fs::canonicalize(&cfg.storage.images_dir)?;
+    let instances_dir = std::fs::canonicalize(&cfg.storage.instances_dir)?;
+    blaze_core::config::validate_storage_paths(&images_dir, &instances_dir)?;
     if let Some(parent) = cfg.daemon.socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
