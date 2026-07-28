@@ -8,7 +8,9 @@ Summary:        Per-host sandbox orchestrator daemon and client
 
 License:        Apache-2.0
 URL:            https://github.com/alibaba/anolisa
+Packager:        Blaze Package Builder
 Source0:        %{name}-%{version}.tar.gz
+Source1:        %{name}-%{version}-vendor.tar.gz
 
 BuildRequires:  rust >= 1.88
 BuildRequires:  cargo
@@ -24,9 +26,22 @@ client exposes the supported remote management operations.
 
 %prep
 %setup -q
+%setup -q -T -D -a 1
+
+mkdir -p .cargo
+cat > .cargo/config.toml <<'EOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
 
 %build
-cargo build --workspace --release --locked
+export CARGO_HOME=$(pwd)/.cargo-home
+mkdir -p "$CARGO_HOME"
+cp .cargo/config.toml "$CARGO_HOME/config.toml"
+cargo build --workspace --release --offline --locked
 
 %install
 rm -rf $RPM_BUILD_ROOT

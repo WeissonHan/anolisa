@@ -13,7 +13,7 @@ const README_ZH: &str = include_str!("../../../README_zh.md");
 fn rpm_builds_and_owns_the_daemon_and_client_contract() {
     let version_line = format!("Version:        {}", env!("CARGO_PKG_VERSION"));
     assert!(SPEC.lines().any(|line| line == version_line.as_str()));
-    assert!(SPEC.contains("cargo build --workspace --release --locked"));
+    assert!(SPEC.contains("cargo build --workspace --release --offline --locked"));
 
     assert_eq!(
         line_count("install -Dm755 target/release/blazed "),
@@ -39,6 +39,17 @@ fn rpm_builds_and_owns_the_daemon_and_client_contract() {
         1,
         "the RPM file list must own exactly one client path"
     );
+}
+
+#[test]
+fn rpm_build_uses_a_vendored_offline_dependency_source() {
+    assert!(SPEC.contains("Source1:        %{name}-%{version}-vendor.tar.gz"));
+    assert!(SPEC.contains("%setup -q -T -D -a 1"));
+    assert!(SPEC.contains("[source.crates-io]"));
+    assert!(SPEC.contains("replace-with = \"vendored-sources\""));
+    assert!(SPEC.contains("[source.vendored-sources]"));
+    assert!(SPEC.contains("directory = \"vendor\""));
+    assert!(SPEC.contains("cargo build --workspace --release --offline --locked"));
 }
 
 #[test]
@@ -103,6 +114,7 @@ fn release_metadata_matches_the_client_version() {
 
 #[test]
 fn package_metadata_contains_no_identity_changelog() {
+    assert!(SPEC.contains("Packager:        Blaze Package Builder"));
     assert!(!SPEC.contains("%changelog"));
     assert!(!SPEC.contains('@'));
 }
