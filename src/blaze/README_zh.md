@@ -361,8 +361,8 @@ read 返回内容过大时，API 返回 HTTP 502 和
 ```json
 {
   "status": "ok",
-  "version": "0.3.0",
-  "storage_pool": { "ready": 0, "capacity": 0, "pending": 0 }
+  "version": "0.4.0",
+  "storage_pool": { "ready": 0, "capacity": 0, "pending": 0, "quarantined": 0 }
 }
 ```
 

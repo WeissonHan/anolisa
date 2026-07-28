@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-01
+
+### Added
+
+- Sandbox create, list, inspect, and destroy APIs backed by persistent lifecycle operations and an explicit recovery state.
+- Bounded guest command execution and file read/write APIs with explicit payload and request limits.
+- A configurable runtime warm pool with asynchronous refill, capacity reporting, cleanup, and optional ready virtual machines.
+- Optional per-sandbox networking for Firecracker virtual machines, with isolated allocation and owned cleanup.
+- Integrity-checked checkpoint artifacts with lineage, rollback, and pruning.
+- Sandbox hibernate and resume operations with durable artifacts and restart recovery.
+- A transactional runtime artifact catalog with bounded import validation and daemon query APIs.
+- Optional periodic synchronization of storage owned by running sandboxes.
+
+### Changed
+
+- The file provider now creates self-contained runtime snapshots, using additional capacity so each restore remains independent.
+- Runtime processes and host resources remain behind backend ownership interfaces, allowing interrupted cleanup to be retried.
+- Network-enabled VM snapshots restore the captured network slot so guest device names remain stable.
+
 ## [0.3.0] - 2026-07-22
 
 ### Added
@@ -73,4 +92,3 @@ Initial scaffold of ANOLISA Anvil per-host sandbox daemon.
 - Warm pool: pre-created sandboxes ready for instant allocation, configurable min/target/max.
 - Template sharing: multiple sandboxes share one base memory image, reducing per-instance cost.
 - Prometheus metrics endpoint for monitoring.
-
