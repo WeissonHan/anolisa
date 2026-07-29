@@ -191,6 +191,20 @@ pub async fn run(config_path: &Path) -> Result<()> {
         active_backend,
         storage,
     )?);
+    let reconciliation = state.manager.reconcile_startup().await;
+    tracing::info!(
+        attempted = reconciliation.attempted,
+        completed = reconciliation.completed,
+        failed = reconciliation.failures.len(),
+        "startup sandbox reconciliation completed"
+    );
+    for failure in reconciliation.failures {
+        tracing::warn!(
+            instance = %failure.instance_id,
+            error = %failure.error,
+            "sandbox remains recovery-required after startup reconciliation"
+        );
+    }
 
     let listener = DaemonSocket::bind(daemon_lock).await?;
     tracing::info!(socket = %socket_path.display(), "blaze UDS API listening");

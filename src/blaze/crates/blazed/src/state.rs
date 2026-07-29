@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Daemon-wide shared state: configuration, policy engine, pool, template
-//! and hook registries, and the in-memory instance map. All API handlers
-//! receive an [`Arc<ServerState>`] and acquire the relevant `Mutex<...>`
-//! lock just long enough to read or mutate the piece they need — locks
-//! are never held across `.await` boundaries.
+//! Daemon-wide shared state: configuration, policy engine, pool, template and
+//! hook registries, plus the sandbox manager. API paths that change runtime
+//! ownership enter through the manager so its per-instance lock spans every
+//! asynchronous resource mutation.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 use blaze_core::backend::BackendKind;
 use blaze_core::config::DaemonConfig;
@@ -17,32 +19,32 @@ use blaze_core::policy::PolicyEngine;
 use blaze_core::pool::PoolManager;
 use blaze_core::storage::StorageProvider;
 use blaze_core::template::TemplateRegistry;
-use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
 use crate::metrics::Metrics;
-use crate::spawner::{DynBackendInstance, DynSpawner, SpawnerRegistry};
+use crate::sandbox::{SandboxManager, SandboxManagerInit};
+use crate::spawner::SpawnerRegistry;
 
 /// All daemon mutable state. Cloning is via `Arc` (see the `state.clone()`
 /// idiom in `daemon.rs`); the struct itself is never `Clone`.
 pub struct ServerState {
     pub config: Mutex<DaemonConfig>,
     pub policy: Mutex<PolicyEngine>,
-    pub pool: Mutex<PoolManager>,
+    pub pool: Arc<Mutex<PoolManager>>,
     pub template: Mutex<TemplateRegistry>,
     pub hook: Mutex<HookRegistry>,
-    pub instances: Mutex<HashMap<Uuid, SandboxInstance>>,
-    pub backend_instances: Mutex<HashMap<Uuid, DynBackendInstance>>,
-    operation_locks: Mutex<HashMap<Uuid, Weak<AsyncMutex<()>>>>,
-    pub spawners: SpawnerRegistry,
+    #[cfg(test)]
+    pub instances: Arc<Mutex<HashMap<Uuid, SandboxInstance>>>,
+    pub manager: SandboxManager,
     /// The backend kind that `build_spawner` actually probed and selected.
     /// API handlers use this to constrain availability to the single active
     /// backend rather than reporting all configured binaries.
     pub active_backend: BackendKind,
     pub storage: Arc<dyn StorageProvider>,
+    #[cfg(test)]
     pub state_dir: PathBuf,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
 }
 
 impl ServerState {
@@ -61,50 +63,39 @@ impl ServerState {
     ) -> Result<Self> {
         let state_dir = config.daemon.state_dir.clone();
         let instances = scan_state_dir(&state_dir)?;
+        let (manager, resources) = SandboxManager::new(SandboxManagerInit {
+            instances,
+            pool,
+            spawners,
+            active_backend,
+            storage: storage.clone(),
+            state_dir: state_dir.clone(),
+            rootfs_size: config.storage.rootfs_size,
+            mem_size: config.storage.mem_size,
+        });
 
         Ok(Self {
             config: Mutex::new(config),
             policy: Mutex::new(policy),
-            pool: Mutex::new(pool),
+            pool: resources.pool,
             template: Mutex::new(template),
             hook: Mutex::new(hook),
-            instances: Mutex::new(instances),
-            backend_instances: Mutex::new(HashMap::new()),
-            operation_locks: Mutex::new(HashMap::new()),
-            spawners,
+            #[cfg(test)]
+            instances: resources.instances,
+            manager,
             active_backend,
             storage,
+            #[cfg(test)]
             state_dir,
-            metrics: Metrics::new(),
+            metrics: resources.metrics,
         })
     }
 
     /// Return the async operation lock that serializes one sandbox mutation.
-    pub fn operation_lock(&self, id: Uuid) -> Arc<AsyncMutex<()>> {
-        match self.operation_locks.lock() {
-            Ok(mut locks) => operation_lock(&mut locks, id),
-            Err(poisoned) => operation_lock(&mut poisoned.into_inner(), id),
-        }
+    #[cfg(test)]
+    pub fn operation_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        self.manager.operation_lock(id)
     }
-
-    /// Return the implementation responsible for a persisted backend kind.
-    pub fn spawner_for(&self, kind: BackendKind) -> Option<DynSpawner> {
-        self.spawners.get(kind)
-    }
-}
-
-fn operation_lock(
-    locks: &mut HashMap<Uuid, Weak<AsyncMutex<()>>>,
-    id: Uuid,
-) -> Arc<AsyncMutex<()>> {
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(&id).and_then(Weak::upgrade) {
-        return lock;
-    }
-
-    let lock = Arc::new(AsyncMutex::new(()));
-    locks.insert(id, Arc::downgrade(&lock));
-    lock
 }
 
 /// Walk `{state_dir}/<uuid>/state.json` and rebuild the instance map.
@@ -192,24 +183,5 @@ mod tests {
                 if message.contains(&instance.id.to_string())
                     && message.contains(&directory_id.to_string())
         ));
-    }
-
-    #[test]
-    fn operation_locks_reuse_live_entries_and_prune_dead_ones() {
-        let mut locks = HashMap::new();
-        let id = Uuid::new_v4();
-        let first = operation_lock(&mut locks, id);
-        let second = operation_lock(&mut locks, id);
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(locks.len(), 1);
-
-        drop(first);
-        drop(second);
-        for _ in 0..256 {
-            drop(operation_lock(&mut locks, Uuid::new_v4()));
-        }
-
-        assert_eq!(locks.len(), 1);
     }
 }

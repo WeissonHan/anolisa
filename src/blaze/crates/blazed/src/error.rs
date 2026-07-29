@@ -51,6 +51,9 @@ pub enum BlazeDaemonError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("unsupported operation: {0}")]
     UnsupportedOperation(String),
 
@@ -96,12 +99,14 @@ impl BlazeDaemonError {
         match self {
             BlazeDaemonError::BadRequest(_) | BlazeDaemonError::RequestBody(_) => 400,
             BlazeDaemonError::NotFound(_) => 404,
+            BlazeDaemonError::Conflict(_) => 409,
             BlazeDaemonError::PayloadTooLarge { .. } => 413,
             BlazeDaemonError::UnsupportedOperation(_) => 501,
             BlazeDaemonError::RecoveryRequired(_) => 500,
             BlazeDaemonError::HttpStatus { status, .. } => *status,
             BlazeDaemonError::Core(blaze_core::BlazeError::PolicyEvalError { .. })
             | BlazeDaemonError::Core(blaze_core::BlazeError::InvalidStateTransition { .. }) => 422,
+            BlazeDaemonError::Core(blaze_core::BlazeError::OperationInProgress { .. }) => 409,
             BlazeDaemonError::Core(blaze_core::BlazeError::BackendUnavailable { .. }) => 503,
             _ => 500,
         }
