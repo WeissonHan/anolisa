@@ -22,6 +22,7 @@ pub enum SandboxState {
     Running,
     Paused,
     Checkpointed,
+    RecoveryRequired,
     Reset,
     Warm,
     Destroyed,
@@ -35,11 +36,46 @@ impl SandboxState {
             SandboxState::Running => "running",
             SandboxState::Paused => "paused",
             SandboxState::Checkpointed => "checkpointed",
+            SandboxState::RecoveryRequired => "recovery-required",
             SandboxState::Reset => "reset",
             SandboxState::Warm => "warm",
             SandboxState::Destroyed => "destroyed",
         }
     }
+}
+
+/// Persisted multi-step operation used for crash diagnosis and recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperationKind {
+    /// Sandbox creation is acquiring resources or starting a backend.
+    Create,
+    /// Runtime resources are being destroyed.
+    Destroy,
+}
+
+impl OperationKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            OperationKind::Create => "create",
+            OperationKind::Destroy => "destroy",
+        }
+    }
+}
+
+impl std::fmt::Display for OperationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Durable journal entry for one active lifecycle operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationJournal {
+    /// Operation being performed.
+    pub kind: OperationKind,
+    /// UTC time at which the operation became externally visible.
+    pub started_at: DateTime<Utc>,
 }
 
 impl std::fmt::Display for SandboxState {
@@ -86,6 +122,9 @@ pub struct SandboxInstance {
     /// Last durably known backend ownership state.
     #[serde(default)]
     pub backend_ownership: BackendOwnership,
+    /// Active multi-step operation, if any.
+    #[serde(default)]
+    pub operation: Option<OperationJournal>,
 }
 
 impl SandboxInstance {
@@ -111,7 +150,47 @@ impl SandboxInstance {
             updated_at: now,
             policy_name,
             backend_ownership: BackendOwnership::NotStarted,
+            operation: None,
         }
+    }
+
+    /// Record a new operation before starting its first owned-resource
+    /// mutation. An unfinished journal must be recovered rather than silently
+    /// replaced by a later request.
+    pub fn begin_operation(&mut self, kind: OperationKind) -> Result<()> {
+        if let Some(active) = &self.operation {
+            return Err(BlazeError::OperationInProgress {
+                active: active.kind.to_string(),
+                requested: kind.to_string(),
+            });
+        }
+        self.operation = Some(OperationJournal {
+            kind,
+            started_at: Utc::now(),
+        });
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    /// Transfer an interrupted lifecycle operation to destroy recovery.
+    ///
+    /// Cleanup is the only operation allowed to supersede an unfinished
+    /// journal because it releases, rather than acquires, owned resources.
+    pub fn begin_destroy_recovery(&mut self) {
+        if self.operation.as_ref().map(|operation| operation.kind) == Some(OperationKind::Destroy) {
+            return;
+        }
+        self.operation = Some(OperationJournal {
+            kind: OperationKind::Destroy,
+            started_at: Utc::now(),
+        });
+        self.updated_at = Utc::now();
+    }
+
+    /// Clear the marker before atomically persisting the final state.
+    pub fn finish_operation(&mut self) {
+        self.operation = None;
+        self.updated_at = Utc::now();
     }
 
     /// Apply a state transition. Returns
@@ -153,6 +232,7 @@ impl SandboxInstance {
         self.persist_with(state_dir, |tmp_path, final_path, json| {
             let mut file = File::create(tmp_path)?;
             file.write_all(json)?;
+            file.write_all(b"\n")?;
             file.sync_all()?;
             drop(file);
             fs::rename(tmp_path, final_path)?;
@@ -237,10 +317,15 @@ impl SandboxInstance {
 }
 
 fn is_valid_transition(from: SandboxState, to: SandboxState) -> bool {
-    use SandboxState::{Checkpointed, Creating, Destroyed, Paused, Pending, Reset, Running, Warm};
+    use SandboxState::{
+        Checkpointed, Creating, Destroyed, Paused, Pending, RecoveryRequired, Reset, Running, Warm,
+    };
     if to == Destroyed {
         // `* → destroyed` is always valid (terminal sink).
         return from != Destroyed;
+    }
+    if to == RecoveryRequired {
+        return !matches!(from, Destroyed | RecoveryRequired);
     }
     match (from, to) {
         (Pending, Creating) => true,
@@ -305,6 +390,29 @@ mod tests {
         let again = inst.transition(SandboxState::Destroyed);
         assert!(matches!(
             again,
+            Err(BlazeError::InvalidStateTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn recovery_required_can_finish_but_cannot_be_reentered() {
+        let mut inst = fresh();
+        inst.transition(SandboxState::Creating).expect("creating");
+        inst.transition(SandboxState::Running).expect("running");
+        inst.transition(SandboxState::RecoveryRequired)
+            .expect("recovery required");
+
+        let repeated = inst.transition(SandboxState::RecoveryRequired);
+        assert!(matches!(
+            repeated,
+            Err(BlazeError::InvalidStateTransition { .. })
+        ));
+
+        inst.transition(SandboxState::Destroyed)
+            .expect("destroyed from recovery");
+        let terminal = inst.transition(SandboxState::RecoveryRequired);
+        assert!(matches!(
+            terminal,
             Err(BlazeError::InvalidStateTransition { .. })
         ));
     }
@@ -450,5 +558,62 @@ mod tests {
             .expect_err("publication must fail");
 
         assert!(owner_dir.join("backend.pid").exists());
+    }
+
+    #[test]
+    fn legacy_state_without_optional_fields_deserializes() {
+        let inst = fresh();
+        let value = serde_json::json!({
+            "id": inst.id,
+            "state": "running",
+            "backend": "mock",
+            "workload_class": "agent-rl",
+            "image_digest": "sha256:old",
+            "start_path": "cold",
+            "created_at": inst.created_at,
+            "updated_at": inst.updated_at,
+            "policy_name": "legacy"
+        });
+        let loaded: SandboxInstance = serde_json::from_value(value).expect("legacy state");
+        assert!(loaded.operation.is_none());
+        assert_eq!(loaded.backend_ownership, BackendOwnership::Unknown);
+    }
+
+    #[test]
+    fn create_journal_round_trips() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut instance = fresh();
+        instance
+            .begin_operation(OperationKind::Create)
+            .expect("begin create");
+        instance.persist(tmp.path()).expect("persist");
+
+        let mut loaded = SandboxInstance::load(tmp.path(), instance.id).expect("load");
+        assert_eq!(
+            loaded.operation.as_ref().map(|operation| operation.kind),
+            Some(OperationKind::Create)
+        );
+        loaded.finish_operation();
+        assert!(loaded.operation.is_none());
+    }
+
+    #[test]
+    fn unfinished_journal_cannot_be_overwritten() {
+        let mut instance = fresh();
+        instance
+            .begin_operation(OperationKind::Create)
+            .expect("begin create");
+        let journal = instance.operation.clone().expect("journal");
+
+        let error = instance
+            .begin_operation(OperationKind::Destroy)
+            .expect_err("unfinished operation must be preserved");
+
+        assert!(matches!(
+            error,
+            BlazeError::OperationInProgress { active, requested }
+                if active == "create" && requested == "destroy"
+        ));
+        assert_eq!(instance.operation, Some(journal));
     }
 }
