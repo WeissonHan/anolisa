@@ -12,7 +12,8 @@ Prometheus 指标导出，设计为 E2B 类编排平台的单机执行代理。
 
 - **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + TCP (`:14159`)
 - **策略驱动后端选择** — workload class → 后端优先级列表
-- **生命周期状态机** — 8 种状态（Pending → Creating → Running → Paused → Checkpointed → Reset → Warm → Destroyed）
+- **生命周期状态机** — 9 种状态：Pending、Creating、Running、Paused、
+  Checkpointed、RecoveryRequired、Reset、Warm 和 Destroyed
 - **Warm pool 管理** — 预热实例 + 基于 TTL 的 GC
 - **模板注册表** — 内存中模板追踪，支持空闲驱逐
 - **内核 hook 注册** — 前/后置 hook 状态追踪
@@ -37,7 +38,7 @@ sudo ./target/release/blazed daemon start --config examples/config.toml
 curl --unix-socket /run/blaze/api.sock http://localhost/v1/health
 
 # 创建 sandbox
-curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/instances \
+curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/sandboxes \
   -H 'Content-Type: application/json' \
   -d '{"workload_class":"agent-rl","image_digest":"sha256:..."}'
 ```
@@ -110,12 +111,17 @@ images_dir = "/var/lib/blaze/images"
 | 方法 | 路径 | 说明 |
 |--------|------|-------------|
 | GET | `/v1/health` | 健康检查 |
-| GET | `/v1/instances` | 列出所有实例 |
-| POST | `/v1/instances` | 创建新 sandbox 实例 |
-| GET | `/v1/instances/{id}` | 获取实例详情 |
+| GET | `/v1/sandboxes` | 列出所有 sandbox |
+| POST | `/v1/sandboxes` | 创建 sandbox |
+| GET | `/v1/sandboxes/{id}` | 获取 sandbox 详情 |
+| DELETE | `/v1/sandboxes/{id}` | 销毁 sandbox |
+| GET | `/v1/instances` | 列出 sandbox 的兼容入口 |
+| POST | `/v1/instances` | 创建 sandbox 的兼容入口 |
+| GET | `/v1/instances/{id}` | 获取 sandbox 详情的兼容入口 |
+| DELETE | `/v1/instances/{id}` | 销毁 sandbox 的兼容入口 |
+| POST | `/v1/instances/{id}/destroy` | 保留的销毁 action |
 | POST | `/v1/instances/{id}/checkpoint` | 预留接口；后端和存储快照实现前返回 `501` |
 | POST | `/v1/instances/{id}/reset` | 预留接口；运行时重置实现前返回 `501` |
-| POST | `/v1/instances/{id}/destroy` | 销毁实例 |
 | GET | `/v1/pools` | 列出 warm pool |
 | GET | `/v1/pools/{backend}/{class}` | 获取 pool 状态 |
 | POST | `/v1/pools/{backend}/{class}/drain` | 排空 pool |
@@ -127,6 +133,25 @@ images_dir = "/var/lib/blaze/images"
 | GET | `/v1/hooks` | 列出内核 hook |
 | GET | `/v1/metrics` | Prometheus 指标 |
 | POST | `/v1/admin/reload` | 热加载策略 |
+
+### 生命周期管理与恢复
+
+创建和销毁会在修改存储或后端资源之前记录当前操作。创建成功后状态为
+`Running`，销毁成功后状态为 `Destroyed`。如果失败补偿不能释放全部已有
+资源，sandbox 会保留为可查询的 `RecoveryRequired`，后续可以再次执行销毁。
+
+daemon 启动时会逐个处理未结束的 sandbox。单个 sandbox 清理失败不会阻止
+其他记录继续处理，也不会阻止 API 启动。
+
+正常关闭时，daemon 会先停止接收新请求并等待已有连接结束，再为每条持久化
+记录和仍持有的后端资源执行有界清理。单条清理失败不会跳过其余 sandbox，
+所有未完成记录都会汇总报告。
+
+操作记录只保存操作类型和开始时间，不记录每个资源步骤是否已经完成。中断的
+创建会被清理而不是从原位置继续，重启后也不会接管先前的后端进程。恢复失败
+后目前没有后台循环自动重试。checkpoint 和 reset 会先确认 sandbox 处于
+`Running` 且没有进行中的生命周期操作，然后返回 `501`；它们不会修改运行
+资源或持久化状态，其后端和存储操作尚未在这里实现。
 
 #### 健康检查
 
