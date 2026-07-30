@@ -80,6 +80,7 @@ impl FirecrackerSpawner {
                 child,
                 api_socket,
                 guest_socket,
+                fc_config.enable_vsock,
                 pid_file,
                 stopped_marker,
             ));
@@ -91,6 +92,7 @@ impl FirecrackerSpawner {
             child,
             api_socket,
             guest_socket,
+            fc_config.enable_vsock,
             pid_file,
             stopped_marker,
         );
@@ -149,6 +151,7 @@ impl FirecrackerInstance {
         child: Child,
         api_socket: PathBuf,
         guest_socket: PathBuf,
+        enable_vsock: bool,
         pid_file: PathBuf,
         stopped_marker: PathBuf,
     ) -> Self {
@@ -156,7 +159,7 @@ impl FirecrackerInstance {
             instance_id,
             child: Mutex::new(Some(child)),
             api_socket,
-            guest_socket,
+            guest_socket: configured_guest_socket(enable_vsock, guest_socket),
             pid_file,
             stopped_marker,
             killed: AtomicBool::new(false),
@@ -168,6 +171,10 @@ impl FirecrackerInstance {
 impl BackendInstance for FirecrackerInstance {
     fn backend(&self) -> BackendKind {
         BackendKind::Firecracker
+    }
+
+    fn guest_socket_path(&self) -> &Path {
+        &self.guest_socket
     }
 
     async fn try_wait(&self) -> Result<Option<SpawnResult>> {
@@ -393,11 +400,18 @@ async fn wait_for_socket(socket: &Path, child: &mut Child, timeout: Duration) ->
 }
 
 async fn remove_if_exists(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn configured_guest_socket(enable_vsock: bool, socket: PathBuf) -> PathBuf {
+    if enable_vsock { socket } else { PathBuf::new() }
 }
 
 fn validate_regular_file(path: &Path, label: &str) -> Result<()> {
@@ -529,6 +543,45 @@ mod tests {
     }
 
     #[test]
+    fn vm_config_and_reported_guest_transport_agree() {
+        let temp = tempfile::tempdir().expect("temp");
+        let request = spawn_request(temp.path());
+        let socket = temp.path().join("vsock.uds");
+        let disabled = FirecrackerConfig::default();
+        let disabled_path =
+            write_vm_config(&temp.path().join("images"), &request, &disabled, &socket)
+                .expect("disabled config");
+        let disabled_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(disabled_path).expect("read disabled config"))
+                .expect("parse disabled config");
+        assert!(disabled_value.get("vsock").is_none());
+        assert!(
+            configured_guest_socket(disabled.enable_vsock, socket.clone())
+                .as_os_str()
+                .is_empty()
+        );
+
+        let enabled = FirecrackerConfig {
+            enable_vsock: true,
+            ..FirecrackerConfig::default()
+        };
+        let enabled_path =
+            write_vm_config(&temp.path().join("images"), &request, &enabled, &socket)
+                .expect("enabled config");
+        let enabled_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(enabled_path).expect("read enabled config"))
+                .expect("parse enabled config");
+        assert_eq!(
+            enabled_value["vsock"]["uds_path"],
+            path_string(&socket, "socket").unwrap()
+        );
+        assert_eq!(
+            configured_guest_socket(enabled.enable_vsock, socket.clone()),
+            socket
+        );
+    }
+
+    #[test]
     fn serial_log_rotates_before_reuse() {
         let temp = tempfile::tempdir().expect("temp");
         let log = temp.path().join("serial.log");
@@ -581,6 +634,7 @@ mod tests {
             child,
             temp.path().join("api.sock"),
             temp.path().join("guest.sock"),
+            true,
             pid_file.clone(),
             stopped_marker(temp.path()),
         ));

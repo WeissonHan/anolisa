@@ -397,6 +397,7 @@ async fn serve(
 
     uds.stop_accepting();
     drop(tcp);
+    state.manager.begin_shutdown();
     let drain = connections.shutdown(SHUTDOWN_BUDGET.connection_drain);
     let cleanup = api::shutdown_instances(&state, SHUTDOWN_BUDGET.runtime_cleanup);
     let shutdown_result = finish_shutdown(drain, cleanup).await;
