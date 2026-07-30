@@ -901,25 +901,16 @@ async fn checkpoint(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<
     let uuid = parse_uuid(id)?;
     let operation_lock = state.operation_lock(uuid);
     let _operation = operation_lock.lock().await;
-    let mut map = state
+    let map = state
         .instances
         .lock()
         .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?;
-    let inst = map
-        .get_mut(&uuid)
+    map.get(&uuid)
         .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {uuid}")))?;
 
-    if inst.state == SandboxState::Running {
-        inst.transition(SandboxState::Paused)?;
-    }
-    inst.transition(SandboxState::Checkpointed)?;
-    inst.persist(&state.state_dir)?;
-
-    let checkpoint_id = format!("ckpt-{}-{}", inst.id, chrono::Utc::now().timestamp());
-    json_ok(&json!({
-        "checkpoint_id": checkpoint_id,
-        "instance_id": inst.id,
-    }))
+    Err(BlazeDaemonError::UnsupportedOperation(format!(
+        "instance {uuid} cannot be checkpointed until its backend and storage state can be captured"
+    )))
 }
 
 async fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
@@ -1736,6 +1727,51 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_state_only_snapshot() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let request = test_request();
+        let created = created_json(&state, &request).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        let state_path = state.state_dir.join(id).join("state.json");
+        let persisted_before = std::fs::read(&state_path).expect("persisted state");
+
+        let error = checkpoint(&state, id)
+            .await
+            .expect_err("checkpoint without backend and storage capture must fail closed");
+
+        assert!(matches!(error, BlazeDaemonError::UnsupportedOperation(_)));
+        assert_eq!(error.status_code(), 501);
+        assert_eq!(
+            state.instances.lock().expect("instances")[&uuid].state,
+            SandboxState::Running
+        );
+        assert_eq!(
+            std::fs::read(state_path).expect("persisted state"),
+            persisted_before
+        );
+        assert!(
+            state
+                .backend_instances
+                .lock()
+                .expect("owners")
+                .contains_key(&uuid)
+        );
     }
 
     #[tokio::test]
