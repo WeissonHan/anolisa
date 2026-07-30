@@ -18,7 +18,7 @@ use blaze_core::lifecycle::{BackendOwnership, SandboxInstance, SandboxState, Sta
 use blaze_core::policy::{ImageMetadata, RuntimeDecision, WorkloadClass, parse_duration};
 use blaze_core::pool::{PoolConfig, PoolKey};
 use blaze_core::storage::AcquireOpts;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::CONTENT_TYPE;
 use hyper::{Method, Request, Response, StatusCode};
@@ -29,6 +29,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
+use crate::request_body;
 use crate::state::ServerState;
 
 /// Top-level request handler. Always returns `Ok(Response)`; internal
@@ -43,9 +44,17 @@ pub async fn handle(
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
-    let response = match collect_body(req).await {
-        Ok(body) => dispatch(&method, &path, &query, body, &state).await,
-        Err(e) => Err(e),
+    let limit = state
+        .config
+        .lock()
+        .map(|config| config.api.max_body_bytes)
+        .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()));
+    let response = match limit {
+        Ok(limit) => match request_body::collect(req, limit).await {
+            Ok(body) => dispatch(&method, &path, &query, body, &state).await,
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
     };
 
     let resp = match response {
@@ -53,11 +62,6 @@ pub async fn handle(
         Err(e) => error_response(&e),
     };
     Ok(resp)
-}
-
-async fn collect_body(req: Request<Incoming>) -> Result<Vec<u8>> {
-    let collected = req.into_body().collect().await?;
-    Ok(collected.to_bytes().to_vec())
 }
 
 async fn dispatch(
@@ -1458,6 +1462,7 @@ mod tests {
         AcquireOpts, PoolStatus, StorageAcquireError, StorageProvider, StorageSlot,
     };
     use blaze_core::template::TemplateRegistry;
+    use http_body_util::BodyExt;
 
     use crate::file_provider::FileStorageProvider;
     use crate::spawner::{

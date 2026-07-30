@@ -58,6 +58,18 @@ and a policies directory containing per-workload-class policy files.
 
 See `src/blaze/examples/` for annotated sample configurations.
 
+### API Request Limits
+
+The daemon accepts request bodies up to 1 MiB by default. It checks both
+declared `Content-Length` values and streamed body frames, and returns HTTP
+413 when the configured limit is exceeded. Override the limit with a positive
+byte count:
+
+```toml
+[api]
+max_body_bytes = 1048576
+```
+
 ### VM Resource Configuration
 
 Blaze resolves vCPU and memory settings using a three-layer fallback chain:

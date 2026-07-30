@@ -54,6 +54,12 @@ pub enum BlazeDaemonError {
     #[error("unsupported operation: {0}")]
     UnsupportedOperation(String),
 
+    #[error("request body read failed: {0}")]
+    RequestBody(String),
+
+    #[error("request body too large: {actual} bytes exceeds {limit}")]
+    PayloadTooLarge { actual: u64, limit: usize },
+
     #[error("operation requires recovery: {0}")]
     RecoveryRequired(String),
 
@@ -65,8 +71,9 @@ impl BlazeDaemonError {
     /// HTTP status code that should accompany this error in API responses.
     pub fn status_code(&self) -> u16 {
         match self {
-            BlazeDaemonError::BadRequest(_) => 400,
+            BlazeDaemonError::BadRequest(_) | BlazeDaemonError::RequestBody(_) => 400,
             BlazeDaemonError::NotFound(_) => 404,
+            BlazeDaemonError::PayloadTooLarge { .. } => 413,
             BlazeDaemonError::UnsupportedOperation(_) => 501,
             BlazeDaemonError::RecoveryRequired(_) => 500,
             BlazeDaemonError::HttpStatus { status, .. } => *status,
