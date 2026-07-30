@@ -47,26 +47,32 @@ templates = []
 fallback_on_missing_hook = "fail"
 
 # ---------------------------------------------------------------------------
-# Warm-pool configuration.
+# Warm-path policy metadata. Background slots also require a non-zero
+# [storage].pool_size in config.toml.
 # ---------------------------------------------------------------------------
 [pool]
-# Whether the warm pool is enabled for this policy.  Default: false.
+# Whether this policy is eligible for warm paths. Background runtime slots
+# require this setting.  Default: false.
 enabled = true
 
-# Minimum number of warm instances to maintain.  Default: 0.
+# Reserved lifecycle recycling-pool schema metadata. The runtime-slot worker
+# does not consume min/target/max, and /v1/pools does not apply them from policy.
+# Reserved minimum.  Default: 0.
 min = 2
 
-# Target pool size the autoscaler aims for.  Default: 0.
+# Reserved target.  Default: 0.
 target = 8
 
-# Maximum pool size (hard cap).  Default: 0.
+# Reserved maximum.  Default: 0.
 max = 32
 
-# Time-to-live for idle warm instances before the GC reclaims them.
-# Format: duration string (e.g. "30m", "1h").  Default: "30m".
+# Ready-slot time-to-live override for this policy. If omitted, the daemon uses
+# [pool].default_warm_ttl from config.toml (whose default is "30m").
+# Format: duration string (e.g. "30m", "1h").
 warm_ttl = "30m"
 
-# How the pool resets an instance after use.
+# Reserved lifecycle reset metadata. The public reset/return workflow is not
+# connected; background slots are not returned to ready after destroy.
 # Options: "mm-template", "overlayfs-rollback", "full-recreate".
 # Default: "mm-template".
 reset_mode = "full-recreate"

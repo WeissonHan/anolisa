@@ -15,20 +15,44 @@ Prometheus 指标导出，设计为 E2B 类编排平台的单机执行代理。
 - **生命周期状态机** — 9 种状态：Pending、Creating、Running、Paused、
   Checkpointed、RecoveryRequired、Reset、Warm 和 Destroyed
 - **Guest 操作** — 对提供 guest endpoint 的运行中后端执行有界命令和文件传输
-- **Warm pool 管理** — 预热实例 + 基于 TTL 的 GC
+- **Runtime 槽位容量** — 独立存储槽位、可选后端 prefork 和基于 TTL 的清理
 - **模板注册表** — 内存中模板追踪，支持空闲驱逐
 - **内核 hook 注册** — 前/后置 hook 状态追踪
 - **Prometheus 指标** — 请求计数、实例 gauge、池大小
 - **Spawner 后端** — FirecrackerSpawner、BubblewrapSpawner、MockSpawner
 
+## 安装
+
+Blaze 当前是 Labs 组件。源码树中包含 ANOLISA 组件清单和 RPM 打包文件，但
+配置的组件仓库不一定发布 `blaze` 候选包。执行系统级安装前，先预览仓库
+解析结果：
+
+```bash
+sudo anolisa --install-mode system --dry-run install blaze
+sudo anolisa --install-mode system install blaze
+```
+
+如果 RPM 仓库发布了 Blaze：
+
+```bash
+sudo yum install blaze
+```
+
+开发者从源码构建：
+
+```bash
+cd src/blaze
+cargo build --release --locked
+```
+
 ## 快速开始
 
 ```bash
-# 构建
-cd src/blaze
-cargo build --release
+# 选择一种启动方式，不要同时运行两种方式。
+# 软件包安装
+sudo systemctl enable --now blazed
 
-# 运行 daemon（开发环境：覆盖 policy.dir 使用本地示例）
+# 源码构建方式（覆盖 policy.dir 使用本地示例）
 sudo ./target/release/blazed daemon start --config examples/config.toml
 # 注意：默认配置设置 policy.dir = /etc/anolisa/blaze/policies。
 # 源码开发测试时，创建符号链接或覆盖：
@@ -115,12 +139,29 @@ provider = "file"       # 存储 provider 选择。当前支持："file"、"auto
                         # "auto" 按优先级探测可用 provider（当前等同于 "file"）。
                         # 其他值将记录告警并回退到 file。
 images_dir = "/var/lib/blaze/images"
-# pool_size = 0           # [Reserved] 预热存储槽位数（尚未启用）
-# prefork = false         # [Reserved] 是否在槽位中预启动 VM（尚未启用）
+pool_size = 0            # 后台运行槽位数；0 表示不构建
+prefork = false          # 槽位就绪前是否启动后端
 # flush_interval = "30s"  # [Reserved] 脏数据刷盘周期（尚未启用）
+
+[pool]
+default_warm_ttl = "30m" # 符合条件的策略未设置 warm_ttl 时使用
+gc_interval = "5m"       # 过期检查和容量维护间隔
 ```
 
 `file` provider 使用标准文件系统操作管理 sandbox 存储。`auto` 按优先级探测可用 provider（当前等同于 `file`）。无法识别的值将记录告警并回退到 `file`。
+
+`pool_size` 非零时，首个符合条件的创建请求会固定一组兼容构建参数，并启动
+后台补充。每个槽位都持有存储；只有启用 `prefork` 时，槽位才同时持有已经
+运行的后端。`pool_size` 限制池内及正在构建或交接的槽位，不限制已经完成
+生命周期交接的 sandbox。参数不兼容的请求会继续走已有创建流程。
+只有策略的 `[pool]` 设置 `enabled = true` 时，该策略才符合条件；策略中
+可选的 `warm_ttl` 会覆盖 `default_warm_ttl`。
+
+daemon 重启时会在接收请求前清理尚未交接的槽位记录，不会把旧槽位重新放回
+ready 队列。该清理使用重启后当前配置的 provider 以及存储和运行目录，因此
+这些设置必须继续指向同一组已有目录。下文的 `/v1/pools` 描述的是另一套
+生命周期回收 pool 的管理接口，不展示这里的后台运行容量。公开 reset 当前
+返回 `501`，因此没有生产路径把已经使用的 sandbox 放回该 pool。
 
 ## API 端点
 
@@ -144,10 +185,10 @@ images_dir = "/var/lib/blaze/images"
 | POST | `/v1/instances/{id}/write` | Guest 文件写入兼容入口 |
 | POST | `/v1/instances/{id}/checkpoint` | 预留接口；后端和存储快照实现前返回 `501` |
 | POST | `/v1/instances/{id}/reset` | 预留接口；运行时重置实现前返回 `501` |
-| GET | `/v1/pools` | 列出 warm pool |
-| GET | `/v1/pools/{backend}/{class}` | 获取 pool 状态 |
-| POST | `/v1/pools/{backend}/{class}/drain` | 排空 pool |
-| PUT | `/v1/pools/{backend}/{class}/sizing` | 调整 pool 大小 |
+| GET | `/v1/pools` | 列出生命周期回收 pool |
+| GET | `/v1/pools/{backend}/{class}` | 获取生命周期回收 pool 状态 |
+| POST | `/v1/pools/{backend}/{class}/drain` | 排空生命周期回收 pool |
+| PUT | `/v1/pools/{backend}/{class}/sizing` | 调整生命周期回收 pool 大小 |
 | GET | `/v1/templates` | 列出模板 |
 | GET | `/v1/templates/{id}` | 查看模板详情 |
 | POST | `/v1/templates/gc` | 触发模板 GC |
@@ -162,8 +203,10 @@ images_dir = "/var/lib/blaze/images"
 `Running`，销毁成功后状态为 `Destroyed`。如果失败补偿不能释放全部已有
 资源，sandbox 会保留为可查询的 `RecoveryRequired`，后续可以再次执行销毁。
 
-daemon 启动时会逐个处理未结束的 sandbox。单个 sandbox 清理失败不会阻止
-其他记录继续处理，也不会阻止 API 启动。
+runtime 槽位核对会在该生命周期处理之前完成；inventory、journal 或 runtime
+清理失败会停止启动。runtime 核对成功后，daemon 会逐个处理未结束的
+sandbox。单个 sandbox 清理失败不会阻止其他记录继续处理，也不会阻止 API
+启动。
 
 正常关闭时，daemon 会先停止接收新请求并等待已有连接结束，再为每条持久化
 记录和仍持有的后端资源执行有界清理。单条清理失败不会跳过其余 sandbox，
@@ -180,8 +223,9 @@ daemon 启动时会逐个处理未结束的 sandbox。单个 sandbox 清理失�
 只有 sandbox 处于 `Running` 且后端报告了 guest endpoint 时，才能执行
 guest 操作。冷启动后端如果报告了该 endpoint，创建流程会等待 guest agent
 响应后才发布 `Running`。关闭 guest 支持的后端会跳过等待，后续 guest
-操作返回 HTTP 409。当前从 warm pool 激活实例时不会再次执行 guest
-readiness 探测。
+操作返回 HTTP 409。后端提供 guest endpoint 时，prefork 槽位会在进入
+ready 前等待 guest readiness；取用时再次检查后端存活，但不重复 guest
+readiness。仅含存储的槽位会在启动后端后等待 guest readiness。
 
 Guest 操作和生命周期变更使用同一个 sandbox 操作锁。请求可能等待先开始的
 生命周期操作；取得锁后，manager 会再次检查 `Running`。如果 destroy 或
@@ -215,7 +259,7 @@ read 返回内容过大时，API 返回 HTTP 502 和
 
 #### 健康检查
 
-`GET /v1/health` 返回 daemon 状态，包含存储池就绪信息：
+`GET /v1/health` 返回 daemon 状态，包含 provider 存储池就绪信息：
 
 ```json
 {
@@ -225,6 +269,13 @@ read 返回内容过大时，API 返回 HTTP 502 和
 }
 ```
 
+`storage_pool` 对象不报告后台 runtime 槽位容量。
+
+## 文档
+
+- [Runtime 槽位用户指南](../../docs/user-guide/zh/runtime/blaze/QUICKSTART.md)
+- [Runtime 槽位 ownership 设计](docs/design/runtime-slot-ownership.md)
+
 ## 项目结构
 
 ```
@@ -232,6 +283,7 @@ src/blaze/
 ├── crates/
 │   ├── blaze-core/   # 库：策略、生命周期、池、模板、内核、配置
 │   └── blazed/       # 二进制：daemon、API server、spawner、指标
+├── docs/design/       # 组件设计文档
 ├── examples/         # config.toml、policies/
 ├── dist/             # blazed.service、blaze.spec、tmpfiles
 └── manifests/        # 组件元数据
