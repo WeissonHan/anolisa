@@ -28,7 +28,23 @@ use crate::spawner::{
 };
 use crate::state::ServerState;
 
-const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+#[derive(Clone, Copy)]
+struct ShutdownBudget {
+    connection_drain: Duration,
+    runtime_cleanup: Duration,
+}
+
+const SHUTDOWN_BUDGET: ShutdownBudget = ShutdownBudget {
+    // Preserve the existing client grace period. The supervisor aborts and
+    // joins handlers that do not finish before this deadline.
+    connection_drain: Duration::from_secs(30),
+    // Runtime cleanup starts for all owners concurrently, so this is one
+    // shared work deadline. Timed-out tasks are joined before the stage ends.
+    runtime_cleanup: Duration::from_secs(30),
+};
+
+#[cfg(test)]
+const SERVICE_MANAGER_MARGIN: Duration = Duration::from_secs(20);
 
 struct ConnectionSupervisor {
     shutdown: watch::Sender<bool>,
@@ -367,9 +383,27 @@ async fn serve(uds: UnixListener, tcp: Option<TcpListener>, state: Arc<ServerSta
 
     drop(uds);
     drop(tcp);
-    let drain_result = connections.shutdown(CONNECTION_DRAIN_TIMEOUT).await;
+    let drain = connections.shutdown(SHUTDOWN_BUDGET.connection_drain);
+    let cleanup = api::shutdown_instances(&state, SHUTDOWN_BUDGET.runtime_cleanup);
+    let shutdown_result = finish_shutdown(drain, cleanup).await;
     tracing::info!("blaze daemon stopped");
-    drain_result
+    shutdown_result
+}
+
+async fn finish_shutdown<Drain, Cleanup>(drain: Drain, cleanup: Cleanup) -> Result<()>
+where
+    Drain: Future<Output = Result<()>>,
+    Cleanup: Future<Output = Result<()>>,
+{
+    let drain_result = drain.await;
+    let cleanup_result = cleanup.await;
+    match (drain_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(drain), Err(cleanup)) => Err(BlazeDaemonError::RecoveryRequired(format!(
+            "connection drain failed: {drain}; runtime cleanup failed: {cleanup}"
+        ))),
+    }
 }
 
 async fn serve_connection<I>(
@@ -514,6 +548,61 @@ mod tests {
         assert!(
             !active.load(Ordering::Acquire),
             "aborted task was not joined"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_starts_after_exhausted_connection_stage() {
+        let mut connections = ConnectionSupervisor::new();
+        let connection_active = Arc::new(AtomicBool::new(true));
+        let task_active = connection_active.clone();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        connections.spawn_task(async move {
+            let _active = ActiveTask(task_active);
+            entered_tx.send(()).expect("signal task entry");
+            future::pending::<()>().await;
+        });
+        entered_rx.await.expect("task entered");
+
+        let cleanup_started = Arc::new(AtomicBool::new(false));
+        let cleanup_observed = cleanup_started.clone();
+        let active_observed = connection_active.clone();
+        let cleanup = async move {
+            assert!(
+                !active_observed.load(Ordering::Acquire),
+                "runtime cleanup started before connection tasks stopped"
+            );
+            cleanup_observed.store(true, Ordering::Release);
+            Ok(())
+        };
+        let error = finish_shutdown(connections.shutdown(Duration::from_millis(10)), cleanup)
+            .await
+            .expect_err("connection timeout must be reported");
+
+        assert!(error.to_string().contains("connection drain timed out"));
+        assert!(cleanup_started.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn service_stop_timeout_covers_shutdown_stages() {
+        let unit = include_str!("../../../dist/blazed.service");
+        let service_seconds = unit
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("TimeoutStopSec=")
+                    .and_then(|value| value.strip_suffix('s'))
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .expect("service stop timeout in seconds");
+        let service_timeout = Duration::from_secs(service_seconds);
+
+        assert!(
+            SHUTDOWN_BUDGET
+                .connection_drain
+                .saturating_add(SHUTDOWN_BUDGET.runtime_cleanup)
+                .saturating_add(SERVICE_MANAGER_MARGIN)
+                <= service_timeout,
+            "service manager must cover both stages and cancellation headroom"
         );
     }
 

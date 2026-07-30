@@ -5,10 +5,11 @@
 //! than a router framework — the surface is small (~17 endpoints) and
 //! the cost of a fresh dependency outweighs the readability win.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use blaze_core::BlazeError;
 use blaze_core::backend::{BackendKind, BackendStatus, SpawnRequest, select_backend};
@@ -23,6 +24,8 @@ use hyper::header::CONTENT_TYPE;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
@@ -1051,6 +1054,129 @@ async fn destroy_instance(state: &Arc<ServerState>, id: &str) -> Result<Response
     }))
 }
 
+/// Stop every tracked sandbox after the daemon has stopped accepting work.
+///
+/// Cleanup starts concurrently for all known owners and shares one deadline.
+/// This lets independent owners finish after another owner fails or stalls
+/// without multiplying the daemon's shutdown time by the sandbox count.
+/// Timed-out tasks are cancelled and joined before this function returns.
+pub(crate) async fn shutdown_instances(state: &Arc<ServerState>, budget: Duration) -> Result<()> {
+    let mut ids = state
+        .instances
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?
+        .iter()
+        .filter_map(|(id, instance)| {
+            let clean_terminal = instance.state == SandboxState::Destroyed
+                && matches!(
+                    instance.backend_ownership,
+                    BackendOwnership::NotStarted | BackendOwnership::Stopped
+                );
+            (!clean_terminal).then_some(*id)
+        })
+        .collect::<BTreeSet<_>>();
+    ids.extend(
+        state
+            .backend_instances
+            .lock()
+            .map_err(|_| BlazeDaemonError::Internal("backend_instances lock poisoned".into()))?
+            .keys()
+            .copied(),
+    );
+
+    let deadline = Instant::now() + budget;
+    let mut tasks = JoinSet::new();
+    let mut task_owners = HashMap::new();
+    for id in ids {
+        let state = state.clone();
+        let task =
+            tasks.spawn(async move { destroy_instance(&state, &id.to_string()).await.map(|_| ()) });
+        task_owners.insert(task.id(), id);
+    }
+
+    let mut failures = BTreeMap::new();
+    let mut deadline_expired = false;
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(deadline, tasks.join_next_with_id()).await {
+            Ok(Some(Ok((task_id, result)))) => {
+                let Some(id) = task_owners.remove(&task_id) else {
+                    failures.insert(
+                        format!("task-{task_id}"),
+                        "cleanup result had no tracked sandbox owner".to_string(),
+                    );
+                    continue;
+                };
+                if let Err(error) = result {
+                    failures.insert(id.to_string(), error.to_string());
+                }
+            }
+            Ok(Some(Err(error))) => {
+                let key = task_owners
+                    .remove(&error.id())
+                    .map_or_else(|| format!("task-{}", error.id()), |id| id.to_string());
+                failures.insert(key, format!("cleanup task failed: {error}"));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                deadline_expired = true;
+                break;
+            }
+        }
+    }
+
+    if deadline_expired {
+        let mut timed_out_owners = task_owners.values().copied().collect::<BTreeSet<_>>();
+        tasks.abort_all();
+        while let Some(result) = tasks.join_next_with_id().await {
+            match result {
+                Ok((task_id, result)) => {
+                    let Some(id) = task_owners.remove(&task_id) else {
+                        failures.insert(
+                            format!("task-{task_id}"),
+                            "cleanup result had no tracked sandbox owner".to_string(),
+                        );
+                        continue;
+                    };
+                    timed_out_owners.remove(&id);
+                    if let Err(error) = result {
+                        failures.insert(id.to_string(), error.to_string());
+                    }
+                }
+                Err(error) => {
+                    let owner = task_owners.remove(&error.id());
+                    let key =
+                        owner.map_or_else(|| format!("task-{}", error.id()), |id| id.to_string());
+                    if !error.is_cancelled() {
+                        if let Some(id) = owner {
+                            timed_out_owners.remove(&id);
+                        }
+                        failures.insert(key, format!("cleanup task failed: {error}"));
+                    }
+                }
+            }
+        }
+        for id in timed_out_owners {
+            failures.entry(id.to_string()).or_insert_with(|| {
+                format!("cleanup did not finish within the shared {budget:?} budget")
+            });
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        let failures = failures
+            .into_iter()
+            .map(|(owner, error)| format!("{owner}: {error}"))
+            .collect::<Vec<_>>();
+        Err(BlazeDaemonError::RecoveryRequired(format!(
+            "daemon shutdown left {} sandbox cleanup operation(s) incomplete: {}",
+            failures.len(),
+            failures.join("; ")
+        )))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pools
 // ---------------------------------------------------------------------------
@@ -1314,6 +1440,7 @@ fn _hookkind_marker(_k: HookKind) {}
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::future;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1577,6 +1704,105 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ShutdownBehavior {
+        Complete,
+        Fail,
+        Stall,
+    }
+
+    struct ShutdownOwner {
+        instance_id: Uuid,
+        behavior: ShutdownBehavior,
+        attempts: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+    }
+
+    struct ActiveCleanup(Arc<AtomicUsize>);
+
+    impl ActiveCleanup {
+        fn enter(active: Arc<AtomicUsize>) -> Self {
+            active.fetch_add(1, Ordering::AcqRel);
+            Self(active)
+        }
+    }
+
+    impl Drop for ActiveCleanup {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[async_trait]
+    impl BackendInstance for ShutdownOwner {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Mock
+        }
+
+        async fn try_wait(&self) -> blaze_core::Result<Option<SpawnResult>> {
+            Ok(None)
+        }
+
+        async fn kill(&self) -> blaze_core::Result<()> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            let _active = ActiveCleanup::enter(self.active.clone());
+            match self.behavior {
+                ShutdownBehavior::Complete => Ok(()),
+                ShutdownBehavior::Fail => Err(BlazeError::BackendError {
+                    msg: format!("instance {} termination failed", self.instance_id),
+                }),
+                ShutdownBehavior::Stall => future::pending().await,
+            }
+        }
+    }
+
+    async fn track_shutdown_owner(
+        state: &Arc<ServerState>,
+        behavior: ShutdownBehavior,
+        attempts: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+    ) -> Uuid {
+        let mut instance = SandboxInstance::new(
+            BackendKind::Mock,
+            WorkloadClass::AgentTool,
+            "sha256:shutdown-budget".into(),
+            StartPath::Cold,
+            "shutdown-budget-test".into(),
+        );
+        instance
+            .transition(SandboxState::Creating)
+            .expect("creating");
+        instance.transition(SandboxState::Running).expect("running");
+        instance.backend_ownership = BackendOwnership::Running;
+        instance.persist(&state.state_dir).expect("persist");
+        state
+            .storage
+            .acquire(&AcquireOpts {
+                instance_id: instance.id.to_string(),
+                rootfs_size: 4096,
+                mem_size: 4096,
+            })
+            .await
+            .expect("storage");
+
+        let id = instance.id;
+        state
+            .instances
+            .lock()
+            .expect("instances")
+            .insert(id, instance);
+        state.backend_instances.lock().expect("owners").insert(
+            id,
+            Arc::new(ShutdownOwner {
+                instance_id: id,
+                behavior,
+                attempts,
+                active,
+            }),
+        );
+        id
     }
 
     struct PartialSpawnSpawner;
@@ -1973,6 +2199,148 @@ mod tests {
 
         created_json(&state, &test_request()).await;
         assert!(observed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_releases_tracked_runtime_resources() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let instances_dir = config.storage.instances_dir.clone();
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("instance id"))
+            .expect("uuid");
+
+        shutdown_instances(&state, Duration::from_secs(1))
+            .await
+            .expect("shutdown cleanup");
+
+        assert_eq!(
+            state
+                .instances
+                .lock()
+                .expect("instances")
+                .get(&id)
+                .expect("instance")
+                .state,
+            SandboxState::Destroyed
+        );
+        assert!(
+            !state
+                .backend_instances
+                .lock()
+                .expect("backend owners")
+                .contains_key(&id)
+        );
+        assert!(!instances_dir.join(id.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_joins_all_owners_within_one_budget() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let instances_dir = config.storage.instances_dir.clone();
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let complete = track_shutdown_owner(
+            &state,
+            ShutdownBehavior::Complete,
+            attempts.clone(),
+            active.clone(),
+        )
+        .await;
+        let failed = track_shutdown_owner(
+            &state,
+            ShutdownBehavior::Fail,
+            attempts.clone(),
+            active.clone(),
+        )
+        .await;
+        let stalled_a = track_shutdown_owner(
+            &state,
+            ShutdownBehavior::Stall,
+            attempts.clone(),
+            active.clone(),
+        )
+        .await;
+        let stalled_b = track_shutdown_owner(
+            &state,
+            ShutdownBehavior::Stall,
+            attempts.clone(),
+            active.clone(),
+        )
+        .await;
+
+        let started = Instant::now();
+        let error = shutdown_instances(&state, Duration::from_millis(40))
+            .await
+            .expect_err("stalled cleanup must exhaust the shared budget");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "cleanup did not quiesce promptly after the test deadline"
+        );
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            4,
+            "every owner must receive a cleanup attempt"
+        );
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            0,
+            "shutdown returned before every cleanup task became quiescent"
+        );
+        let message = error.to_string();
+        for id in [failed, stalled_a, stalled_b] {
+            assert!(message.contains(&id.to_string()));
+            assert!(
+                state
+                    .backend_instances
+                    .lock()
+                    .expect("owners")
+                    .contains_key(&id)
+            );
+            assert!(instances_dir.join(id.to_string()).is_dir());
+        }
+        assert_eq!(
+            state
+                .instances
+                .lock()
+                .expect("instances")
+                .get(&complete)
+                .expect("complete instance")
+                .state,
+            SandboxState::Destroyed
+        );
+        assert!(
+            !state
+                .backend_instances
+                .lock()
+                .expect("owners")
+                .contains_key(&complete)
+        );
+        assert!(!instances_dir.join(complete.to_string()).exists());
     }
 
     #[tokio::test]
