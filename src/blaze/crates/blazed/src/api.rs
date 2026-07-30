@@ -1404,16 +1404,19 @@ mod tests {
         active_backend: BackendKind,
         storage: Arc<dyn StorageProvider>,
     ) -> Arc<ServerState> {
-        Arc::new(ServerState::build(
-            config,
-            PolicyEngine::with_policies(vec![policy]),
-            PoolManager::new(),
-            TemplateRegistry::new(),
-            HookRegistry::new(),
-            registry,
-            active_backend,
-            storage,
-        ))
+        Arc::new(
+            ServerState::build(
+                config,
+                PolicyEngine::with_policies(vec![policy]),
+                PoolManager::new(),
+                TemplateRegistry::new(),
+                HookRegistry::new(),
+                registry,
+                active_backend,
+                storage,
+            )
+            .expect("build server state"),
+        )
     }
 
     #[cfg(feature = "test-failpoints")]
@@ -1693,16 +1696,19 @@ mod tests {
         let _ = std::fs::create_dir_all(&storage_dir);
         let storage: Arc<dyn blaze_core::storage::StorageProvider> =
             Arc::new(FileStorageProvider::new(storage_dir));
-        let state = Arc::new(ServerState::build(
-            config,
-            engine,
-            PoolManager::new(),
-            TemplateRegistry::new(),
-            HookRegistry::new(),
-            spawners(BackendKind::Firecracker, spawner),
-            BackendKind::Firecracker,
-            storage,
-        ));
+        let state = Arc::new(
+            ServerState::build(
+                config,
+                engine,
+                PoolManager::new(),
+                TemplateRegistry::new(),
+                HookRegistry::new(),
+                spawners(BackendKind::Firecracker, spawner),
+                BackendKind::Firecracker,
+                storage,
+            )
+            .expect("build server state"),
+        );
 
         // Create instance request for AgentRl workload.
         let req_body = serde_json::to_vec(&serde_json::json!({
@@ -1863,16 +1869,19 @@ mod tests {
                 config.storage.images_dir.clone(),
                 config.storage.instances_dir.clone(),
             ));
-        let state = Arc::new(ServerState::build(
-            config,
-            PolicyEngine::with_policies(vec![policy]),
-            PoolManager::new(),
-            TemplateRegistry::new(),
-            HookRegistry::new(),
-            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
-            BackendKind::Mock,
-            storage,
-        ));
+        let state = Arc::new(
+            ServerState::build(
+                config,
+                PolicyEngine::with_policies(vec![policy]),
+                PoolManager::new(),
+                TemplateRegistry::new(),
+                HookRegistry::new(),
+                spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+                BackendKind::Mock,
+                storage,
+            )
+            .expect("build server state"),
+        );
         let request = serde_json::to_vec(&json!({
             "workload_class": "agent-tool",
             "image_digest": "sha256:warm-validation"

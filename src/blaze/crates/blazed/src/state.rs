@@ -20,7 +20,7 @@ use blaze_core::template::TemplateRegistry;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{BlazeDaemonError, Result};
 use crate::metrics::Metrics;
 use crate::spawner::{DynBackendInstance, DynSpawner, SpawnerRegistry};
 
@@ -47,8 +47,7 @@ pub struct ServerState {
 
 impl ServerState {
     /// Build a server state, scanning `state_dir` to repopulate the
-    /// `instances` map from previous runs (best-effort; corrupt entries
-    /// are skipped with a warning).
+    /// `instances` map from previous runs.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         config: DaemonConfig,
@@ -59,19 +58,16 @@ impl ServerState {
         spawners: SpawnerRegistry,
         active_backend: BackendKind,
         storage: Arc<dyn StorageProvider>,
-    ) -> Self {
+    ) -> Result<Self> {
         let state_dir = config.daemon.state_dir.clone();
-        let instances = scan_state_dir(&state_dir).unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "failed to scan state_dir, starting empty");
-            HashMap::new()
-        });
+        let instances = scan_state_dir(&state_dir)?;
         let operation_locks = instances
             .keys()
             .copied()
             .map(|id| (id, Arc::new(AsyncMutex::new(()))))
             .collect();
 
-        Self {
+        Ok(Self {
             config: Mutex::new(config),
             policy: Mutex::new(policy),
             pool: Mutex::new(pool),
@@ -85,7 +81,7 @@ impl ServerState {
             storage,
             state_dir,
             metrics: Metrics::new(),
-        }
+        })
     }
 
     /// Return the async operation lock that serializes one sandbox mutation.
@@ -109,8 +105,10 @@ impl ServerState {
     }
 }
 
-/// Best-effort: walk `{state_dir}/<uuid>/state.json` and rebuild the
-/// instance map. Used both at boot and (in the future) by `daemon doctor`.
+/// Walk `{state_dir}/<uuid>/state.json` and rebuild the instance map.
+///
+/// A valid UUID directory is owned lifecycle state. If its record cannot be
+/// loaded, startup must stop rather than hide resources from later cleanup.
 fn scan_state_dir(state_dir: &Path) -> Result<HashMap<Uuid, SandboxInstance>> {
     let mut out = HashMap::new();
     if !state_dir.exists() {
@@ -128,15 +126,69 @@ fn scan_state_dir(state_dir: &Path) -> Result<HashMap<Uuid, SandboxInstance>> {
         let Ok(id) = Uuid::parse_str(name_str) else {
             continue;
         };
-        match SandboxInstance::load(state_dir, id) {
-            Ok(inst) => {
-                out.insert(id, inst);
-            }
-            Err(err) => {
-                tracing::warn!(instance = %id, error = %err, "skipping corrupt instance state");
-            }
+        let instance = SandboxInstance::load(state_dir, id).map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "cannot load persisted instance {id}: {error}"
+            ))
+        })?;
+        if instance.id != id {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "persisted instance id {} does not match owned directory {id}",
+                instance.id
+            )));
         }
+        out.insert(id, instance);
     }
     tracing::info!(instances = out.len(), "rehydrated instances from state_dir");
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_rejects_corrupt_owned_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let instance_dir = temp.path().join(id.to_string());
+        std::fs::create_dir_all(&instance_dir).expect("instance dir");
+        std::fs::write(instance_dir.join("state.json"), b"{not-json").expect("state");
+
+        let error = scan_state_dir(temp.path()).expect_err("corrupt state must stop startup");
+
+        assert!(matches!(
+            error,
+            BlazeDaemonError::RecoveryRequired(message)
+                if message.contains(&id.to_string())
+                    && message.contains("cannot load persisted instance")
+        ));
+    }
+    #[test]
+    fn scan_rejects_state_owned_by_a_different_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let instance = SandboxInstance::new(
+            BackendKind::Mock,
+            blaze_core::policy::WorkloadClass::AgentTool,
+            "sha256:mismatched-id".into(),
+            blaze_core::lifecycle::StartPath::Cold,
+            "test".into(),
+        );
+        instance.persist(temp.path()).expect("persist state");
+        let directory_id = Uuid::new_v4();
+        std::fs::rename(
+            temp.path().join(instance.id.to_string()),
+            temp.path().join(directory_id.to_string()),
+        )
+        .expect("rename directory");
+
+        let error = scan_state_dir(temp.path()).expect_err("mismatched state must stop startup");
+
+        assert!(matches!(
+            error,
+            BlazeDaemonError::RecoveryRequired(message)
+                if message.contains(&instance.id.to_string())
+                    && message.contains(&directory_id.to_string())
+        ));
+    }
 }
