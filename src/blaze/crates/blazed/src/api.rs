@@ -799,11 +799,15 @@ mod tests {
     use blaze_core::template::TemplateRegistry;
 
     use crate::file_provider::FileStorageProvider;
+    #[cfg(target_os = "linux")]
+    use crate::spawner::BubblewrapSpawner;
     use crate::spawner::{
         BackendInstance, BackendSpawner, DynBackendInstance, DynSpawner, GuestMockSpawner,
         MockSpawner, SpawnFailure, SpawnResult, SpawnerRegistry,
     };
     use crate::state::ServerState;
+    #[cfg(target_os = "linux")]
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -1140,6 +1144,39 @@ mod tests {
             Err(BlazeError::BackendError {
                 msg: "partial owner must remain registered".into(),
             })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct PreSpawnBoundarySpawner {
+        reached: Arc<Notify>,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait]
+    impl BackendSpawner for PreSpawnBoundarySpawner {
+        async fn prepare_spawn(&self, run_dir: &Path) -> blaze_core::Result<()> {
+            BubblewrapSpawner.prepare_spawn(run_dir).await
+        }
+
+        async fn spawn(
+            &self,
+            _request: SpawnRequest,
+        ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
+            self.reached.notify_one();
+            std::future::pending().await
+        }
+
+        async fn probe(&self, _binary_path: &Path) -> blaze_core::Result<bool> {
+            Ok(true)
+        }
+
+        async fn cleanup_orphan(
+            &self,
+            instance_id: Uuid,
+            run_dir: &Path,
+        ) -> blaze_core::Result<()> {
+            BubblewrapSpawner.cleanup_orphan(instance_id, run_dir).await
         }
     }
 
@@ -2020,6 +2057,226 @@ mod tests {
 
         created_json(&state, &test_request()).await;
         assert!(observed.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restart_reconciles_durable_starting_before_spawn() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut config = test_config(&temp);
+        config.storage.rootfs_size = 64;
+        config.storage.mem_size = 32;
+        config
+            .backends
+            .insert(BackendKind::Bubblewrap.as_str().into(), "/bin/true".into());
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let reached = Arc::new(Notify::new());
+        let state = build_test_state(
+            config.clone(),
+            test_policy(BackendKind::Bubblewrap, false),
+            spawners(
+                BackendKind::Bubblewrap,
+                Arc::new(PreSpawnBoundarySpawner {
+                    reached: reached.clone(),
+                }),
+            ),
+            BackendKind::Bubblewrap,
+            storage,
+        );
+        let create_state = state.clone();
+        let create =
+            tokio::spawn(async move { create_instance(&create_state, &test_request()).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("create reached the pre-spawn boundary");
+
+        let instance = state
+            .manager
+            .list()
+            .expect("instances")
+            .into_iter()
+            .next()
+            .expect("durable create state");
+        let persisted = SandboxInstance::load(&config.daemon.state_dir, instance.id)
+            .expect("load durable Starting state");
+        assert_eq!(persisted.state, SandboxState::Creating);
+        assert_eq!(persisted.backend_ownership, BackendOwnership::Starting);
+        let pid_file = config
+            .daemon
+            .state_dir
+            .join(instance.id.to_string())
+            .join("backend.pid");
+        assert_eq!(std::fs::read(&pid_file).expect("prepared PID handoff"), b"");
+        assert!(
+            config
+                .storage
+                .instances_dir
+                .join(instance.id.to_string())
+                .is_dir()
+        );
+
+        create.abort();
+        assert!(
+            create
+                .await
+                .expect_err("simulated daemon exit cancels create")
+                .is_cancelled()
+        );
+        drop(state);
+
+        let recovered_storage: Arc<dyn StorageProvider> =
+            Arc::new(FileStorageProvider::with_images(
+                config.storage.images_dir.clone(),
+                config.storage.instances_dir.clone(),
+            ));
+        let recovered = build_test_state(
+            config.clone(),
+            test_policy(BackendKind::Bubblewrap, false),
+            spawners(BackendKind::Bubblewrap, Arc::new(BubblewrapSpawner)),
+            BackendKind::Bubblewrap,
+            recovered_storage,
+        );
+
+        let report = recovered.manager.reconcile_startup().await;
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.completed, 1);
+        assert!(report.failures.is_empty());
+        assert_eq!(
+            recovered
+                .manager
+                .get(instance.id)
+                .expect("reconciled state")
+                .state,
+            SandboxState::Destroyed
+        );
+        assert!(
+            !config
+                .storage
+                .instances_dir
+                .join(instance.id.to_string())
+                .exists()
+        );
+        assert!(
+            config
+                .daemon
+                .state_dir
+                .join(instance.id.to_string())
+                .join("backend.stopped")
+                .is_file()
+        );
+        assert!(!pid_file.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restart_retains_locked_handoff_until_retry() {
+        use std::os::fd::AsRawFd;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let mut config = test_config(&temp);
+        config.storage.rootfs_size = 64;
+        config.storage.mem_size = 32;
+        let storage = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let mut instance = SandboxInstance::new(
+            BackendKind::Bubblewrap,
+            WorkloadClass::AgentTool,
+            "sha256:locked-handoff".into(),
+            StartPath::Cold,
+            "pid-handoff-test".into(),
+        );
+        instance
+            .transition(SandboxState::Creating)
+            .expect("creating");
+        instance.begin_operation(OperationKind::Create);
+        let run_dir = config.daemon.state_dir.join(instance.id.to_string());
+        BubblewrapSpawner
+            .prepare_spawn(&run_dir)
+            .await
+            .expect("prepare PID handoff");
+        instance.backend_ownership = BackendOwnership::Starting;
+        instance
+            .persist(&config.daemon.state_dir)
+            .expect("persist Starting state");
+        storage
+            .acquire(&AcquireOpts {
+                instance_id: instance.id.to_string(),
+                rootfs_size: config.storage.rootfs_size,
+                mem_size: config.storage.mem_size,
+            })
+            .await
+            .expect("storage");
+        let pid_file = run_dir.join("backend.pid");
+        let handoff = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pid_file)
+            .expect("open PID handoff");
+        assert_eq!(
+            unsafe { libc::flock(handoff.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "lock PID handoff"
+        );
+        let state = build_test_state(
+            config.clone(),
+            test_policy(BackendKind::Bubblewrap, false),
+            spawners(BackendKind::Bubblewrap, Arc::new(BubblewrapSpawner)),
+            BackendKind::Bubblewrap,
+            storage,
+        );
+
+        let first = state.manager.reconcile_startup().await;
+
+        assert_eq!(first.attempted, 1);
+        assert_eq!(first.completed, 0);
+        assert_eq!(first.failures.len(), 1);
+        assert!(first.failures[0].error.contains("still in progress"));
+        assert_eq!(
+            state
+                .manager
+                .get(instance.id)
+                .expect("retained state")
+                .state,
+            SandboxState::RecoveryRequired
+        );
+        assert!(
+            config
+                .storage
+                .instances_dir
+                .join(instance.id.to_string())
+                .is_dir()
+        );
+        assert!(!run_dir.join("backend.stopped").exists());
+
+        drop(handoff);
+        let retry = state.manager.reconcile_startup().await;
+
+        assert_eq!(retry.attempted, 1);
+        assert_eq!(retry.completed, 1);
+        assert!(retry.failures.is_empty());
+        assert_eq!(
+            state
+                .manager
+                .get(instance.id)
+                .expect("destroyed state")
+                .state,
+            SandboxState::Destroyed
+        );
+        assert!(
+            !config
+                .storage
+                .instances_dir
+                .join(instance.id.to_string())
+                .exists()
+        );
+        assert!(run_dir.join("backend.stopped").is_file());
+        assert!(!pid_file.exists());
     }
 
     #[tokio::test]

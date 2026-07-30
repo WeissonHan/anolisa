@@ -22,7 +22,8 @@ use super::netns::{NetworkManager, NetworkSlot};
 use super::terminate_recorded_process;
 use super::{
     BackendInstance, BackendSpawner, DynBackendInstance, SpawnFailure, SpawnResult,
-    record_backend_stopped, remove_file_if_exists, spawn_result, stopped_marker, terminate_child,
+    configure_pid_handoff, prepare_pid_handoff, record_backend_stopped, remove_file_if_exists,
+    spawn_result, stopped_marker, terminate_child,
 };
 
 const NETWORK_BOOT_IP: &str = "ip=169.254.0.2::169.254.0.1:255.255.255.252::eth0:off";
@@ -97,7 +98,6 @@ impl FirecrackerSpawner {
         let network_temp_file = network_metadata_temp(&network_file);
         remove_if_exists(&api_socket).await?;
         remove_if_exists(&guest_socket).await?;
-        remove_if_exists(&pid_file).await?;
         remove_file_if_exists(&stopped_marker).await?;
         remove_if_exists(&network_file).await?;
         remove_if_exists(&network_temp_file).await?;
@@ -258,7 +258,28 @@ impl FirecrackerSpawner {
                 )
                 .await);
         }
-        let mut child = match command.spawn() {
+        let pid_handoff = match configure_pid_handoff(&mut command, &pid_file) {
+            Ok(pid_handoff) => pid_handoff,
+            Err(error) => {
+                return Err(self
+                    .compensate_before_spawn(
+                        request.instance_id,
+                        runtime_files(
+                            api_socket,
+                            guest_socket,
+                            pid_file,
+                            stopped_marker,
+                            network_file,
+                        ),
+                        network,
+                        error,
+                    )
+                    .await);
+            }
+        };
+        let child = command.spawn();
+        drop(pid_handoff);
+        let mut child = match child {
             Ok(child) => child,
             Err(source) => {
                 return Err(self
@@ -277,24 +298,6 @@ impl FirecrackerSpawner {
                     .await);
             }
         };
-        if let Some(pid) = child.id()
-            && let Err(error) = tokio::fs::write(&pid_file, format!("{pid}\n")).await
-        {
-            let owner: DynBackendInstance = Arc::new(FirecrackerInstance::new(
-                request.instance_id,
-                Some(child),
-                runtime_files(
-                    api_socket,
-                    guest_socket,
-                    pid_file,
-                    stopped_marker,
-                    network_file,
-                ),
-                network,
-                self.network.clone(),
-            ));
-            return Err(SpawnFailure::compensate_started(error.into(), owner).await);
-        }
         if let Err(error) = wait_for_socket(&api_socket, &mut child, self.socket_timeout).await {
             let owner: DynBackendInstance = Arc::new(FirecrackerInstance::new(
                 request.instance_id,
@@ -354,6 +357,11 @@ impl FirecrackerSpawner {
 
 #[async_trait]
 impl BackendSpawner for FirecrackerSpawner {
+    async fn prepare_spawn(&self, run_dir: &Path) -> Result<()> {
+        tokio::fs::create_dir_all(run_dir).await?;
+        prepare_pid_handoff(&run_dir.join("firecracker.pid"))
+    }
+
     async fn spawn(
         &self,
         request: SpawnRequest,
@@ -1403,7 +1411,7 @@ mod tests {
             .await
             .expect_err("unknown launch state must fail closed");
 
-        assert!(error.to_string().contains("missing PID metadata"));
+        assert!(error.to_string().contains("missing PID handoff"));
         assert!(network_temp_file.exists());
         assert!(!stopped_marker(temp.path()).exists());
         assert_eq!(
@@ -1427,7 +1435,7 @@ mod tests {
             .await
             .expect_err("unknown launch state must fail closed");
 
-        assert!(error.to_string().contains("missing PID metadata"));
+        assert!(error.to_string().contains("missing PID handoff"));
         assert!(!stopped_marker(temp.path()).exists());
         assert_eq!(
             runner.calls(),
@@ -1550,7 +1558,7 @@ mod tests {
             .await
             .expect_err("missing process metadata must block cleanup");
 
-        assert!(error.to_string().contains("missing PID metadata"));
+        assert!(error.to_string().contains("missing PID handoff"));
         assert!(network_file.exists());
         assert!(runner.calls().is_empty());
     }

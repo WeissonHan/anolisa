@@ -291,6 +291,30 @@ impl SandboxManager {
         };
         crate::failpoint::pause("create-after-storage-acquire").await;
 
+        let work_dir = self.state_dir.join(instance.id.to_string());
+        let spawner = match self.spawners.get(self.active_backend) {
+            Some(spawner) => spawner,
+            None => {
+                return Err(self
+                    .cleanup_failed_create(
+                        &mut instance,
+                        storage,
+                        None,
+                        false,
+                        BlazeDaemonError::Internal(format!(
+                            "active backend {} has no registered spawner",
+                            self.active_backend
+                        )),
+                    )
+                    .await);
+            }
+        };
+        if let Err(error) = spawner.prepare_spawn(&work_dir).await {
+            return Err(self
+                .cleanup_failed_create(&mut instance, storage, None, false, error.into())
+                .await);
+        }
+
         instance.backend_ownership = BackendOwnership::Starting;
         if let Err(error) = instance.persist(&self.state_dir) {
             instance.backend_ownership = BackendOwnership::NotStarted;
@@ -311,30 +335,12 @@ impl SandboxManager {
                 .await);
         }
 
-        let spawner = match self.spawners.get(self.active_backend) {
-            Some(spawner) => spawner,
-            None => {
-                instance.backend_ownership = BackendOwnership::NotStarted;
-                return Err(self
-                    .cleanup_failed_create(
-                        &mut instance,
-                        storage,
-                        None,
-                        false,
-                        BlazeDaemonError::Internal(format!(
-                            "active backend {} has no registered spawner",
-                            self.active_backend
-                        )),
-                    )
-                    .await);
-            }
-        };
         let spawn = match crate::failpoint::backend("create-spawn") {
             Ok(()) => {
                 spawner
                     .spawn(SpawnRequest {
                         instance_id: instance.id,
-                        run_dir: self.state_dir.join(instance.id.to_string()),
+                        run_dir: work_dir,
                         binary_path: request.binary_path,
                         storage: storage.clone(),
                         backend: request.decision.backend,
