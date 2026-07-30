@@ -315,12 +315,15 @@ impl FirecrackerSpawner {
         let instance = FirecrackerInstance::new(
             request.instance_id,
             Some(child),
-            runtime_files(
-                api_socket,
-                guest_socket,
-                pid_file,
-                stopped_marker,
-                network_file,
+            configured_runtime_files(
+                runtime_files(
+                    api_socket,
+                    guest_socket,
+                    pid_file,
+                    stopped_marker,
+                    network_file,
+                ),
+                fc_config.enable_vsock,
             ),
             network,
             self.network.clone(),
@@ -417,6 +420,16 @@ fn runtime_files(
     }
 }
 
+fn configured_runtime_files(
+    mut files: FirecrackerRuntimeFiles,
+    enable_vsock: bool,
+) -> FirecrackerRuntimeFiles {
+    if !enable_vsock {
+        files.guest_socket = PathBuf::new();
+    }
+    files
+}
+
 impl FirecrackerInstance {
     fn new(
         instance_id: Uuid,
@@ -442,6 +455,10 @@ impl FirecrackerInstance {
 impl BackendInstance for FirecrackerInstance {
     fn backend(&self) -> BackendKind {
         BackendKind::Firecracker
+    }
+
+    fn guest_socket_path(&self) -> &Path {
+        &self.files.guest_socket
     }
 
     async fn try_wait(&self) -> Result<Option<SpawnResult>> {
@@ -737,6 +754,9 @@ async fn wait_for_socket(socket: &Path, child: &mut Child, timeout: Duration) ->
 }
 
 async fn remove_if_exists(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -977,6 +997,68 @@ mod tests {
             serde_json::from_slice(&std::fs::read(path).expect("read config"))
                 .expect("parse config");
         assert!(value.get("network-interfaces").is_none());
+    }
+
+    #[test]
+    fn vm_config_and_reported_guest_transport_agree() {
+        let temp = tempfile::tempdir().expect("temp");
+        let request = spawn_request(temp.path());
+        let socket = temp.path().join("vsock.uds");
+        let disabled = FirecrackerConfig::default();
+        let disabled_path = write_vm_config(
+            &temp.path().join("images"),
+            &request,
+            &disabled,
+            &socket,
+            None,
+        )
+        .expect("disabled config");
+        let disabled_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(disabled_path).expect("read disabled config"))
+                .expect("parse disabled config");
+        assert!(disabled_value.get("vsock").is_none());
+        let files = configured_runtime_files(
+            runtime_files(
+                temp.path().join("api.sock"),
+                socket.clone(),
+                temp.path().join("firecracker.pid"),
+                stopped_marker(temp.path()),
+                temp.path().join("network.json"),
+            ),
+            disabled.enable_vsock,
+        );
+        assert!(files.guest_socket.as_os_str().is_empty());
+
+        let enabled = FirecrackerConfig {
+            enable_vsock: true,
+            ..FirecrackerConfig::default()
+        };
+        let enabled_path = write_vm_config(
+            &temp.path().join("images"),
+            &request,
+            &enabled,
+            &socket,
+            None,
+        )
+        .expect("enabled config");
+        let enabled_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(enabled_path).expect("read enabled config"))
+                .expect("parse enabled config");
+        assert_eq!(
+            enabled_value["vsock"]["uds_path"],
+            path_string(&socket, "socket").expect("socket path")
+        );
+        let files = configured_runtime_files(
+            runtime_files(
+                temp.path().join("api.sock"),
+                socket.clone(),
+                temp.path().join("firecracker.pid"),
+                stopped_marker(temp.path()),
+                temp.path().join("network.json"),
+            ),
+            enabled.enable_vsock,
+        );
+        assert_eq!(files.guest_socket, socket);
     }
 
     #[test]

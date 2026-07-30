@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use blaze_core::BlazeError;
 use blaze_core::backend::{BackendKind, SpawnRequest};
@@ -13,12 +14,16 @@ use blaze_core::lifecycle::{
 use blaze_core::policy::RuntimeDecision;
 use blaze_core::pool::{PoolKey, PoolManager};
 use blaze_core::storage::{AcquireOpts, StorageProvider, StorageSlot};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
+use crate::guest::{GuestClient, GuestExecResult, MAX_GUEST_FILE_BYTES};
 use crate::metrics::Metrics;
 use crate::spawner::{DynBackendInstance, SpawnerRegistry};
+
+const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Inputs already parsed and policy-evaluated by the API.
 #[derive(Debug, Clone)]
@@ -169,6 +174,15 @@ impl SandboxManager {
         }
     }
 
+    #[cfg(test)]
+    pub fn insert_backend_owner(&self, id: Uuid, owner: DynBackendInstance) -> Result<()> {
+        self.backend_instances
+            .lock()
+            .map_err(|_| poisoned("backend_instances"))?
+            .insert(id, owner);
+        Ok(())
+    }
+
     /// Return all persisted sandbox metadata.
     pub fn list(&self) -> Result<Vec<SandboxInstance>> {
         Ok(self
@@ -188,6 +202,40 @@ impl SandboxManager {
             .get(&id)
             .cloned()
             .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {id}")))
+    }
+
+    /// Execute one command through the running sandbox guest.
+    pub async fn exec(
+        &self,
+        id: Uuid,
+        command: String,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        timeout_secs: u32,
+    ) -> Result<GuestExecResult> {
+        let _operation = self.lock_running(id).await?;
+        self.guest_client(id)?
+            .exec(command, cwd, env, timeout_secs)
+            .await
+            .map_err(BlazeDaemonError::from)
+    }
+
+    /// Read one file through the running sandbox guest.
+    pub async fn read_file(&self, id: Uuid, path: String) -> Result<Vec<u8>> {
+        let _operation = self.lock_running(id).await?;
+        self.guest_client(id)?
+            .read_file(path)
+            .await
+            .map_err(BlazeDaemonError::from)
+    }
+
+    /// Replace one file through the running sandbox guest.
+    pub async fn write_file(&self, id: Uuid, path: String, data: &[u8]) -> Result<()> {
+        let _operation = self.lock_running(id).await?;
+        self.guest_client(id)?
+            .write_file(path, data)
+            .await
+            .map_err(BlazeDaemonError::from)
     }
 
     /// Create a cold sandbox or activate a compatible warm runtime.
@@ -300,6 +348,20 @@ impl SandboxManager {
             Ok(backend_instance) => {
                 instance.backend_ownership = BackendOwnership::Running;
                 let actual_backend = backend_instance.backend();
+                if let Err(error) = self
+                    .wait_for_guest_ready(&backend_instance, "create-guest-ready")
+                    .await
+                {
+                    return Err(self
+                        .cleanup_failed_create(
+                            &mut instance,
+                            storage,
+                            Some(backend_instance),
+                            false,
+                            error.into(),
+                        )
+                        .await);
+                }
                 let mut backend_instance = Some(backend_instance);
                 let registered = match self.backend_instances.lock() {
                     Ok(mut instances) => {
@@ -818,6 +880,59 @@ impl SandboxManager {
             }
         }
         report
+    }
+
+    async fn lock_running(&self, id: Uuid) -> Result<OwnedMutexGuard<()>> {
+        let operation = self.operation_lock(id).lock_owned().await;
+        let instance = self.get(id)?;
+        if instance.state != SandboxState::Running || instance.operation.is_some() {
+            return Err(BlazeDaemonError::Conflict(format!(
+                "instance {id} is not available for guest operations"
+            )));
+        }
+        Ok(operation)
+    }
+
+    fn guest_client(&self, id: Uuid) -> Result<GuestClient> {
+        let backend = self
+            .backend_instances
+            .lock()
+            .map_err(|_| poisoned("backend_instances"))?
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| {
+                BlazeDaemonError::Conflict(format!("instance {id} has no backend owner"))
+            })?;
+        let socket = backend.guest_socket_path();
+        if socket.as_os_str().is_empty() {
+            return Err(BlazeDaemonError::Conflict(format!(
+                "instance {id} has no guest transport"
+            )));
+        }
+        Ok(GuestClient::new(
+            socket.to_path_buf(),
+            GUEST_REQUEST_TIMEOUT,
+            MAX_GUEST_FILE_BYTES,
+        ))
+    }
+
+    async fn wait_for_guest_ready(
+        &self,
+        backend: &DynBackendInstance,
+        failpoint: &str,
+    ) -> crate::guest::Result<()> {
+        let socket = backend.guest_socket_path();
+        if socket.as_os_str().is_empty() {
+            return Ok(());
+        }
+        crate::failpoint::guest(failpoint)?;
+        GuestClient::new(
+            socket.to_path_buf(),
+            GUEST_REQUEST_TIMEOUT,
+            MAX_GUEST_FILE_BYTES,
+        )
+        .wait_ready(GUEST_REQUEST_TIMEOUT, &CancellationToken::new())
+        .await
     }
 
     async fn cleanup_failed_create(
