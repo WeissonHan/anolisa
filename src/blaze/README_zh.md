@@ -14,6 +14,7 @@ Prometheus 指标导出，设计为 E2B 类编排平台的单机执行代理。
 - **策略驱动后端选择** — workload class → 后端优先级列表
 - **生命周期状态机** — 9 种状态：Pending、Creating、Running、Paused、
   Checkpointed、RecoveryRequired、Reset、Warm 和 Destroyed
+- **Guest 操作** — 对提供 guest endpoint 的运行中后端执行有界命令和文件传输
 - **Warm pool 管理** — 预热实例 + 基于 TTL 的 GC
 - **模板注册表** — 内存中模板追踪，支持空闲驱逐
 - **内核 hook 注册** — 前/后置 hook 状态追踪
@@ -40,8 +41,12 @@ curl --unix-socket /run/blaze/api.sock http://localhost/v1/health
 # 创建 sandbox
 curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/sandboxes \
   -H 'Content-Type: application/json' \
-  -d '{"workload_class":"agent-rl","image_digest":"sha256:..."}'
+  -d '{"workload_class":"agent-tool","image_digest":"sha256:..."}'
 ```
+
+快速开始使用关闭 Firecracker guest transport 的示例策略，因此没有兼容
+guest agent 的镜像不会等待 guest 就绪。只有镜像运行了对应 agent 时才应
+启用该 transport。
 
 ## 配置
 
@@ -68,6 +73,17 @@ daemon 默认接收不超过 1 MiB 的请求体。它会同时检查声明的
 [api]
 max_body_bytes = 1048576
 ```
+
+Guest 文件在 base64 解码后最多为 16 MiB。完整的 16 MiB 写入经过 JSON 和
+base64 编码后会变大，所以默认 1 MiB 请求上限会拒绝它。调用者确实需要完整
+文件上限时，应至少配置 22 MiB：
+
+```toml
+[api]
+max_body_bytes = 23068672
+```
+
+daemon 会同时检查 HTTP 请求大小和解码后的文件大小。
 
 ### VM 资源配置
 
@@ -115,11 +131,17 @@ images_dir = "/var/lib/blaze/images"
 | POST | `/v1/sandboxes` | 创建 sandbox |
 | GET | `/v1/sandboxes/{id}` | 获取 sandbox 详情 |
 | DELETE | `/v1/sandboxes/{id}` | 销毁 sandbox |
+| POST | `/v1/sandboxes/{id}/exec` | 执行 guest 命令 |
+| POST | `/v1/sandboxes/{id}/read` | 读取 guest 文件 |
+| POST | `/v1/sandboxes/{id}/write` | 替换 guest 文件 |
 | GET | `/v1/instances` | 列出 sandbox 的兼容入口 |
 | POST | `/v1/instances` | 创建 sandbox 的兼容入口 |
 | GET | `/v1/instances/{id}` | 获取 sandbox 详情的兼容入口 |
 | DELETE | `/v1/instances/{id}` | 销毁 sandbox 的兼容入口 |
 | POST | `/v1/instances/{id}/destroy` | 保留的销毁 action |
+| POST | `/v1/instances/{id}/exec` | Guest 命令兼容入口 |
+| POST | `/v1/instances/{id}/read` | Guest 文件读取兼容入口 |
+| POST | `/v1/instances/{id}/write` | Guest 文件写入兼容入口 |
 | POST | `/v1/instances/{id}/checkpoint` | 预留接口；后端和存储快照实现前返回 `501` |
 | POST | `/v1/instances/{id}/reset` | 预留接口；运行时重置实现前返回 `501` |
 | GET | `/v1/pools` | 列出 warm pool |
@@ -152,6 +174,44 @@ daemon 启动时会逐个处理未结束的 sandbox。单个 sandbox 清理失�
 后目前没有后台循环自动重试。checkpoint 和 reset 会先确认 sandbox 处于
 `Running` 且没有进行中的生命周期操作，然后返回 `501`；它们不会修改运行
 资源或持久化状态，其后端和存储操作尚未在这里实现。
+
+### Guest 操作
+
+只有 sandbox 处于 `Running` 且后端报告了 guest endpoint 时，才能执行
+guest 操作。冷启动后端如果报告了该 endpoint，创建流程会等待 guest agent
+响应后才发布 `Running`。关闭 guest 支持的后端会跳过等待，后续 guest
+操作返回 HTTP 409。当前从 warm pool 激活实例时不会再次执行 guest
+readiness 探测。
+
+Guest 操作和生命周期变更使用同一个 sandbox 操作锁。请求可能等待先开始的
+生命周期操作；取得锁后，manager 会再次检查 `Running`。如果 destroy 或
+其他状态变更先完成，guest 请求不会访问旧 runtime，而是直接失败。
+
+接口接收以下 JSON：
+
+```json
+{"cmd":"uname -a","cwd":"/","env":{"LANG":"C"},"timeout":10}
+```
+
+```json
+{"path":"/tmp/input","data_b64":"aGVsbG8="}
+```
+
+`read` 只需要 `path`；文件读取结果和命令输出使用标准 base64。Exec timeout
+范围为 1 至 20 秒。Guest 文件解码后最多为 16 MiB，响应帧也有固定上限。
+
+如果 exec 或 write 在请求送达前失败，它是普通通信失败；送达前等待超时使用
+`"code": "guest_timeout"`。如果已经开始送达，但 daemon 无法确定结果，API
+返回 HTTP 504 和 `"code": "guest_outcome_unknown"`；调用者应先核对状态，
+不能自动重放。read 不改变 guest 状态，可以由调用者决定是否重试。Guest
+read 返回内容过大时，API 返回 HTTP 502 和
+`"code": "guest_response_too_large"`。exec 或 write 已经开始送达后，如果
+返回内容过大或不可信，结果仍归为 unknown。调用者的请求过大时返回 HTTP
+413。
+
+每个请求都会完整缓冲。上限约束的是单个请求，而不是所有并发请求之和，因此
+调用方还需要限制 guest 操作并发数。当前不支持文件流式传输、交互式终端和
+会话复用。
 
 #### 健康检查
 

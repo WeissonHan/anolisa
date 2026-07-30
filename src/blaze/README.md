@@ -15,6 +15,8 @@ Designed as the per-host agent for E2B-style orchestrator platforms.
 - **Policy-driven backend selection** — workload class → backend priority list
 - **Lifecycle state machine** — 9 states: Pending, Creating, Running, Paused,
   Checkpointed, RecoveryRequired, Reset, Warm, and Destroyed
+- **Guest operations** — bounded command execution and file transfer for
+  running backends that expose a guest endpoint
 - **Warm pool management** — pre-warmed instances with TTL-based GC
 - **Template registry** — in-memory template tracking with idle eviction
 - **Kernel hook registry** — state tracking for pre/post hooks
@@ -41,8 +43,12 @@ curl --unix-socket /run/blaze/api.sock http://localhost/v1/health
 # Create a sandbox
 curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/sandboxes \
   -H 'Content-Type: application/json' \
-  -d '{"workload_class":"agent-rl","image_digest":"sha256:..."}'
+  -d '{"workload_class":"agent-tool","image_digest":"sha256:..."}'
 ```
+
+The quick-start request uses an example policy with Firecracker guest transport
+disabled, so an image without the compatible guest agent does not wait for guest
+readiness. Enable the transport only for images that run that agent.
 
 ## Configuration
 
@@ -70,6 +76,18 @@ byte count:
 [api]
 max_body_bytes = 1048576
 ```
+
+Guest files are limited to 16 MiB after base64 decoding. A full-size write is
+larger on the wire because JSON and base64 add overhead, so the default 1 MiB
+request limit intentionally rejects it. Set at least 22 MiB when callers need
+the full decoded limit:
+
+```toml
+[api]
+max_body_bytes = 23068672
+```
+
+The daemon checks both the HTTP request size and the decoded file size.
 
 ### VM Resource Configuration
 
@@ -117,11 +135,17 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | POST | `/v1/sandboxes` | Create a sandbox |
 | GET | `/v1/sandboxes/{id}` | Get sandbox details |
 | DELETE | `/v1/sandboxes/{id}` | Destroy a sandbox |
+| POST | `/v1/sandboxes/{id}/exec` | Execute a guest command |
+| POST | `/v1/sandboxes/{id}/read` | Read a guest file |
+| POST | `/v1/sandboxes/{id}/write` | Replace a guest file |
 | GET | `/v1/instances` | Alias for listing sandboxes |
 | POST | `/v1/instances` | Alias for creating a sandbox |
 | GET | `/v1/instances/{id}` | Alias for sandbox details |
 | DELETE | `/v1/instances/{id}` | Alias for destroying a sandbox |
 | POST | `/v1/instances/{id}/destroy` | Compatible destroy action |
+| POST | `/v1/instances/{id}/exec` | Compatible guest command action |
+| POST | `/v1/instances/{id}/read` | Compatible guest file read action |
+| POST | `/v1/instances/{id}/write` | Compatible guest file write action |
 | POST | `/v1/instances/{id}/checkpoint` | Reserved; returns `501` until backend and storage capture is implemented |
 | POST | `/v1/instances/{id}/reset` | Reserved; returns `501` until runtime reset is implemented |
 | GET | `/v1/pools` | List warm pools |
@@ -159,6 +183,49 @@ does not run in a background retry loop. Checkpoint and reset validate that the
 sandbox is running with no active lifecycle operation, then return `501`
 without changing runtime or persisted state. Their backend and storage
 operations are not implemented here.
+
+### Guest operations
+
+Guest operations are available only while a sandbox is `Running` and its
+backend reports a guest endpoint. A cold create that reports such an endpoint
+waits for the guest agent to answer before publishing `Running`. Backends with
+guest support disabled skip that wait, and later guest-operation requests
+return HTTP 409. Warm-pool activation does not currently repeat the guest
+readiness probe.
+
+Guest operations and lifecycle changes use the same per-sandbox operation
+lock. A request may wait for an earlier lifecycle action. After it obtains the
+lock, the manager checks `Running` again; if destroy or another state change
+won the race, the guest request fails without contacting the old runtime.
+
+The endpoints accept JSON:
+
+```json
+{"cmd":"uname -a","cwd":"/","env":{"LANG":"C"},"timeout":10}
+```
+
+```json
+{"path":"/tmp/input","data_b64":"aGVsbG8="}
+```
+
+`read` takes only `path`; successful file reads and command output use standard
+base64 in the response. Exec timeouts must be from 1 through 20 seconds. Guest
+files are limited to 16 MiB after decoding, and response frames are bounded.
+
+An exec or write failure before request delivery is an ordinary transport
+failure. A bounded wait that expires before delivery uses
+`"code": "guest_timeout"`. If delivery began but the daemon cannot determine
+the result, the API returns HTTP 504 with
+`"code": "guest_outcome_unknown"`; callers must reconcile state instead of
+automatically replaying the operation. Reads do not change guest state and
+remain safe for caller-directed retry. An oversized read response returns
+HTTP 502 with `"code": "guest_response_too_large"`. For exec or write after
+delivery starts, an oversized or otherwise untrusted response instead leaves
+the outcome unknown. An oversized caller request returns HTTP 413.
+
+Each request is fully buffered. The limits bound one request, not the sum of
+concurrent requests, so callers should also bound guest-operation concurrency.
+Streaming files, interactive terminals, and session reuse are not supported.
 
 #### Health Check
 
