@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Sandbox lifecycle state machine + JSON persistence.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -150,7 +151,10 @@ impl SandboxInstance {
     /// rename via `state.json.tmp` to avoid torn reads on daemon restart.
     pub fn persist(&self, state_dir: &Path) -> Result<()> {
         self.persist_with(state_dir, |tmp_path, final_path, json| {
-            fs::write(tmp_path, json)?;
+            let mut file = File::create(tmp_path)?;
+            file.write_all(json)?;
+            file.sync_all()?;
+            drop(file);
             fs::rename(tmp_path, final_path)?;
             Ok(())
         })
@@ -160,26 +164,67 @@ impl SandboxInstance {
     where
         F: FnOnce(&Path, &Path, &[u8]) -> Result<()>,
     {
-        let dir = state_dir.join(self.id.to_string());
+        self.persist_with_directory_sync(state_dir, publish, |directory| {
+            File::open(directory)?.sync_all()?;
+            Ok(())
+        })
+    }
+
+    fn persist_with_directory_sync<F, S>(
+        &self,
+        state_dir: &Path,
+        publish: F,
+        mut sync_directory: S,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path, &Path, &[u8]) -> Result<()>,
+        S: FnMut(&Path) -> Result<()>,
+    {
+        let owner_dir = state_dir.join(self.id.to_string());
         let json = serde_json::to_vec_pretty(self)?;
         fs::create_dir_all(state_dir)?;
-        let created_owner_dir = match fs::create_dir(&dir) {
-            Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(error) => return Err(error.into()),
-        };
-        let final_path = dir.join("state.json");
-        let tmp_path = dir.join("state.json.tmp");
-        let result = publish(&tmp_path, &final_path, &json);
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp_path);
-            if created_owner_dir {
-                // Remove only an empty directory. If another owned artifact
-                // appeared, retain the directory so startup fails closed.
-                let _ = fs::remove_dir(&dir);
+
+        match fs::symlink_metadata(&owner_dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                let final_path = owner_dir.join("state.json");
+                let tmp_path = owner_dir.join("state.json.tmp");
+                let result = publish(&tmp_path, &final_path, &json);
+                if result.is_err() {
+                    let _ = fs::remove_file(&tmp_path);
+                }
+                result?;
+                sync_directory(&owner_dir)
             }
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "lifecycle owner {} is not a real directory",
+                    owner_dir.display()
+                ),
+            )
+            .into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let staging_dir =
+                    state_dir.join(format!(".state-{}-{}.tmp", self.id, Uuid::new_v4()));
+                fs::create_dir(&staging_dir)?;
+                let final_path = staging_dir.join("state.json");
+                let tmp_path = staging_dir.join("state.json.tmp");
+                if let Err(error) = publish(&tmp_path, &final_path, &json) {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err(error);
+                }
+                if let Err(error) = sync_directory(&staging_dir) {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err(error);
+                }
+                if let Err(error) = fs::rename(&staging_dir, &owner_dir) {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err(error.into());
+                }
+                sync_directory(state_dir)
+            }
+            Err(error) => Err(error.into()),
         }
-        result
     }
 
     /// Reload an instance previously persisted via [`Self::persist`].
@@ -212,6 +257,8 @@ fn is_valid_transition(from: SandboxState, to: SandboxState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn fresh() -> SandboxInstance {
@@ -315,6 +362,77 @@ mod tests {
 
         assert!(error.to_string().contains("injected publication failure"));
         assert!(!tmp.path().join(instance.id.to_string()).exists());
+        assert_eq!(
+            std::fs::read_dir(tmp.path())
+                .expect("state directory")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn first_persist_syncs_the_staged_owner_and_state_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let instance = fresh();
+        let sync_count = Cell::new(0);
+
+        instance
+            .persist_with_directory_sync(
+                tmp.path(),
+                |tmp_path, final_path, json| {
+                    std::fs::write(tmp_path, json)?;
+                    std::fs::rename(tmp_path, final_path)?;
+                    Ok(())
+                },
+                |_| {
+                    sync_count.set(sync_count.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect("publish lifecycle");
+
+        assert_eq!(sync_count.get(), 2);
+        assert_eq!(
+            SandboxInstance::load(tmp.path(), instance.id)
+                .expect("published lifecycle")
+                .id,
+            instance.id
+        );
+    }
+
+    #[test]
+    fn parent_sync_failure_preserves_the_published_owner() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let instance = fresh();
+        let sync_count = Cell::new(0);
+
+        let error = instance
+            .persist_with_directory_sync(
+                tmp.path(),
+                |tmp_path, final_path, json| {
+                    std::fs::write(tmp_path, json)?;
+                    std::fs::rename(tmp_path, final_path)?;
+                    Ok(())
+                },
+                |_| {
+                    let next = sync_count.get() + 1;
+                    sync_count.set(next);
+                    if next == 2 {
+                        Err(std::io::Error::other("injected parent sync failure").into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("parent sync result is uncertain");
+
+        assert!(error.to_string().contains("injected parent sync failure"));
+        assert_eq!(
+            SandboxInstance::load(tmp.path(), instance.id)
+                .expect("published lifecycle remains")
+                .id,
+            instance.id
+        );
     }
 
     #[test]
