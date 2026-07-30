@@ -160,6 +160,10 @@ pub trait BackendSpawner: Send + Sync {
 
     /// Clean up a backend process and resources whose in-memory handle was
     /// lost across daemon restart.
+    ///
+    /// Implementations must be safe to retry after a prior successful call.
+    /// They may update backend-specific files, but must not remove `run_dir`
+    /// because the caller retains its durable ownership journal there.
     async fn cleanup_orphan(&self, instance_id: Uuid, run_dir: &Path) -> Result<()>;
 }
 

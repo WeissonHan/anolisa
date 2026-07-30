@@ -72,7 +72,11 @@ impl ServerState {
             state_dir: state_dir.clone(),
             rootfs_size: config.storage.rootfs_size,
             mem_size: config.storage.mem_size,
-        });
+            pool_size: config.storage.pool_size,
+            prefork: config.storage.prefork,
+            default_warm_ttl: config.pool.default_warm_ttl.clone(),
+            gc_interval: config.pool.gc_interval.clone(),
+        })?;
 
         Ok(Self {
             config: Mutex::new(config),
@@ -139,6 +143,22 @@ fn scan_state_dir(state_dir: &Path) -> Result<HashMap<Uuid, SandboxInstance>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_ignores_runtime_pool_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_slot = temp
+            .path()
+            .join("runtime-pool")
+            .join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&runtime_slot).expect("runtime slot");
+        std::fs::write(runtime_slot.join("ownership.json"), b"{not-lifecycle-state")
+            .expect("ownership marker");
+
+        let instances = scan_state_dir(temp.path()).expect("scan state");
+
+        assert!(instances.is_empty());
+    }
 
     #[test]
     fn scan_rejects_corrupt_owned_state() {

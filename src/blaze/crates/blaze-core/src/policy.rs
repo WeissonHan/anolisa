@@ -184,15 +184,15 @@ impl PolicyFile {
             });
         }
 
-        // Validate [pool].warm_ttl format (e.g. "30s", "30m", "1h", "1d"; pure numbers are illegal).
+        // Validate an explicit pool TTL while allowing the daemon default to apply when omitted.
         if let Some(pool) = self.pool.as_ref()
-            && parse_duration(&pool.warm_ttl).is_none()
+            && let Some(warm_ttl) = pool.warm_ttl.as_deref()
+            && parse_duration(warm_ttl).is_none()
         {
             return Err(BlazeError::PolicyEvalError {
                 reason: format!(
                     "policy \"{policy_name}\": [pool].warm_ttl must be a duration like \"30s\", \"30m\", \"1h\", \"1d\", got \"{warm_ttl}\"",
                     policy_name = self.policy_name,
-                    warm_ttl = pool.warm_ttl
                 ),
             });
         }
@@ -297,14 +297,11 @@ pub struct PolicyPool {
     pub target: u32,
     #[serde(default)]
     pub max: u32,
-    #[serde(default = "default_warm_ttl")]
-    pub warm_ttl: String,
+    /// Optional TTL override; the daemon-wide pool default applies when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_ttl: Option<String>,
     #[serde(default)]
     pub reset_mode: ResetMode,
-}
-
-fn default_warm_ttl() -> String {
-    "30m".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -833,6 +830,31 @@ sequence = ["template-reg:bind-mm-template"]
         assert_eq!(pf.match_.workload_class, WorkloadClass::AgentRl);
         assert_eq!(pf.select.backend_priority[0], BackendKind::KataFc);
         assert!(pf.pool.as_ref().expect("pool").enabled);
+        assert_eq!(
+            pf.pool.as_ref().and_then(|pool| pool.warm_ttl.as_deref()),
+            Some("30m")
+        );
+    }
+
+    #[test]
+    fn omitted_pool_ttl_remains_unset_for_daemon_resolution() {
+        let raw = r#"
+manifest_version = 1
+policy_name = "test"
+
+[match]
+workload_class = "agent-tool"
+
+[select]
+backend_priority = ["mock"]
+
+[pool]
+enabled = true
+"#;
+        let policy: PolicyFile = toml::from_str(raw).expect("parse");
+
+        policy.validate().expect("omitted TTL is valid");
+        assert!(policy.pool.as_ref().expect("pool").warm_ttl.is_none());
     }
 
     #[test]

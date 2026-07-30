@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BlazeError, ConfigErrorSource, Result};
+use crate::policy::parse_duration;
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -168,13 +169,11 @@ pub struct StorageSection {
     #[serde(default = "default_storage_provider")]
     pub provider: String,
 
-    /// Warm pool target size (0 = no pool).
-    /// NOTE: Reserved for future use. Not yet wired into runtime.
+    /// Warm runtime target size (0 disables background construction).
     #[serde(default)]
     pub pool_size: usize,
 
-    /// Whether to pre-start VMs in pool slots.
-    /// NOTE: Reserved for future use. Not yet wired into runtime.
+    /// Whether to pre-start backends in warm runtime slots.
     #[serde(default)]
     pub prefork: bool,
 
@@ -226,16 +225,30 @@ impl DaemonConfig {
                 ),
             });
         }
-        validate_storage_paths(&self.storage.images_dir, &self.storage.instances_dir)
+        for (name, value) in [
+            ("pool.default_warm_ttl", self.pool.default_warm_ttl.as_str()),
+            ("pool.gc_interval", self.pool.gc_interval.as_str()),
+        ] {
+            if parse_duration(value).is_none() {
+                return Err(BlazeError::ConfigError {
+                    source: ConfigErrorSource::InvalidValue(format!(
+                        "{name} must be a positive duration with an s, m, h, or d suffix, got \
+                         {value:?}"
+                    )),
+                });
+            }
+        }
+        validate_runtime_storage_paths(
+            &self.daemon.state_dir.join("runtime-pool"),
+            &self.storage.images_dir,
+            &self.storage.instances_dir,
+        )
     }
 }
 
 /// Reject storage roots whose ownership domains overlap.
 pub fn validate_storage_paths(images_dir: &Path, instances_dir: &Path) -> Result<()> {
-    if images_dir == instances_dir
-        || images_dir.starts_with(instances_dir)
-        || instances_dir.starts_with(images_dir)
-    {
+    if paths_overlap(images_dir, instances_dir) {
         return Err(BlazeError::ConfigError {
             source: ConfigErrorSource::InvalidValue(format!(
                 "storage.images_dir ({}) and storage.instances_dir ({}) must be disjoint",
@@ -245,6 +258,38 @@ pub fn validate_storage_paths(images_dir: &Path, instances_dir: &Path) -> Result
         });
     }
     Ok(())
+}
+
+/// Reject runtime and storage roots whose ownership domains overlap.
+///
+/// Callers should invoke this once with configured paths and again with
+/// canonical paths after creating the roots. The second check catches aliases
+/// introduced by symbolic links.
+pub fn validate_runtime_storage_paths(
+    runtime_root: &Path,
+    images_dir: &Path,
+    instances_dir: &Path,
+) -> Result<()> {
+    validate_storage_paths(images_dir, instances_dir)?;
+    for (name, storage_root) in [
+        ("storage.images_dir", images_dir),
+        ("storage.instances_dir", instances_dir),
+    ] {
+        if paths_overlap(runtime_root, storage_root) {
+            return Err(BlazeError::ConfigError {
+                source: ConfigErrorSource::InvalidValue(format!(
+                    "runtime slot root ({}) and {name} ({}) must be disjoint",
+                    runtime_root.display(),
+                    storage_root.display()
+                )),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 // ----- defaults -----
@@ -371,6 +416,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_runtime_pool_durations() {
+        for (field, value) in [
+            ("pool.default_warm_ttl", "30"),
+            ("pool.default_warm_ttl", "0s"),
+            ("pool.gc_interval", "soon"),
+            ("pool.gc_interval", "0m"),
+        ] {
+            let mut cfg = DaemonConfig::default();
+            if field == "pool.default_warm_ttl" {
+                cfg.pool.default_warm_ttl = value.to_string();
+            } else {
+                cfg.pool.gc_interval = value.to_string();
+            }
+
+            let error = cfg.validate().expect_err("invalid pool duration");
+
+            assert!(error.to_string().contains(field));
+            assert!(error.to_string().contains(value));
+        }
+    }
+
+    #[test]
     fn rejects_equal_or_nested_storage_roots() {
         for (images, instances) in [
             ("/var/lib/blaze/data", "/var/lib/blaze/data"),
@@ -381,6 +448,51 @@ mod tests {
             cfg.storage.images_dir = PathBuf::from(images);
             cfg.storage.instances_dir = PathBuf::from(instances);
             let error = cfg.validate().expect_err("overlapping paths");
+            assert!(error.to_string().contains("must be disjoint"));
+        }
+    }
+
+    #[test]
+    fn accepts_sibling_runtime_and_storage_roots() {
+        validate_runtime_storage_paths(
+            Path::new("/var/lib/blaze/runtime-pool"),
+            Path::new("/var/lib/blaze/images"),
+            Path::new("/var/lib/blaze/instances"),
+        )
+        .expect("sibling ownership roots are disjoint");
+    }
+
+    #[test]
+    fn rejects_equal_or_nested_runtime_and_storage_roots() {
+        for (runtime, images, instances) in [
+            (
+                "/var/lib/blaze/images",
+                "/var/lib/blaze/images",
+                "/var/lib/blaze/instances",
+            ),
+            (
+                "/var/lib/blaze",
+                "/var/lib/blaze/images",
+                "/var/lib/blaze/instances",
+            ),
+            (
+                "/var/lib/blaze/images/runtime",
+                "/var/lib/blaze/images",
+                "/var/lib/blaze/instances",
+            ),
+            (
+                "/var/lib/blaze/instances/runtime",
+                "/var/lib/blaze/images",
+                "/var/lib/blaze/instances",
+            ),
+        ] {
+            let error = validate_runtime_storage_paths(
+                Path::new(runtime),
+                Path::new(images),
+                Path::new(instances),
+            )
+            .expect_err("overlapping runtime and storage roots");
+            assert!(matches!(error, BlazeError::ConfigError { .. }));
             assert!(error.to_string().contains("must be disjoint"));
         }
     }

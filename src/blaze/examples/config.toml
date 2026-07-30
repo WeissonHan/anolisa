@@ -96,25 +96,27 @@ provider = "file"
 rootfs_size = 8589934592
 mem_size = 4294967296
 
-# Number of pre-warmed storage slots to keep ready in the pool.
-# pool_size = 0           # [Reserved] Warm pool slots (not yet active)
+# Number of recoverable runtime slots to keep ready for compatible requests.
+# Zero disables background construction. Default: 0.
+pool_size = 0
 
-# Whether to prefork (pre-allocate) storage slots at daemon startup.
-# prefork = false         # [Reserved] Pre-start VMs in pool (not yet active)
+# Start each slot's backend before it becomes ready. When false, the slot owns
+# storage only and starts its backend after a request claims it. Default: false.
+prefork = false
 
 # Interval between flush-dirty sweeps.
 # flush_interval = "30s"   # [Reserved] Dirty data flush period (not yet active)
 
 # ---------------------------------------------------------------------------
-# Instance pool settings (global defaults for warm-pool recycling).
-# Per-workload pool settings are configured in each policy file.
+# Runtime slot maintenance defaults.
+# A policy-specific [pool].warm_ttl overrides the daemon-wide TTL.
 # ---------------------------------------------------------------------------
 [pool]
-# Default time-to-live for warm (idle) instances before the GC reclaims them.
+# Default time-to-live for ready runtime slots before the worker reclaims them.
 # Format: duration string (e.g. "30m", "1h", "90s").  Default: "30m".
 default_warm_ttl = "30m"
 
-# How often the garbage collector runs to reap expired warm instances.
+# How often the runtime worker checks for expired slots and missing capacity.
 # Format: duration string.  Default: "5m".
 gc_interval = "5m"
 

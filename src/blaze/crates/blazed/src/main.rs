@@ -18,6 +18,7 @@ mod file_provider;
 mod guest;
 mod metrics;
 mod request_body;
+mod runtime_pool;
 mod sandbox;
 mod spawner;
 mod state;
