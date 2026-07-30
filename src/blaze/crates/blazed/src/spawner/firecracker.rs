@@ -20,7 +20,8 @@ use uuid::Uuid;
 use super::terminate_recorded_process;
 use super::{
     BackendInstance, BackendSpawner, DynBackendInstance, SpawnFailure, SpawnResult,
-    record_backend_stopped, remove_file_if_exists, spawn_result, stopped_marker, terminate_child,
+    configure_pid_handoff, prepare_pid_handoff, record_backend_stopped, remove_file_if_exists,
+    spawn_result, stopped_marker, terminate_child,
 };
 
 /// Firecracker backend factory.
@@ -54,7 +55,6 @@ impl FirecrackerSpawner {
         let stopped_marker = stopped_marker(&request.run_dir);
         remove_if_exists(&api_socket).await?;
         remove_if_exists(&guest_socket).await?;
-        remove_if_exists(&pid_file).await?;
         remove_file_if_exists(&stopped_marker).await?;
         let fc_config = request
             .backend
@@ -67,23 +67,13 @@ impl FirecrackerSpawner {
         command.arg("--config-file").arg(config_path);
         configure_logs(&mut command, &request.run_dir, fc_config.serial_log)?;
         command.env("BLAZE_INSTANCE_ID", request.instance_id.to_string());
-        let mut child = match command.spawn() {
+        let pid_handoff = configure_pid_handoff(&mut command, &pid_file)?;
+        let child = command.spawn();
+        drop(pid_handoff);
+        let mut child = match child {
             Ok(child) => child,
             Err(source) => return Err(source.into()),
         };
-        if let Some(pid) = child.id()
-            && let Err(error) = tokio::fs::write(&pid_file, format!("{pid}\n")).await
-        {
-            let owner: DynBackendInstance = Arc::new(FirecrackerInstance::new(
-                request.instance_id,
-                child,
-                api_socket,
-                guest_socket,
-                pid_file,
-                stopped_marker,
-            ));
-            return Err(SpawnFailure::compensate_started(error.into(), owner).await);
-        }
         if let Err(error) = wait_for_socket(&api_socket, &mut child, self.socket_timeout).await {
             let owner: DynBackendInstance = Arc::new(FirecrackerInstance::new(
                 request.instance_id,
@@ -110,6 +100,11 @@ impl FirecrackerSpawner {
 
 #[async_trait]
 impl BackendSpawner for FirecrackerSpawner {
+    async fn prepare_spawn(&self, run_dir: &Path) -> Result<()> {
+        tokio::fs::create_dir_all(run_dir).await?;
+        prepare_pid_handoff(&run_dir.join("firecracker.pid"))
+    }
+
     async fn spawn(
         &self,
         request: SpawnRequest,
