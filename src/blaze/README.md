@@ -104,7 +104,7 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | POST | `/v1/instances` | Create a new sandbox instance |
 | GET | `/v1/instances/{id}` | Get instance details |
 | POST | `/v1/instances/{id}/checkpoint` | Checkpoint an instance |
-| POST | `/v1/instances/{id}/reset` | Reset instance to checkpoint |
+| POST | `/v1/instances/{id}/reset` | Reserved; returns `501` until runtime reset is implemented |
 | POST | `/v1/instances/{id}/destroy` | Destroy an instance |
 | GET | `/v1/pools` | List warm pools |
 | GET | `/v1/pools/{backend}/{class}` | Get pool status |
@@ -148,4 +148,3 @@ src/blaze/
 - Linux host with root privileges for sandbox backends
 
 ## License
-

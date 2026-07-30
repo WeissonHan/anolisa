@@ -103,7 +103,7 @@ images_dir = "/var/lib/blaze/images"
 | POST | `/v1/instances` | 创建新 sandbox 实例 |
 | GET | `/v1/instances/{id}` | 获取实例详情 |
 | POST | `/v1/instances/{id}/checkpoint` | 对实例做 checkpoint |
-| POST | `/v1/instances/{id}/reset` | 将实例重置到 checkpoint |
+| POST | `/v1/instances/{id}/reset` | 预留接口；运行时重置实现前返回 `501` |
 | POST | `/v1/instances/{id}/destroy` | 销毁实例 |
 | GET | `/v1/pools` | 列出 warm pool |
 | GET | `/v1/pools/{backend}/{class}` | 获取 pool 状态 |

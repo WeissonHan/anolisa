@@ -926,6 +926,23 @@ async fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<F
     let uuid = parse_uuid(id)?;
     let operation_lock = state.operation_lock(uuid);
     let _operation = operation_lock.lock().await;
+    let map = state
+        .instances
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?;
+    map.get(&uuid)
+        .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {uuid}")))?;
+
+    Err(BlazeDaemonError::UnsupportedOperation(format!(
+        "instance {uuid} cannot be reset until its backend can reset runtime and storage state"
+    )))
+}
+
+#[cfg(test)]
+async fn return_to_pool_for_test(state: &Arc<ServerState>, id: &str) -> Result<()> {
+    let uuid = parse_uuid(id)?;
+    let operation_lock = state.operation_lock(uuid);
+    let _operation = operation_lock.lock().await;
     let mut map = state
         .instances
         .lock()
@@ -933,9 +950,6 @@ async fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<F
     let inst = map
         .get_mut(&uuid)
         .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {uuid}")))?;
-    // TODO(v0.2): perform actual data-plane reset (full-recreate or
-    // mm-template rollback per policy reset_mode) before returning to
-    // pool. Current implementation is control-plane state only.
     inst.transition(SandboxState::Reset)?;
     inst.transition(SandboxState::Warm)?;
     inst.persist(&state.state_dir)?;
@@ -943,7 +957,6 @@ async fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<F
     // return to pool keyed on (backend, class, image_digest)
     let key = PoolKey::new(inst.backend, inst.workload_class, inst.image_digest.clone());
     let inst_id = inst.id;
-    let snapshot = inst.clone();
     drop(map);
     {
         let mut pool = state
@@ -952,8 +965,7 @@ async fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<F
             .map_err(|_| BlazeDaemonError::Internal("pool lock poisoned".into()))?;
         pool.return_to_pool(key, inst_id);
     }
-    state.metrics.inc(&state.metrics.instances_resets);
-    json_ok(&snapshot)
+    Ok(())
 }
 
 async fn destroy_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
@@ -1727,6 +1739,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_rejects_state_only_pool_return() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, true),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let request = test_request();
+        let created = created_json(&state, &request).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+
+        let error = reset_instance(&state, id)
+            .await
+            .expect_err("reset without a runtime implementation must fail closed");
+
+        assert!(matches!(error, BlazeDaemonError::UnsupportedOperation(_)));
+        assert_eq!(error.status_code(), 501);
+        assert_eq!(
+            state.instances.lock().expect("instances")[&uuid].state,
+            SandboxState::Running
+        );
+        let key = PoolKey::new(
+            BackendKind::Mock,
+            WorkloadClass::AgentTool,
+            "sha256:ownership-test".into(),
+        );
+        assert_eq!(state.pool.lock().expect("pool").stats(&key).warm_count, 0);
+        assert!(
+            state
+                .backend_instances
+                .lock()
+                .expect("owners")
+                .contains_key(&uuid)
+        );
+    }
+
+    #[tokio::test]
     async fn warm_claim_validates_runtime_and_quarantines_dead_owner() {
         let temp = tempfile::tempdir().expect("temp");
         let mut config = DaemonConfig::default();
@@ -1793,7 +1850,9 @@ mod tests {
             serde_json::from_slice(&cold.into_body().collect().await.expect("body").to_bytes())
                 .expect("cold json");
         let id = cold["instance"]["id"].as_str().expect("id").to_string();
-        reset_instance(&state, &id).await.expect("return to pool");
+        return_to_pool_for_test(&state, &id)
+            .await
+            .expect("return to pool");
 
         let warm = create_instance(&state, &request)
             .await
@@ -1804,7 +1863,7 @@ mod tests {
         assert_eq!(warm["instance"]["id"], id);
         assert_eq!(warm["start_path"], "warm");
 
-        reset_instance(&state, &id)
+        return_to_pool_for_test(&state, &id)
             .await
             .expect("return live owner");
         let owner = state
@@ -1893,7 +1952,9 @@ mod tests {
         assert_eq!(cold["instance"]["backend"], "mock");
         assert_eq!(cold["selected_backend"], "mock");
 
-        reset_instance(&state, &id).await.expect("return to pool");
+        return_to_pool_for_test(&state, &id)
+            .await
+            .expect("return to pool");
         let warm = created_json(&state, &request).await;
         assert_eq!(warm["instance"]["id"], id);
         assert_eq!(warm["instance"]["backend"], "mock");
@@ -2135,7 +2196,7 @@ mod tests {
         let request = test_request();
         let cold = created_json(&state, &request).await;
         let id = cold["instance"]["id"].as_str().expect("id").to_string();
-        reset_instance(&state, &id).await.expect("warm");
+        return_to_pool_for_test(&state, &id).await.expect("warm");
 
         storage.fail_reconstruct.store(true, Ordering::Release);
         let error = create_instance(&state, &request)
@@ -2179,7 +2240,7 @@ mod tests {
         let request = test_request();
         let cold = created_json(&state, &request).await;
         let id = cold["instance"]["id"].as_str().expect("id").to_string();
-        reset_instance(&state, &id).await.expect("warm");
+        return_to_pool_for_test(&state, &id).await.expect("warm");
         std::fs::remove_file(instances_dir.join(&id).join("mem.bin")).expect("remove artifact");
 
         let replacement = created_json(&state, &request).await;
@@ -2416,7 +2477,7 @@ mod tests {
         let request = test_request();
         let cold = created_json(&state, &request).await;
         let id = cold["instance"]["id"].as_str().expect("id").to_string();
-        reset_instance(&state, &id).await.expect("warm");
+        return_to_pool_for_test(&state, &id).await.expect("warm");
 
         let pause_hook = crate::failpoint::TestFailpoint::new(&["warm-before-state-commit"]);
         let create_state = state.clone();
