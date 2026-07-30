@@ -16,12 +16,13 @@ use blaze_core::template::TemplateRegistry;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
 
 use crate::api;
+use crate::daemon_socket::{DaemonLock, DaemonSocket};
 use crate::error::{BlazeDaemonError, Result};
 use crate::spawner::{
     BubblewrapSpawner, DynSpawner, FirecrackerSpawner, MockSpawner, SpawnerRegistry,
@@ -144,6 +145,8 @@ pub async fn run(config_path: &Path) -> Result<()> {
     tracing::info!(?config_path, "loaded daemon config");
 
     ensure_dirs(&config)?;
+    let socket_path = config.daemon.socket.clone();
+    let daemon_lock = DaemonLock::acquire(&socket_path)?;
     let policy = load_policy_engine(&config)?;
     let pool = PoolManager::new();
     let template = TemplateRegistry::new();
@@ -177,7 +180,6 @@ pub async fn run(config_path: &Path) -> Result<()> {
         Arc::new(fp)
     };
 
-    let socket_path = config.daemon.socket.clone();
     let http_addr = config.listen.http_addr.clone();
     let state = Arc::new(ServerState::build(
         config,
@@ -190,13 +192,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         storage,
     )?);
 
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = DaemonSocket::bind(daemon_lock).await?;
     tracing::info!(socket = %socket_path.display(), "blaze UDS API listening");
 
     // Optional TCP listener for remote platform API
@@ -327,7 +323,11 @@ fn load_policy_engine(cfg: &DaemonConfig) -> Result<PolicyEngine> {
     }
 }
 
-async fn serve(uds: UnixListener, tcp: Option<TcpListener>, state: Arc<ServerState>) -> Result<()> {
+async fn serve(
+    mut uds: DaemonSocket,
+    tcp: Option<TcpListener>,
+    state: Arc<ServerState>,
+) -> Result<()> {
     let mut sighup = signal(SignalKind::hangup())
         .map_err(|e| BlazeDaemonError::Internal(format!("install SIGHUP handler: {e}")))?;
     let mut sigterm = signal(SignalKind::terminate())
@@ -381,7 +381,7 @@ async fn serve(uds: UnixListener, tcp: Option<TcpListener>, state: Arc<ServerSta
         }
     }
 
-    drop(uds);
+    uds.stop_accepting();
     drop(tcp);
     let drain = connections.shutdown(SHUTDOWN_BUDGET.connection_drain);
     let cleanup = api::shutdown_instances(&state, SHUTDOWN_BUDGET.runtime_cleanup);

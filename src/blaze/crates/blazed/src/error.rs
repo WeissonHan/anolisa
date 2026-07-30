@@ -63,6 +63,29 @@ pub enum BlazeDaemonError {
     #[error("operation requires recovery: {0}")]
     RecoveryRequired(String),
 
+    #[error("another blaze daemon already owns API socket {socket}")]
+    DaemonAlreadyRunning { socket: PathBuf },
+
+    #[error("cannot access daemon lock {path}: {source}")]
+    DaemonLockIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("refusing daemon lock {path}: {reason}")]
+    InvalidDaemonLock { path: PathBuf, reason: String },
+
+    #[error("cannot prepare daemon API socket {path}: {source}")]
+    DaemonSocketIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("refusing daemon API socket {path}: {reason}")]
+    InvalidDaemonSocket { path: PathBuf, reason: String },
+
     #[error("internal error: {0}")]
     Internal(String),
 }
