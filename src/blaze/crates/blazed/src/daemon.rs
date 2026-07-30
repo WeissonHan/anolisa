@@ -77,7 +77,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         spawners,
         active_backend,
         storage,
-    ));
+    )?);
 
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;

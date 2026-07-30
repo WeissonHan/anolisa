@@ -149,14 +149,37 @@ impl SandboxInstance {
     /// Persist this instance to `{state_dir}/{id}/state.json`. Atomic
     /// rename via `state.json.tmp` to avoid torn reads on daemon restart.
     pub fn persist(&self, state_dir: &Path) -> Result<()> {
+        self.persist_with(state_dir, |tmp_path, final_path, json| {
+            fs::write(tmp_path, json)?;
+            fs::rename(tmp_path, final_path)?;
+            Ok(())
+        })
+    }
+
+    fn persist_with<F>(&self, state_dir: &Path, publish: F) -> Result<()>
+    where
+        F: FnOnce(&Path, &Path, &[u8]) -> Result<()>,
+    {
         let dir = state_dir.join(self.id.to_string());
-        fs::create_dir_all(&dir)?;
+        let json = serde_json::to_vec_pretty(self)?;
+        fs::create_dir_all(state_dir)?;
+        let created_owner_dir = match fs::create_dir(&dir) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error.into()),
+        };
         let final_path = dir.join("state.json");
         let tmp_path = dir.join("state.json.tmp");
-        let json = serde_json::to_vec_pretty(self)?;
-        fs::write(&tmp_path, &json)?;
-        fs::rename(&tmp_path, &final_path)?;
-        Ok(())
+        let result = publish(&tmp_path, &final_path, &json);
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+            if created_owner_dir {
+                // Remove only an empty directory. If another owned artifact
+                // appeared, retain the directory so startup fails closed.
+                let _ = fs::remove_dir(&dir);
+            }
+        }
+        result
     }
 
     /// Reload an instance previously persisted via [`Self::persist`].
@@ -277,5 +300,37 @@ mod tests {
         assert_eq!(loaded.id, inst.id);
         assert_eq!(loaded.state, SandboxState::Creating);
         assert_eq!(loaded.policy_name, inst.policy_name);
+    }
+
+    #[test]
+    fn failed_first_persist_removes_an_empty_owner_directory() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let instance = fresh();
+
+        let error = instance
+            .persist_with(tmp.path(), |_tmp_path, _final_path, _json| {
+                Err(std::io::Error::other("injected publication failure").into())
+            })
+            .expect_err("publication must fail");
+
+        assert!(error.to_string().contains("injected publication failure"));
+        assert!(!tmp.path().join(instance.id.to_string()).exists());
+    }
+
+    #[test]
+    fn failed_persist_preserves_a_directory_with_owned_artifacts() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let instance = fresh();
+        let owner_dir = tmp.path().join(instance.id.to_string());
+        std::fs::create_dir_all(&owner_dir).expect("owner dir");
+        std::fs::write(owner_dir.join("backend.pid"), b"owner").expect("owner marker");
+
+        instance
+            .persist_with(tmp.path(), |_tmp_path, _final_path, _json| {
+                Err(std::io::Error::other("injected publication failure").into())
+            })
+            .expect_err("publication must fail");
+
+        assert!(owner_dir.join("backend.pid").exists());
     }
 }
