@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use blaze_core::backend::BackendKind;
 use blaze_core::config::DaemonConfig;
@@ -34,7 +34,7 @@ pub struct ServerState {
     pub hook: Mutex<HookRegistry>,
     pub instances: Mutex<HashMap<Uuid, SandboxInstance>>,
     pub backend_instances: Mutex<HashMap<Uuid, DynBackendInstance>>,
-    operation_locks: Mutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>,
+    operation_locks: Mutex<HashMap<Uuid, Weak<AsyncMutex<()>>>>,
     pub spawners: SpawnerRegistry,
     /// The backend kind that `build_spawner` actually probed and selected.
     /// API handlers use this to constrain availability to the single active
@@ -61,11 +61,6 @@ impl ServerState {
     ) -> Result<Self> {
         let state_dir = config.daemon.state_dir.clone();
         let instances = scan_state_dir(&state_dir)?;
-        let operation_locks = instances
-            .keys()
-            .copied()
-            .map(|id| (id, Arc::new(AsyncMutex::new(()))))
-            .collect();
 
         Ok(Self {
             config: Mutex::new(config),
@@ -75,7 +70,7 @@ impl ServerState {
             hook: Mutex::new(hook),
             instances: Mutex::new(instances),
             backend_instances: Mutex::new(HashMap::new()),
-            operation_locks: Mutex::new(operation_locks),
+            operation_locks: Mutex::new(HashMap::new()),
             spawners,
             active_backend,
             storage,
@@ -87,15 +82,8 @@ impl ServerState {
     /// Return the async operation lock that serializes one sandbox mutation.
     pub fn operation_lock(&self, id: Uuid) -> Arc<AsyncMutex<()>> {
         match self.operation_locks.lock() {
-            Ok(mut locks) => locks
-                .entry(id)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .entry(id)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone(),
+            Ok(mut locks) => operation_lock(&mut locks, id),
+            Err(poisoned) => operation_lock(&mut poisoned.into_inner(), id),
         }
     }
 
@@ -103,6 +91,20 @@ impl ServerState {
     pub fn spawner_for(&self, kind: BackendKind) -> Option<DynSpawner> {
         self.spawners.get(kind)
     }
+}
+
+fn operation_lock(
+    locks: &mut HashMap<Uuid, Weak<AsyncMutex<()>>>,
+    id: Uuid,
+) -> Arc<AsyncMutex<()>> {
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&id).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(id, Arc::downgrade(&lock));
+    lock
 }
 
 /// Walk `{state_dir}/<uuid>/state.json` and rebuild the instance map.
@@ -190,5 +192,24 @@ mod tests {
                 if message.contains(&instance.id.to_string())
                     && message.contains(&directory_id.to_string())
         ));
+    }
+
+    #[test]
+    fn operation_locks_reuse_live_entries_and_prune_dead_ones() {
+        let mut locks = HashMap::new();
+        let id = Uuid::new_v4();
+        let first = operation_lock(&mut locks, id);
+        let second = operation_lock(&mut locks, id);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(locks.len(), 1);
+
+        drop(first);
+        drop(second);
+        for _ in 0..256 {
+            drop(operation_lock(&mut locks, Uuid::new_v4()));
+        }
+
+        assert_eq!(locks.len(), 1);
     }
 }
