@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Daemon runtime: bind UDS, accept connections, wire signal handlers.
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use blaze_core::backend::BackendKind;
 use blaze_core::config::{DaemonConfig, PolicyLoadErrorMode};
@@ -11,13 +13,13 @@ use blaze_core::policy::PolicyEngine;
 use blaze_core::pool::PoolManager;
 use blaze_core::storage::StorageProvider;
 use blaze_core::template::TemplateRegistry;
-use http_body_util::Full;
-use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, UnixListener};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
+use tokio::task::{JoinError, JoinSet};
 
 use crate::api;
 use crate::error::{BlazeDaemonError, Result};
@@ -25,6 +27,99 @@ use crate::spawner::{
     BubblewrapSpawner, DynSpawner, FirecrackerSpawner, MockSpawner, SpawnerRegistry,
 };
 use crate::state::ServerState;
+
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ConnectionSupervisor {
+    shutdown: watch::Sender<bool>,
+    tasks: JoinSet<()>,
+}
+
+impl ConnectionSupervisor {
+    fn new() -> Self {
+        let (shutdown, _) = watch::channel(false);
+        Self {
+            shutdown,
+            tasks: JoinSet::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn spawn<I>(&mut self, io: TokioIo<I>, state: Arc<ServerState>)
+    where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let shutdown = self.shutdown.subscribe();
+        self.spawn_task(serve_connection(io, state, shutdown));
+    }
+
+    fn spawn_task<F>(&mut self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.tasks.spawn(task);
+    }
+
+    async fn join_next(&mut self) -> Option<std::result::Result<(), JoinError>> {
+        self.tasks.join_next().await
+    }
+
+    async fn shutdown(mut self, grace: Duration) -> Result<()> {
+        self.shutdown.send_replace(true);
+        let mut task_failed = false;
+        let completed = tokio::time::timeout(grace, async {
+            while let Some(result) = self.tasks.join_next().await {
+                task_failed |= report_connection_result(result);
+            }
+        })
+        .await;
+
+        if completed.is_err() {
+            let remaining = self.tasks.len();
+            tracing::warn!(
+                remaining,
+                timeout_secs = grace.as_secs(),
+                "connection drain timed out; aborting remaining tasks"
+            );
+            self.tasks.abort_all();
+            while let Some(result) = self.tasks.join_next().await {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    report_connection_result(Err(error));
+                }
+            }
+            return Err(BlazeDaemonError::Internal(format!(
+                "connection drain timed out after {} seconds; aborted {remaining} task(s)",
+                grace.as_secs()
+            )));
+        }
+
+        if task_failed {
+            return Err(BlazeDaemonError::Internal(
+                "one or more connection tasks failed during shutdown".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn report_connection_result(result: std::result::Result<(), JoinError>) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(error) if error.is_cancelled() => {
+            tracing::debug!("connection task cancelled");
+            false
+        }
+        Err(error) => {
+            tracing::error!(%error, "connection task failed");
+            true
+        }
+    }
+}
 
 /// Boot the daemon: load config + policies, prepare state directories,
 /// bind the API socket, and run the accept loop until SIGTERM/SIGINT.
@@ -223,9 +318,15 @@ async fn serve(uds: UnixListener, tcp: Option<TcpListener>, state: Arc<ServerSta
         .map_err(|e| BlazeDaemonError::Internal(format!("install SIGTERM handler: {e}")))?;
     let mut sigint = signal(SignalKind::interrupt())
         .map_err(|e| BlazeDaemonError::Internal(format!("install SIGINT handler: {e}")))?;
+    let mut connections = ConnectionSupervisor::new();
 
     loop {
         tokio::select! {
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(completed) = completed {
+                    report_connection_result(completed);
+                }
+            }
             res = uds.accept() => {
                 let (stream, _peer) = match res {
                     Ok(s) => s,
@@ -234,7 +335,7 @@ async fn serve(uds: UnixListener, tcp: Option<TcpListener>, state: Arc<ServerSta
                         continue;
                     }
                 };
-                spawn_conn(TokioIo::new(stream), state.clone());
+                connections.spawn(TokioIo::new(stream), state.clone());
             }
             res = async { match &tcp { Some(l) => l.accept().await, None => std::future::pending().await }}, if tcp.is_some() => {
                 let (stream, peer) = match res {
@@ -245,7 +346,7 @@ async fn serve(uds: UnixListener, tcp: Option<TcpListener>, state: Arc<ServerSta
                     }
                 };
                 tracing::debug!(?peer, "TCP connection");
-                spawn_conn(TokioIo::new(stream), state.clone());
+                connections.spawn(TokioIo::new(stream), state.clone());
             }
             _ = sighup.recv() => {
                 tracing::info!("SIGHUP received: reloading policies");
@@ -264,24 +365,48 @@ async fn serve(uds: UnixListener, tcp: Option<TcpListener>, state: Arc<ServerSta
         }
     }
 
+    drop(uds);
+    drop(tcp);
+    let drain_result = connections.shutdown(CONNECTION_DRAIN_TIMEOUT).await;
     tracing::info!("blaze daemon stopped");
-    Ok(())
+    drain_result
 }
 
-fn spawn_conn<I>(io: TokioIo<I>, state: Arc<ServerState>)
-where
+async fn serve_connection<I>(
+    io: TokioIo<I>,
+    state: Arc<ServerState>,
+    mut shutdown: watch::Receiver<bool>,
+) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
-        let svc = service_fn(move |req| {
-            let state = state.clone();
-            async move { api::handle(req, state).await }
-        });
-        if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
-            tracing::debug!(?err, "connection closed with error");
-        }
-        let _: Option<Full<Bytes>> = None;
+    let svc = service_fn(move |req| {
+        let state = state.clone();
+        async move { api::handle(req, state).await }
     });
+    let connection = http1::Builder::new().serve_connection(io, svc);
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        result = &mut connection => result,
+        _ = wait_for_shutdown(&mut shutdown) => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
+    };
+    if let Err(error) = result {
+        tracing::debug!(%error, "connection closed with error");
+    }
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        let stopping = *shutdown.borrow_and_update();
+        if stopping {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 fn reload_policies(state: &Arc<ServerState>) -> Result<()> {
@@ -303,4 +428,105 @@ fn reload_policies(state: &Arc<ServerState>) -> Result<()> {
     }
     tracing::info!(policies = count, "policy engine reloaded via SIGHUP");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    struct ActiveTask(Arc<AtomicBool>);
+
+    impl Drop for ActiveTask {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_inflight_connection_task() {
+        let mut connections = ConnectionSupervisor::new();
+        let mut shutdown = connections.shutdown.subscribe();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        connections.spawn_task(async move {
+            entered_tx.send(()).expect("signal task entry");
+            shutdown
+                .wait_for(|stopping| *stopping)
+                .await
+                .expect("shutdown sender");
+            release_rx.await.expect("release task");
+        });
+        entered_rx.await.expect("task entered");
+
+        let drain = tokio::spawn(connections.shutdown(Duration::from_secs(1)));
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished(), "drain returned before task completed");
+
+        release_tx.send(()).expect("release connection task");
+        drain
+            .await
+            .expect("drain task")
+            .expect("graceful connection drain");
+    }
+
+    #[tokio::test]
+    async fn shutdown_notifies_idle_connection_task() {
+        let mut connections = ConnectionSupervisor::new();
+        let mut shutdown = connections.shutdown.subscribe();
+        connections.spawn_task(async move {
+            shutdown
+                .wait_for(|stopping| *stopping)
+                .await
+                .expect("shutdown sender");
+        });
+
+        connections
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("idle task drained");
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_aborts_and_joins_stuck_task() {
+        let mut connections = ConnectionSupervisor::new();
+        let active = Arc::new(AtomicBool::new(true));
+        let task_active = active.clone();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        connections.spawn_task(async move {
+            let _active = ActiveTask(task_active);
+            entered_tx.send(()).expect("signal task entry");
+            future::pending::<()>().await;
+        });
+        entered_rx.await.expect("task entered");
+
+        let error = connections
+            .shutdown(Duration::from_millis(10))
+            .await
+            .expect_err("stuck task must time out");
+
+        assert!(error.to_string().contains("connection drain timed out"));
+        assert!(
+            !active.load(Ordering::Acquire),
+            "aborted task was not joined"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_tasks_are_reaped_while_serving() {
+        let mut connections = ConnectionSupervisor::new();
+        connections.spawn_task(async {});
+
+        let completed = connections
+            .join_next()
+            .await
+            .expect("one tracked connection");
+        assert!(!report_connection_result(completed));
+        assert!(connections.is_empty());
+    }
 }
