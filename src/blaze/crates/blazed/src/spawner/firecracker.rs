@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use blaze_core::backend::{
-    BackendKind, SnapshotKind, SnapshotRequest, SnapshotResult, SpawnRequest,
+    BackendKind, RestoreCapability, RestoreRequest, SnapshotKind, SnapshotRequest, SnapshotResult,
+    SpawnRequest,
 };
 use blaze_core::policy::{FirecrackerConfig, VmConfig, parse_memory_value, to_mib_ceil};
 use blaze_core::{BlazeError, Result};
@@ -26,7 +27,7 @@ use uuid::Uuid;
 #[cfg(target_os = "linux")]
 use super::terminate_recorded_process;
 use super::{
-    BackendInstance, BackendSpawner, DynBackendInstance, SpawnFailure, SpawnResult,
+    BackendInstance, BackendSpawner, DynBackendInstance, RestoreResult, SpawnFailure, SpawnResult,
     configure_pid_handoff, prepare_pid_handoff, record_backend_stopped, remove_file_if_exists,
     spawn_result, stopped_marker, terminate_child,
 };
@@ -66,15 +67,25 @@ impl FirecrackerSpawner {
     async fn start(
         &self,
         request: SpawnRequest,
+        restore: Option<FirecrackerRestore>,
     ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
         validate_regular_file(&request.binary_path, "firecracker binary")?;
         validate_regular_file(&request.storage.rootfs_path, "rootfs")?;
-        validate_regular_file(&self.images_dir.join("vmlinux"), "vmlinux")?;
-        tokio::fs::create_dir_all(&request.run_dir).await?;
+        match &restore {
+            Some(restore) => {
+                validate_regular_file(&restore.snapshot_path, "VM-state snapshot")?;
+                validate_regular_file(&restore.mem_path, "memory snapshot")?;
+            }
+            None => validate_regular_file(&self.images_dir.join("vmlinux"), "vmlinux")?,
+        }
         let api_socket = request.run_dir.join("api.sock");
         let capture = self
             .capture_for(&request.binary_path, api_socket.clone())
             .await?;
+        if let Some(restore) = &restore {
+            validate_restore_compatibility(restore, &capture.backend_version)?;
+        }
+        tokio::fs::create_dir_all(&request.run_dir).await?;
         let guest_socket = request.run_dir.join("vsock.uds");
         let pid_file = request.run_dir.join("firecracker.pid");
         let stopped_marker = stopped_marker(&request.run_dir);
@@ -87,9 +98,15 @@ impl FirecrackerSpawner {
             .as_ref()
             .cloned()
             .unwrap_or_default();
+        let expose_guest_socket = restore.as_ref().map_or(fc_config.enable_vsock, |restore| {
+            restore.expose_guest_socket
+        });
         let mut command = build_launch_command(&request.binary_path, &api_socket);
-        let config_path = write_vm_config(&self.images_dir, &request, &fc_config, &guest_socket)?;
-        command.arg("--config-file").arg(config_path);
+        if restore.is_none() {
+            let config_path =
+                write_vm_config(&self.images_dir, &request, &fc_config, &guest_socket)?;
+            command.arg("--config-file").arg(config_path);
+        }
         configure_logs(&mut command, &request.run_dir, fc_config.serial_log)?;
         command.env("BLAZE_INSTANCE_ID", request.instance_id.to_string());
         let pid_handoff = configure_pid_handoff(&mut command, &pid_file)?;
@@ -105,23 +122,29 @@ impl FirecrackerSpawner {
                 child,
                 capture,
                 guest_socket,
-                fc_config.enable_vsock,
+                expose_guest_socket,
                 pid_file,
                 stopped_marker,
             ));
             return Err(SpawnFailure::compensate_started(error, owner).await);
         }
 
-        let instance = FirecrackerInstance::new(
+        let instance = Arc::new(FirecrackerInstance::new(
             request.instance_id,
             child,
             capture,
             guest_socket,
-            fc_config.enable_vsock,
+            expose_guest_socket,
             pid_file,
             stopped_marker,
-        );
-        Ok(Arc::new(instance))
+        ));
+        if let Some(restore) = restore
+            && let Err(error) = instance.load_snapshot(&restore).await
+        {
+            let owner: DynBackendInstance = instance;
+            return Err(SpawnFailure::compensate_started(error, owner).await);
+        }
+        Ok(instance)
     }
 }
 
@@ -136,7 +159,53 @@ impl BackendSpawner for FirecrackerSpawner {
         &self,
         request: SpawnRequest,
     ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
-        self.start(request).await
+        self.start(request, None).await
+    }
+
+    async fn restore_capability(&self, binary_path: &Path) -> Result<Option<RestoreCapability>> {
+        validate_regular_file(binary_path, "firecracker binary")?;
+        Ok(Some(RestoreCapability {
+            backend: BackendKind::Firecracker,
+            version: Some(read_backend_version(binary_path).await?),
+            snapshot_kind: SnapshotKind::Full,
+        }))
+    }
+
+    async fn restore(&self, request: RestoreRequest) -> RestoreResult {
+        let RestoreRequest {
+            instance_id,
+            run_dir,
+            binary_path,
+            storage,
+            snapshot_path,
+            mem_path,
+            checkpoint_backend,
+            expected_version,
+            snapshot_kind,
+            expose_guest_socket,
+        } = request;
+        self.start(
+            SpawnRequest {
+                instance_id,
+                run_dir,
+                binary_path,
+                storage,
+                // Snapshot restore does not reconstruct the original policy.
+                // Keep host-side logging disabled unless a future restore
+                // contract models that setting explicitly.
+                backend: blaze_core::policy::BackendConfigs::default(),
+                vm: None,
+            },
+            Some(FirecrackerRestore {
+                snapshot_path,
+                mem_path,
+                backend: checkpoint_backend,
+                expected_version,
+                snapshot_kind,
+                expose_guest_socket,
+            }),
+        )
+        .await
     }
 
     async fn probe(&self, binary_path: &Path) -> Result<bool> {
@@ -186,6 +255,10 @@ impl FirecrackerInstance {
             stopped_marker,
             killed: AtomicBool::new(false),
         }
+    }
+
+    async fn load_snapshot(&self, restore: &FirecrackerRestore) -> Result<()> {
+        self.capture.api.load_snapshot(restore).await
     }
 }
 
@@ -313,6 +386,16 @@ struct FirecrackerCapture {
     backend_version: String,
 }
 
+#[derive(Debug)]
+struct FirecrackerRestore {
+    snapshot_path: PathBuf,
+    mem_path: PathBuf,
+    backend: BackendKind,
+    expected_version: Option<String>,
+    snapshot_kind: SnapshotKind,
+    expose_guest_socket: bool,
+}
+
 impl FirecrackerCapture {
     fn new(api_socket: PathBuf, api_timeout: Duration, backend_version: String) -> Self {
         Self {
@@ -331,6 +414,23 @@ struct FirecrackerApiClient {
 impl FirecrackerApiClient {
     fn new(socket: PathBuf, timeout: Duration) -> Self {
         Self { socket, timeout }
+    }
+
+    async fn load_snapshot(&self, restore: &FirecrackerRestore) -> Result<()> {
+        self.call_json(
+            Method::PUT,
+            "/snapshot/load",
+            Some(serde_json::json!({
+                "snapshot_path": path_string(&restore.snapshot_path, "VM-state snapshot")?,
+                "mem_backend": {
+                    "backend_type": "File",
+                    "backend_path": path_string(&restore.mem_path, "memory snapshot")?
+                },
+                "resume_vm": true
+            })),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn call_json(
@@ -409,6 +509,41 @@ impl FirecrackerApiClient {
                 ),
             })?
     }
+}
+
+fn validate_restore_compatibility(
+    restore: &FirecrackerRestore,
+    actual_version: &str,
+) -> Result<()> {
+    if restore.backend != BackendKind::Firecracker {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "Firecracker cannot restore a {} checkpoint",
+                restore.backend
+            ),
+        });
+    }
+    if restore.snapshot_kind != SnapshotKind::Full {
+        return Err(BlazeError::BackendError {
+            msg: "Firecracker restore accepts only full checkpoints".to_string(),
+        });
+    }
+    let expected_version =
+        restore
+            .expected_version
+            .as_deref()
+            .ok_or_else(|| BlazeError::BackendError {
+                msg: "Firecracker restore requires a checkpoint backend version".to_string(),
+            })?;
+    if expected_version != actual_version {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "Firecracker checkpoint version {expected_version:?} does not match \
+                 executable version {actual_version:?}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl FirecrackerInstance {
@@ -734,6 +869,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use tokio::sync::oneshot;
 
+    #[cfg(target_os = "linux")]
+    use crate::spawner::SpawnerRegistry;
+
     use super::*;
 
     #[test]
@@ -751,6 +889,41 @@ mod tests {
     fn version_parser_rejects_missing_or_ambiguous_version() {
         assert!(parse_backend_version(b"Firecracker exiting successfully\n").is_err());
         assert!(parse_backend_version(b"Firecracker v1.15.0\nFirecracker v1.16.0\n").is_err());
+    }
+
+    #[test]
+    fn restore_compatibility_requires_the_matching_firecracker_version() {
+        let mut restore = FirecrackerRestore {
+            snapshot_path: PathBuf::from("vmstate.snap"),
+            mem_path: PathBuf::from("memory.snap"),
+            backend: BackendKind::Firecracker,
+            expected_version: Some("Firecracker v1.16.0".to_string()),
+            snapshot_kind: SnapshotKind::Full,
+            expose_guest_socket: false,
+        };
+
+        validate_restore_compatibility(&restore, "Firecracker v1.16.0").expect("matching version");
+        assert!(
+            validate_restore_compatibility(&restore, "Firecracker v1.17.0")
+                .expect_err("mismatched version")
+                .to_string()
+                .contains("does not match executable version")
+        );
+        restore.expected_version = None;
+        assert!(
+            validate_restore_compatibility(&restore, "Firecracker v1.16.0")
+                .expect_err("missing version")
+                .to_string()
+                .contains("requires a checkpoint backend version")
+        );
+        restore.expected_version = Some("Firecracker v1.16.0".to_string());
+        restore.backend = BackendKind::Mock;
+        assert!(
+            validate_restore_compatibility(&restore, "Firecracker v1.16.0")
+                .expect_err("wrong backend")
+                .to_string()
+                .contains("cannot restore a mock checkpoint")
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -888,6 +1061,276 @@ mod tests {
 
         write_version_binary(&invalid, "Firecracker v1.17.0");
         assert!(spawner.probe(&invalid).await.expect("replaced probe"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn registry_restore_capability_reads_each_requested_binary() {
+        let temp = tempfile::tempdir().expect("temp");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        write_version_binary(&first, "Firecracker v1.15.0");
+        write_version_binary(&second, "Firecracker v1.16.0");
+        let mut registry = SpawnerRegistry::new();
+        registry.insert(
+            BackendKind::Firecracker,
+            Arc::new(FirecrackerSpawner::new(temp.path().join("images"))),
+        );
+        let adapter = registry
+            .get(BackendKind::Firecracker)
+            .expect("registered Firecracker adapter");
+
+        let first_capability = adapter
+            .restore_capability(&first)
+            .await
+            .expect("first capability")
+            .expect("restore supported");
+        let second_capability = adapter
+            .restore_capability(&second)
+            .await
+            .expect("second capability")
+            .expect("restore supported");
+        assert_eq!(first_capability.backend, BackendKind::Firecracker);
+        assert_eq!(
+            first_capability.version.as_deref(),
+            Some("Firecracker v1.15.0")
+        );
+        assert_eq!(first_capability.snapshot_kind, SnapshotKind::Full);
+        assert_eq!(
+            second_capability.version.as_deref(),
+            Some("Firecracker v1.16.0")
+        );
+
+        write_version_binary(&first, "Firecracker v1.17.0");
+        let replaced_capability = adapter
+            .restore_capability(&first)
+            .await
+            .expect("replaced capability")
+            .expect("restore supported");
+        assert_eq!(
+            replaced_capability.version.as_deref(),
+            Some("Firecracker v1.17.0")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restore_rejects_a_binary_version_change_before_start() {
+        let temp = tempfile::tempdir().expect("temp");
+        let spawn = spawn_request(temp.path());
+        let run_dir = spawn.run_dir.clone();
+        std::fs::remove_dir_all(&run_dir).expect("remove fixture run dir");
+        write_version_binary(&spawn.binary_path, "Firecracker v1.17.0");
+        std::fs::create_dir_all(spawn.storage.rootfs_path.parent().expect("rootfs parent"))
+            .expect("slot");
+        std::fs::write(&spawn.storage.rootfs_path, b"rootfs").expect("rootfs");
+        let snapshot_path = temp.path().join("vmstate.snap");
+        let mem_path = temp.path().join("memory.snap");
+        std::fs::write(&snapshot_path, b"vmstate").expect("VM state");
+        std::fs::write(&mem_path, b"memory").expect("memory");
+        let spawner = FirecrackerSpawner::new(temp.path().join("images"));
+
+        let failure = match spawner
+            .restore(RestoreRequest {
+                instance_id: spawn.instance_id,
+                run_dir: spawn.run_dir,
+                binary_path: spawn.binary_path,
+                storage: spawn.storage,
+                snapshot_path,
+                mem_path,
+                checkpoint_backend: BackendKind::Firecracker,
+                expected_version: Some("Firecracker v1.16.0".to_string()),
+                snapshot_kind: SnapshotKind::Full,
+                expose_guest_socket: false,
+            })
+            .await
+        {
+            Ok(_) => panic!("version change must fail before process start"),
+            Err(failure) => failure,
+        };
+        let (source, owner) = failure.into_parts();
+
+        assert!(
+            source
+                .to_string()
+                .contains("does not match executable version")
+        );
+        assert!(owner.is_none());
+        assert!(!run_dir.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn instance_loads_a_full_snapshot_with_a_minimal_payload() {
+        let temp = tempfile::tempdir().expect("temp");
+        let api_socket = temp.path().join("api.sock");
+        let observed = spawn_api(&api_socket, 1).await;
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let instance = FirecrackerInstance::new(
+            Uuid::new_v4(),
+            child,
+            FirecrackerCapture::new(
+                api_socket,
+                Duration::from_secs(1),
+                "Firecracker v1.16.0".to_string(),
+            ),
+            PathBuf::new(),
+            false,
+            temp.path().join("firecracker.pid"),
+            stopped_marker(temp.path()),
+        );
+        let snapshot_path = temp.path().join("vmstate.snap");
+        let mem_path = temp.path().join("memory.snap");
+
+        instance
+            .load_snapshot(&FirecrackerRestore {
+                snapshot_path: snapshot_path.clone(),
+                mem_path: mem_path.clone(),
+                backend: BackendKind::Firecracker,
+                expected_version: Some("Firecracker v1.16.0".to_string()),
+                snapshot_kind: SnapshotKind::Full,
+                expose_guest_socket: false,
+            })
+            .await
+            .expect("load snapshot");
+
+        let calls = observed.await.expect("observed call");
+        assert_eq!(
+            calls,
+            vec![(
+                Method::PUT,
+                "/snapshot/load".to_string(),
+                serde_json::json!({
+                    "snapshot_path": snapshot_path,
+                    "mem_backend": {
+                        "backend_type": "File",
+                        "backend_path": mem_path,
+                    },
+                    "resume_vm": true,
+                }),
+            )]
+        );
+        instance.kill().await.expect("kill");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restored_owner_exposes_the_guest_socket_when_requested() {
+        let temp = tempfile::tempdir().expect("temp");
+        let api_socket = temp.path().join("api.sock");
+        let observed = spawn_api(&api_socket, 1).await;
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let guest_socket = temp.path().join("vsock.uds");
+        let instance = FirecrackerInstance::new(
+            Uuid::new_v4(),
+            child,
+            FirecrackerCapture::new(
+                api_socket,
+                Duration::from_secs(1),
+                "Firecracker v1.16.0".to_string(),
+            ),
+            guest_socket.clone(),
+            true,
+            temp.path().join("firecracker.pid"),
+            stopped_marker(temp.path()),
+        );
+        let snapshot_path = temp.path().join("vmstate.snap");
+        let mem_path = temp.path().join("memory.snap");
+
+        assert_eq!(instance.guest_socket_path(), guest_socket);
+        instance
+            .load_snapshot(&FirecrackerRestore {
+                snapshot_path: snapshot_path.clone(),
+                mem_path: mem_path.clone(),
+                backend: BackendKind::Firecracker,
+                expected_version: Some("Firecracker v1.16.0".to_string()),
+                snapshot_kind: SnapshotKind::Full,
+                expose_guest_socket: true,
+            })
+            .await
+            .expect("load snapshot");
+
+        let calls = observed.await.expect("observed call");
+        assert_eq!(
+            calls,
+            vec![(
+                Method::PUT,
+                "/snapshot/load".to_string(),
+                serde_json::json!({
+                    "snapshot_path": snapshot_path,
+                    "mem_backend": {
+                        "backend_type": "File",
+                        "backend_path": mem_path,
+                    },
+                    "resume_vm": true,
+                }),
+            )]
+        );
+        instance.kill().await.expect("kill");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_snapshot_load_retains_an_owner_when_cleanup_is_incomplete() {
+        let temp = tempfile::tempdir().expect("temp");
+        let api_socket = temp.path().join("api.sock");
+        let server = spawn_api_response(
+            &api_socket,
+            hyper::StatusCode::BAD_REQUEST,
+            b"incompatible snapshot".to_vec(),
+            Duration::ZERO,
+        );
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let guest_socket = temp.path().join("guest.sock");
+        std::fs::create_dir(&guest_socket).expect("cleanup blocker");
+        let instance_id = Uuid::new_v4();
+        let instance = Arc::new(FirecrackerInstance::new(
+            instance_id,
+            child,
+            FirecrackerCapture::new(
+                api_socket,
+                Duration::from_secs(1),
+                "Firecracker v1.16.0".to_string(),
+            ),
+            guest_socket.clone(),
+            true,
+            temp.path().join("firecracker.pid"),
+            stopped_marker(temp.path()),
+        ));
+        let restore = FirecrackerRestore {
+            snapshot_path: temp.path().join("vmstate.snap"),
+            mem_path: temp.path().join("memory.snap"),
+            backend: BackendKind::Firecracker,
+            expected_version: Some("Firecracker v1.16.0".to_string()),
+            snapshot_kind: SnapshotKind::Full,
+            expose_guest_socket: true,
+        };
+
+        let load_error = instance
+            .load_snapshot(&restore)
+            .await
+            .expect_err("snapshot load must fail");
+        server.await.expect("server");
+        let owner: DynBackendInstance = instance;
+        let failure = SpawnFailure::compensate_started(load_error, owner).await;
+        let (source, retained) = failure.into_parts();
+
+        assert!(source.to_string().contains("cleanup failed"));
+        let retained = retained.expect("incomplete cleanup must retain ownership");
+        assert_eq!(retained.instance_id(), instance_id);
+        assert_eq!(retained.version(), Some("Firecracker v1.16.0"));
+
+        std::fs::remove_dir(&guest_socket).expect("remove cleanup blocker");
+        retained.kill().await.expect("retry cleanup");
     }
 
     #[cfg(target_os = "linux")]

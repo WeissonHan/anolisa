@@ -58,6 +58,19 @@ pub enum CheckpointStoreError {
 /// Convenient result type for checkpoint catalog operations.
 pub type Result<T> = std::result::Result<T, CheckpointStoreError>;
 
+/// Verified checkpoint metadata and provider-safe artifact paths.
+#[derive(Debug)]
+pub struct VerifiedCheckpoint {
+    /// Validated checkpoint manifest.
+    pub metadata: CheckpointMetadata,
+    /// Full backend-state snapshot.
+    pub snapshot_path: PathBuf,
+    /// Full guest-memory snapshot.
+    pub memory_path: PathBuf,
+    /// Self-contained root filesystem snapshot.
+    pub rootfs_path: PathBuf,
+}
+
 /// Temporary checkpoint directory populated before atomic publication.
 #[derive(Debug)]
 pub struct CheckpointStage {
@@ -229,6 +242,25 @@ impl CheckpointStore {
             }
         }
         Ok(metadata)
+    }
+
+    /// Verify a restore target, its complete ancestry, and its artifact paths.
+    pub fn verify_restore_target(
+        &self,
+        sandbox_id: Uuid,
+        checkpoint_id: &str,
+    ) -> Result<VerifiedCheckpoint> {
+        let metadata = self.verify(sandbox_id, checkpoint_id)?;
+        if let Some(parent) = metadata.parent.as_deref() {
+            self.validated_chain_from(sandbox_id, parent)?;
+        }
+        let directory = self.committed_dir(sandbox_id, checkpoint_id)?;
+        Ok(VerifiedCheckpoint {
+            snapshot_path: require_contained_file(&directory, "vmstate.snap")?,
+            memory_path: require_contained_file(&directory, "memory.snap")?,
+            rootfs_path: require_contained_file(&directory, "rootfs.snap")?,
+            metadata,
+        })
     }
 
     /// List committed checkpoints and mark the lineage reachable from HEAD.

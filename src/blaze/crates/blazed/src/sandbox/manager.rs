@@ -22,7 +22,7 @@ use crate::checkpoint_store::CheckpointStore;
 use crate::error::{BlazeDaemonError, Result};
 use crate::guest::{GuestClient, GuestExecResult, MAX_GUEST_FILE_BYTES};
 use crate::metrics::Metrics;
-use crate::spawner::{DynBackendInstance, SpawnerRegistry};
+use crate::spawner::{DynBackendInstance, DynSpawner, SpawnerRegistry};
 
 const INSTANCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -193,6 +193,21 @@ impl SandboxManager {
         match self.backend_instances.lock() {
             Ok(instances) => instances.get(&id).cloned(),
             Err(poisoned) => poisoned.into_inner().get(&id).cloned(),
+        }
+    }
+
+    pub(super) fn spawner(&self, backend: BackendKind) -> Option<DynSpawner> {
+        self.spawners.get(backend)
+    }
+
+    pub(super) fn runtime_dir(&self, id: Uuid) -> PathBuf {
+        self.state_dir.join(id.to_string())
+    }
+
+    pub(super) fn remove_backend_owner(&self, id: Uuid) -> Option<DynBackendInstance> {
+        match self.backend_instances.lock() {
+            Ok(mut instances) => instances.remove(&id),
+            Err(poisoned) => poisoned.into_inner().remove(&id),
         }
     }
 
@@ -1247,7 +1262,7 @@ impl SandboxManager {
         }
     }
 
-    fn retain_backend(&self, id: Uuid, backend: DynBackendInstance) -> Option<String> {
+    pub(super) fn retain_backend(&self, id: Uuid, backend: DynBackendInstance) -> Option<String> {
         match self.backend_instances.lock() {
             Ok(mut instances) => {
                 instances.insert(id, backend);

@@ -14,7 +14,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use blaze_core::backend::{BackendKind, SnapshotRequest, SnapshotResult, SpawnRequest};
+use blaze_core::backend::{
+    BackendKind, RestoreCapability, RestoreRequest, SnapshotRequest, SnapshotResult, SpawnRequest,
+};
 use blaze_core::guest_protocol::DEFAULT_MAX_RESPONSE_BYTES;
 use blaze_core::{BlazeError, Result};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -98,6 +100,9 @@ pub trait BackendInstance: Send + Sync {
 /// Shared backend instance handle stored in the daemon runtime map.
 pub type DynBackendInstance = Arc<dyn BackendInstance>;
 
+/// Restore outcome that preserves ownership when cleanup cannot be confirmed.
+pub type RestoreResult = std::result::Result<DynBackendInstance, SpawnFailure>;
+
 /// Backend start failure that may retain ownership of a started process.
 pub struct SpawnFailure {
     source: BlazeError,
@@ -177,7 +182,7 @@ impl From<std::io::Error> for SpawnFailure {
 /// Factory for owned backend runtime instances.
 #[async_trait]
 pub trait BackendSpawner: Send + Sync {
-    /// Persist backend-specific pre-spawn ownership metadata.
+    /// Persist backend-specific ownership metadata before spawn or restore.
     async fn prepare_spawn(&self, _run_dir: &Path) -> Result<()> {
         Ok(())
     }
@@ -187,6 +192,26 @@ pub trait BackendSpawner: Send + Sync {
         &self,
         request: SpawnRequest,
     ) -> std::result::Result<DynBackendInstance, SpawnFailure>;
+
+    /// Report the restore identity of the requested backend executable.
+    ///
+    /// `None` means restore is unsupported. Implementations that return a
+    /// version must inspect `binary_path` for every call rather than reusing
+    /// mutable process-wide state.
+    async fn restore_capability(&self, _binary_path: &Path) -> Result<Option<RestoreCapability>> {
+        Ok(None)
+    }
+
+    /// Start an owned backend from committed checkpoint artifacts.
+    ///
+    /// Callers prepare the PID handoff through [`Self::prepare_spawn`] first.
+    /// Failures transfer any owner whose cleanup could not be confirmed.
+    async fn restore(&self, request: RestoreRequest) -> RestoreResult {
+        let _ = request;
+        Err(SpawnFailure::clean(BlazeError::BackendError {
+            msg: "checkpoint restore is not supported by this backend".to_string(),
+        }))
+    }
 
     /// Probe whether the configured backend executable is usable.
     async fn probe(&self, binary_path: &Path) -> Result<bool>;
@@ -369,6 +394,75 @@ impl BackendSpawner for MockSpawner {
             .map_err(SpawnFailure::from)
     }
 
+    async fn restore_capability(&self, _binary_path: &Path) -> Result<Option<RestoreCapability>> {
+        Ok(Some(RestoreCapability {
+            backend: BackendKind::Mock,
+            version: Some("mock-v1".to_string()),
+            snapshot_kind: blaze_core::backend::SnapshotKind::Full,
+        }))
+    }
+
+    async fn restore(&self, request: RestoreRequest) -> RestoreResult {
+        let RestoreRequest {
+            instance_id,
+            run_dir,
+            snapshot_path,
+            mem_path,
+            checkpoint_backend,
+            expected_version,
+            snapshot_kind,
+            expose_guest_socket,
+            ..
+        } = request;
+        if checkpoint_backend != BackendKind::Mock
+            || expected_version.as_deref() != Some("mock-v1")
+            || snapshot_kind != blaze_core::backend::SnapshotKind::Full
+        {
+            return Err(SpawnFailure::clean(BlazeError::BackendError {
+                msg: "mock checkpoint identity is incompatible with the restore adapter"
+                    .to_string(),
+            }));
+        }
+        let vmstate: serde_json::Value = match tokio::fs::read(&snapshot_path)
+            .await
+            .map_err(BlazeError::from)
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| BlazeError::BackendError {
+                    msg: format!("decode mock VM state: {error}"),
+                })
+            }) {
+            Ok(vmstate) => vmstate,
+            Err(error) => return Err(SpawnFailure::clean(error)),
+        };
+        if vmstate.get("format").and_then(serde_json::Value::as_str) != Some("blaze-mock-v1")
+            || vmstate
+                .get("instance_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(instance_id.to_string().as_str())
+            || vmstate.get("kind").and_then(serde_json::Value::as_str) != Some("full")
+        {
+            return Err(SpawnFailure::clean(BlazeError::BackendError {
+                msg: "mock VM state does not match the requested sandbox".to_string(),
+            }));
+        }
+        let files = match tokio::fs::read(&mem_path)
+            .await
+            .map_err(BlazeError::from)
+            .and_then(|bytes| {
+                serde_json::from_slice::<HashMap<String, Vec<u8>>>(&bytes).map_err(|error| {
+                    BlazeError::BackendError {
+                        msg: format!("decode mock guest memory: {error}"),
+                    }
+                })
+            }) {
+            Ok(files) => files,
+            Err(error) => return Err(SpawnFailure::clean(error)),
+        };
+        spawn_mock_instance_with_files(instance_id, run_dir, files, expose_guest_socket)
+            .await
+            .map_err(SpawnFailure::from)
+    }
+
     async fn probe(&self, _binary_path: &Path) -> Result<bool> {
         Ok(true)
     }
@@ -389,37 +483,54 @@ struct MockInstance {
 }
 
 async fn spawn_mock_instance(instance_id: Uuid, run_dir: PathBuf) -> Result<DynBackendInstance> {
+    spawn_mock_instance_with_files(instance_id, run_dir, HashMap::new(), true).await
+}
+
+async fn spawn_mock_instance_with_files(
+    instance_id: Uuid,
+    run_dir: PathBuf,
+    restored_files: HashMap<String, Vec<u8>>,
+    expose_guest_socket: bool,
+) -> Result<DynBackendInstance> {
     tokio::fs::create_dir_all(&run_dir).await?;
     let socket = run_dir.join("vsock.uds");
     if socket.exists() {
         tokio::fs::remove_file(&socket).await?;
     }
-    let listener = UnixListener::bind(&socket)?;
     let cancellation = CancellationToken::new();
     let task_token = cancellation.clone();
-    let files = Arc::new(Mutex::new(HashMap::new()));
+    let files = Arc::new(Mutex::new(restored_files));
     let task_files = files.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = task_token.cancelled() => break,
-                accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else {
-                        break;
-                    };
-                    let files = task_files.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = serve_mock_guest(stream, files).await {
-                            tracing::debug!(%error, "mock guest connection ended");
-                        }
-                    });
+    let (guest_socket_path, task) = if expose_guest_socket {
+        let listener = UnixListener::bind(&socket)?;
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = task_token.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else {
+                            break;
+                        };
+                        let files = task_files.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = serve_mock_guest(stream, files).await {
+                                tracing::debug!(%error, "mock guest connection ended");
+                            }
+                        });
+                    }
                 }
             }
-        }
-    });
+        });
+        (socket, task)
+    } else {
+        let task = tokio::spawn(async move {
+            task_token.cancelled().await;
+        });
+        (PathBuf::new(), task)
+    };
     Ok(Arc::new(MockInstance {
         instance_id,
-        guest_socket_path: socket,
+        guest_socket_path,
         cancellation,
         task: Mutex::new(Some(task)),
         files,
@@ -1024,7 +1135,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::time::Duration;
 
-    use blaze_core::backend::{SnapshotKind, SnapshotRequest, SpawnRequest};
+    use blaze_core::backend::{RestoreRequest, SnapshotKind, SnapshotRequest, SpawnRequest};
     use blaze_core::policy::BackendConfigs;
     use blaze_core::storage::StorageSlot;
 
@@ -1133,6 +1244,39 @@ mod tests {
         assert!(instance.pause().await.is_err());
         assert!(instance.resume().await.is_err());
         assert!(instance.snapshot(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restore_defaults_fail_closed_without_an_owner() {
+        let temp = tempfile::tempdir().expect("temp");
+        let spawn = request(temp.path());
+        let restore = RestoreRequest {
+            instance_id: spawn.instance_id,
+            run_dir: spawn.run_dir,
+            binary_path: spawn.binary_path,
+            storage: spawn.storage,
+            snapshot_path: temp.path().join("vmstate.snap"),
+            mem_path: temp.path().join("memory.snap"),
+            checkpoint_backend: BackendKind::Bubblewrap,
+            expected_version: None,
+            snapshot_kind: SnapshotKind::Full,
+            expose_guest_socket: true,
+        };
+
+        assert!(
+            BubblewrapSpawner
+                .restore_capability(Path::new(""))
+                .await
+                .expect("capability")
+                .is_none()
+        );
+        let failure = match BubblewrapSpawner.restore(restore).await {
+            Ok(_) => panic!("restore must remain unsupported"),
+            Err(failure) => failure,
+        };
+        let (source, owner) = failure.into_parts();
+        assert!(source.to_string().contains("restore is not supported"));
+        assert!(owner.is_none());
     }
 
     #[tokio::test]

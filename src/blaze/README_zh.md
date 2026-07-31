@@ -136,6 +136,7 @@ images_dir = "/var/lib/blaze/images"
 | POST | `/v1/sandboxes/{id}/write` | 替换 guest 文件 |
 | POST | `/v1/sandboxes/{id}/checkpoint` | 后端和存储 provider 支持时捕获完整 checkpoint |
 | GET | `/v1/sandboxes/{id}/checkpoints` | 列出已提交的 checkpoint 及其 HEAD 可达性 |
+| POST | `/v1/sandboxes/{id}/rollback/{checkpoint_id}` | 用经过校验的 checkpoint 替换正在运行的 sandbox |
 | GET | `/v1/instances` | 列出 sandbox 的兼容入口 |
 | POST | `/v1/instances` | 创建 sandbox 的兼容入口 |
 | GET | `/v1/instances/{id}` | 获取 sandbox 详情的兼容入口 |
@@ -146,6 +147,7 @@ images_dir = "/var/lib/blaze/images"
 | POST | `/v1/instances/{id}/write` | Guest 文件写入兼容入口 |
 | POST | `/v1/instances/{id}/checkpoint` | 捕获完整 checkpoint 的兼容入口 |
 | GET | `/v1/instances/{id}/checkpoints` | 列出 checkpoint 的兼容入口 |
+| POST | `/v1/instances/{id}/rollback/{checkpoint_id}` | 恢复 checkpoint 的兼容入口 |
 | POST | `/v1/instances/{id}/reset` | 预留接口；运行时重置实现前返回 `501` |
 | GET | `/v1/pools` | 列出 warm pool |
 | GET | `/v1/pools/{backend}/{class}` | 获取 pool 状态 |
@@ -196,6 +198,19 @@ stage。如果发布或 HEAD 的结果无法确定，或者后端无法恢复，
 `RecoveryRequired`；runtime ownership 和已经提交的 checkpoint 数据仍会
 保留，供后续显式清理。列出 checkpoint 与捕获、guest 操作及销毁共用同一个
 sandbox 操作锁。销毁会删除事务临时文件，但保留已经提交的 checkpoint 历史。
+
+只有当前存储 provider 和 checkpoint 对应的后端都实现恢复，并且当前后端版本
+与捕获时记录的版本完全一致，daemon 才会开始恢复。修改 runtime 之前，daemon
+会先校验所选 checkpoint、完整父链和全部 artifact hash。
+
+file provider 会在旧后端仍然运行时准备一份独立的 rootfs。旧后端停止后，
+daemon 才选择这份 rootfs，启动并持有新的后端，随后把 HEAD 指向所选
+checkpoint，最后释放旧 rootfs。旧后端停止前发生失败时，原 runtime 会继续
+运行；停止后发生任何无法确认的失败时，daemon 会保留实际存在的资源，并把
+sandbox 标记为 `RecoveryRequired`，后续 destroy 仍能找到并清理这些资源。
+
+`last_checkpoint` 始终表示最近一次成功捕获。恢复只移动 catalog HEAD，不会
+改写捕获历史。
 
 runtime reset 仍是预留接口，会返回 `501`，且不会修改 runtime 或持久化状态。
 

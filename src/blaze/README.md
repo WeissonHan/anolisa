@@ -140,6 +140,7 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | POST | `/v1/sandboxes/{id}/write` | Replace a guest file |
 | POST | `/v1/sandboxes/{id}/checkpoint` | Capture a full checkpoint when the backend and storage provider support it |
 | GET | `/v1/sandboxes/{id}/checkpoints` | List committed checkpoints and HEAD reachability |
+| POST | `/v1/sandboxes/{id}/rollback/{checkpoint_id}` | Replace a running sandbox from a verified checkpoint |
 | GET | `/v1/instances` | Alias for listing sandboxes |
 | POST | `/v1/instances` | Alias for creating a sandbox |
 | GET | `/v1/instances/{id}` | Alias for sandbox details |
@@ -150,6 +151,7 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | POST | `/v1/instances/{id}/write` | Compatible guest file write action |
 | POST | `/v1/instances/{id}/checkpoint` | Compatible full-checkpoint action |
 | GET | `/v1/instances/{id}/checkpoints` | Compatible checkpoint-list action |
+| POST | `/v1/instances/{id}/rollback/{checkpoint_id}` | Compatible checkpoint-restore action |
 | POST | `/v1/instances/{id}/reset` | Reserved; returns `501` until runtime reset is implemented |
 | GET | `/v1/pools` | List warm pools |
 | GET | `/v1/pools/{backend}/{class}` | Get pool status |
@@ -209,6 +211,23 @@ uncertain outcome, or the backend cannot resume, the sandbox becomes
 remain available for explicit cleanup. Listing uses the same per-sandbox
 operation lock as capture, guest operations, and destroy. Destroy removes
 transaction scratch but preserves committed checkpoint history.
+
+Checkpoint restore is available only when the current storage provider and the
+checkpoint's backend implement restore, and the current backend version exactly
+matches the version recorded at capture. The daemon verifies the selected
+checkpoint, its parent chain, and all artifact hashes before changing runtime
+state.
+
+The file provider stages a separate rootfs copy while the current backend is
+still running. After the old backend stops, the daemon selects that copy,
+starts and owns the replacement backend, moves HEAD to the selected checkpoint,
+and only then releases the previous rootfs. A failure before backend shutdown
+keeps the original runtime running. A failure after shutdown retains the
+resources that actually exist and marks the sandbox `RecoveryRequired`, so a
+later destroy can finish cleanup without losing process ownership.
+
+`last_checkpoint` continues to mean the most recent completed capture. Restore
+moves catalog HEAD but does not rewrite capture history.
 
 Runtime reset remains reserved and returns `501` without changing runtime or
 persisted state.
