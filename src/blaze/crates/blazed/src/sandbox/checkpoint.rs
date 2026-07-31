@@ -57,6 +57,8 @@ impl SandboxManager {
         }
         self.require_live_backend(id, &backend).await?;
         let storage = self.storage.reconstruct(&id.to_string()).await?;
+        let expose_guest_socket = !backend.guest_socket_path().as_os_str().is_empty();
+        let network_slot = backend.network_slot();
 
         let stage = self.checkpoints.begin(id).map_err(checkpoint_store_error)?;
         let checkpoint_id = stage.id().to_string();
@@ -190,6 +192,8 @@ impl SandboxManager {
                     backend: instance.backend,
                     backend_version,
                     snapshot_kind: SnapshotKind::Full,
+                    expose_guest_socket,
+                    network_slot,
                 },
             )
             .map_err(checkpoint_store_error);

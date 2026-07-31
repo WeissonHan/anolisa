@@ -50,6 +50,7 @@ struct HibernateManifest {
     backend_version: Option<String>,
     snapshot_kind: SnapshotKind,
     expose_guest_socket: bool,
+    network_slot: Option<usize>,
     artifacts: Vec<CheckpointArtifact>,
 }
 
@@ -111,6 +112,7 @@ impl SandboxManager {
             }
             let storage = self.storage.reconstruct(&id.to_string()).await?;
             let expose_guest_socket = !backend.guest_socket_path().as_os_str().is_empty();
+            let network_slot = backend.network_slot();
             let hibernate_dir = self.hibernate_dir(id);
             if let Err(error) = prepare_hibernate_directory(&hibernate_dir).await {
                 let recovery = self.mark_instance_recovery(instance).err();
@@ -229,6 +231,7 @@ impl SandboxManager {
                 &instance,
                 capability.version,
                 expose_guest_socket,
+                network_slot,
             )
             .await
             {
@@ -477,6 +480,7 @@ impl SandboxManager {
                             expected_version: manifest.backend_version.clone(),
                             snapshot_kind: manifest.snapshot_kind,
                             expose_guest_socket: manifest.expose_guest_socket,
+                            network_slot: manifest.network_slot,
                         })
                         .await
                 }
@@ -787,6 +791,7 @@ async fn build_hibernate_manifest(
     instance: &SandboxInstance,
     backend_version: Option<String>,
     expose_guest_socket: bool,
+    network_slot: Option<usize>,
 ) -> Result<HibernateManifest> {
     let mut artifacts = Vec::with_capacity(REQUIRED_ARTIFACTS.len());
     for name in REQUIRED_ARTIFACTS {
@@ -801,6 +806,7 @@ async fn build_hibernate_manifest(
         backend_version,
         snapshot_kind: SnapshotKind::Full,
         expose_guest_socket,
+        network_slot,
         artifacts,
     })
 }
@@ -1012,5 +1018,45 @@ fn with_recovery_error(
             "{error}; recovery state persistence failed: {recovery}"
         )),
         None => error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_core::backend::BackendKind;
+    use blaze_core::lifecycle::StartPath;
+    use blaze_core::policy::WorkloadClass;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn manifest_preserves_the_network_slot_for_resume() {
+        let temp = tempfile::tempdir().expect("temp");
+        tokio::fs::write(temp.path().join(VMSTATE_ARTIFACT), b"vmstate")
+            .await
+            .expect("VM state");
+        tokio::fs::write(temp.path().join(MEMORY_ARTIFACT), b"memory")
+            .await
+            .expect("memory");
+        let instance = SandboxInstance::new(
+            BackendKind::Firecracker,
+            WorkloadClass::AgentTool,
+            "sha256:image".to_string(),
+            StartPath::Cold,
+            "default".to_string(),
+        );
+
+        let manifest = build_hibernate_manifest(
+            temp.path(),
+            &instance,
+            Some("Firecracker v1.16.0".to_string()),
+            true,
+            Some(7),
+        )
+        .await
+        .expect("manifest");
+
+        assert!(manifest.expose_guest_socket);
+        assert_eq!(manifest.network_slot, Some(7));
     }
 }

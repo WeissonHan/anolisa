@@ -120,8 +120,6 @@ impl SandboxManager {
             )));
         }
         let storage = self.storage.reconstruct(&id.to_string()).await?;
-        let expose_guest_socket = !current_backend.guest_socket_path().as_os_str().is_empty();
-
         instance.begin_restore_operation(request.checkpoint_id.clone())?;
         crate::failpoint::state("restore-begin-state")
             .and_then(|_| self.persist_and_retain(instance.clone()))?;
@@ -263,7 +261,8 @@ impl SandboxManager {
                         checkpoint_backend: target.metadata.backend,
                         expected_version: target.metadata.backend_version.clone(),
                         snapshot_kind: target.metadata.snapshot_kind,
-                        expose_guest_socket,
+                        expose_guest_socket: target.metadata.expose_guest_socket,
+                        network_slot: target.metadata.network_slot,
                     })
                     .await
             }
@@ -322,7 +321,7 @@ impl SandboxManager {
             ));
         }
         if let Err(error) = self
-            .verify_restored_backend(id, &restored, expose_guest_socket)
+            .verify_restored_backend(id, &restored, target.metadata.expose_guest_socket)
             .await
         {
             return Err(self.fail_after_restore_stop(

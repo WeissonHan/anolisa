@@ -55,6 +55,10 @@ pub struct CheckpointMetadata {
     pub created_at: DateTime<Utc>,
     /// Backend snapshot semantics.
     pub snapshot_kind: SnapshotKind,
+    /// Whether the captured runtime exposed the stable guest transport.
+    pub expose_guest_socket: bool,
+    /// Stable host-network slot whose device names are embedded in the snapshot.
+    pub network_slot: Option<usize>,
     /// Integrity records for all required artifacts.
     pub artifacts: Vec<CheckpointArtifact>,
 }
@@ -91,6 +95,10 @@ pub struct CommitCheckpoint {
     pub backend_version: Option<String>,
     /// Backend snapshot semantics.
     pub snapshot_kind: SnapshotKind,
+    /// Whether the captured runtime exposed the stable guest transport.
+    pub expose_guest_socket: bool,
+    /// Stable host-network slot whose device names are embedded in the snapshot.
+    pub network_slot: Option<usize>,
 }
 
 /// Pure validation failure for a checkpoint identifier or manifest.
@@ -371,6 +379,8 @@ mod tests {
             backend_version: Some("mock-v1".to_string()),
             created_at: Utc::now(),
             snapshot_kind: SnapshotKind::Full,
+            expose_guest_socket: true,
+            network_slot: None,
             artifacts: vec![
                 artifact("vmstate.snap", 'a'),
                 artifact("memory.snap", 'b'),
@@ -447,6 +457,8 @@ mod tests {
             backend: BackendKind::Mock,
             backend_version: None,
             snapshot_kind: SnapshotKind::Full,
+            expose_guest_socket: false,
+            network_slot: None,
         };
         assert!(validate_commit_checkpoint(&id, &input).is_err());
     }
@@ -473,6 +485,8 @@ mod tests {
             backend: metadata.backend,
             backend_version: metadata.backend_version,
             snapshot_kind: metadata.snapshot_kind,
+            expose_guest_socket: metadata.expose_guest_socket,
+            network_slot: metadata.network_slot,
         };
         let error = validate_commit_checkpoint(&metadata.id, &input)
             .expect_err("missing version must fail");

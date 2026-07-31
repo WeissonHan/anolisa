@@ -152,13 +152,23 @@ impl FirecrackerSpawner {
                 }
                 .into());
             }
-            match self
-                .network
-                .create(request.instance_id, |slot| {
-                    write_network_metadata(&network_file, slot)
-                })
-                .await
-            {
+            let created = match restore.as_ref().and_then(|restore| restore.network_slot) {
+                Some(slot) => {
+                    self.network
+                        .create_at(request.instance_id, slot, |slot| {
+                            write_network_metadata(&network_file, slot)
+                        })
+                        .await
+                }
+                None => {
+                    self.network
+                        .create(request.instance_id, |slot| {
+                            write_network_metadata(&network_file, slot)
+                        })
+                        .await
+                }
+            };
+            match created {
                 Ok(network) => Some(network),
                 Err(error) => {
                     let (source, residual) = error.into_parts();
@@ -457,17 +467,24 @@ impl BackendSpawner for FirecrackerSpawner {
             expected_version,
             snapshot_kind,
             expose_guest_socket,
+            network_slot,
         } = request;
+        let backend = blaze_core::policy::BackendConfigs {
+            firecracker: Some(blaze_core::policy::FirecrackerConfig {
+                enable_vsock: expose_guest_socket,
+                enable_network: network_slot.is_some(),
+                ..blaze_core::policy::FirecrackerConfig::default()
+            }),
+        };
         self.start(
             SpawnRequest {
                 instance_id,
                 run_dir,
                 binary_path,
                 storage,
-                // Snapshot restore does not reconstruct the original policy.
-                // Keep host-side logging disabled unless a future restore
-                // contract models that setting explicitly.
-                backend: blaze_core::policy::BackendConfigs::default(),
+                // Snapshot restore only reconstructs host-side resources that
+                // are required to make the captured runtime reachable.
+                backend,
                 vm: None,
             },
             Some(FirecrackerRestore {
@@ -477,6 +494,7 @@ impl BackendSpawner for FirecrackerSpawner {
                 expected_version,
                 snapshot_kind,
                 expose_guest_socket,
+                network_slot,
             }),
         )
         .await
@@ -511,6 +529,7 @@ struct FirecrackerInstance {
     files: FirecrackerRuntimeFiles,
     guest_socket: PathBuf,
     network: Mutex<Option<NetworkSlot>>,
+    network_slot: Option<usize>,
     network_manager: Arc<NetworkManager>,
     cleanup_complete: AtomicBool,
     killed: AtomicBool,
@@ -551,6 +570,7 @@ impl FirecrackerInstance {
         enable_vsock: bool,
     ) -> Self {
         let guest_socket = configured_guest_socket(enable_vsock, files.guest_socket.clone());
+        let network_slot = network.as_ref().map(NetworkSlot::slot);
         Self {
             instance_id,
             child: Mutex::new(child),
@@ -559,6 +579,7 @@ impl FirecrackerInstance {
             files,
             guest_socket,
             network: Mutex::new(network),
+            network_slot,
             network_manager,
             cleanup_complete: AtomicBool::new(false),
             killed: AtomicBool::new(false),
@@ -590,6 +611,10 @@ impl BackendInstance for FirecrackerInstance {
 
     fn guest_socket_path(&self) -> &Path {
         &self.guest_socket
+    }
+
+    fn network_slot(&self) -> Option<usize> {
+        self.network_slot
     }
 
     async fn try_wait(&self) -> Result<Option<SpawnResult>> {
@@ -708,6 +733,7 @@ struct FirecrackerRestore {
     expected_version: Option<String>,
     snapshot_kind: SnapshotKind,
     expose_guest_socket: bool,
+    network_slot: Option<usize>,
 }
 
 impl FirecrackerCapture {
@@ -1384,6 +1410,7 @@ mod tests {
             expected_version: Some("Firecracker v1.16.0".to_string()),
             snapshot_kind: SnapshotKind::Full,
             expose_guest_socket: false,
+            network_slot: None,
         };
 
         validate_restore_compatibility(&restore, "Firecracker v1.16.0").expect("matching version");
@@ -1408,6 +1435,33 @@ mod tests {
                 .to_string()
                 .contains("cannot restore a mock checkpoint")
         );
+    }
+
+    #[test]
+    fn instance_preserves_its_network_slot_for_restore() {
+        let temp = tempfile::tempdir().expect("temp");
+        let api_socket = temp.path().join("api.sock");
+        let instance = FirecrackerInstance::new(
+            Uuid::new_v4(),
+            None,
+            FirecrackerCapture::new(
+                api_socket.clone(),
+                Duration::from_secs(1),
+                "Firecracker v1.16.0".to_string(),
+            ),
+            runtime_files(
+                api_socket,
+                temp.path().join("vsock.uds"),
+                temp.path().join("firecracker.pid"),
+                stopped_marker(temp.path()),
+                temp.path().join("network.json"),
+            ),
+            Some(test_network_slot(7)),
+            Arc::new(NetworkManager::default()),
+            false,
+        );
+
+        assert_eq!(instance.network_slot(), Some(7));
     }
 
     #[cfg(target_os = "linux")]
@@ -1626,6 +1680,7 @@ mod tests {
                 expected_version: Some("Firecracker v1.16.0".to_string()),
                 snapshot_kind: SnapshotKind::Full,
                 expose_guest_socket: false,
+                network_slot: None,
             })
             .await
         {
@@ -1683,6 +1738,7 @@ mod tests {
                 expected_version: Some("Firecracker v1.16.0".to_string()),
                 snapshot_kind: SnapshotKind::Full,
                 expose_guest_socket: false,
+                network_slot: None,
             })
             .await
             .expect("load snapshot");
@@ -1748,6 +1804,7 @@ mod tests {
                 expected_version: Some("Firecracker v1.16.0".to_string()),
                 snapshot_kind: SnapshotKind::Full,
                 expose_guest_socket: true,
+                network_slot: None,
             })
             .await
             .expect("load snapshot");
@@ -1815,6 +1872,7 @@ mod tests {
             expected_version: Some("Firecracker v1.16.0".to_string()),
             snapshot_kind: SnapshotKind::Full,
             expose_guest_socket: true,
+            network_slot: None,
         };
 
         let load_error = instance

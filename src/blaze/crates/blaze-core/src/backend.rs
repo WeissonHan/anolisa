@@ -135,6 +135,8 @@ pub struct RestoreRequest {
     pub snapshot_kind: SnapshotKind,
     /// Whether the captured runtime exposed the stable run-directory guest transport.
     pub expose_guest_socket: bool,
+    /// Stable host-network slot whose device names are embedded in the snapshot.
+    pub network_slot: Option<usize>,
 }
 
 /// Snapshot flavor requested from a backend.

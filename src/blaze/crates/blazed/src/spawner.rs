@@ -70,6 +70,10 @@ pub trait BackendInstance: Send + Sync {
     fn guest_socket_path(&self) -> &Path {
         Path::new("")
     }
+    /// Stable host-network slot required to reproduce snapshot device names.
+    fn network_slot(&self) -> Option<usize> {
+        None
+    }
     /// Report an observed backend exit without waiting.
     ///
     /// `None` means the owned process or task was running when checked.
@@ -417,6 +421,7 @@ impl BackendSpawner for MockSpawner {
             expected_version,
             snapshot_kind,
             expose_guest_socket,
+            network_slot: _,
             ..
         } = request;
         if checkpoint_backend != BackendKind::Mock
@@ -1266,6 +1271,7 @@ mod tests {
             expected_version: None,
             snapshot_kind: SnapshotKind::Full,
             expose_guest_socket: true,
+            network_slot: None,
         };
 
         assert!(

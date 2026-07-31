@@ -243,6 +243,32 @@ impl NetworkManager {
     pub(super) async fn create<F>(
         &self,
         owner: Uuid,
+        record: F,
+    ) -> std::result::Result<NetworkSlot, NetworkCreateError>
+    where
+        F: FnMut(&NetworkSlot) -> Result<()>,
+    {
+        self.create_with_slot(owner, None, record).await
+    }
+
+    /// Recreate the exact slot whose device names are embedded in a snapshot.
+    pub(super) async fn create_at<F>(
+        &self,
+        owner: Uuid,
+        slot: usize,
+        record: F,
+    ) -> std::result::Result<NetworkSlot, NetworkCreateError>
+    where
+        F: FnMut(&NetworkSlot) -> Result<()>,
+    {
+        NetworkSlot::from_record(slot, owner)?;
+        self.create_with_slot(owner, Some(slot), record).await
+    }
+
+    async fn create_with_slot<F>(
+        &self,
+        owner: Uuid,
+        requested_slot: Option<usize>,
         mut record: F,
     ) -> std::result::Result<NetworkSlot, NetworkCreateError>
     where
@@ -251,7 +277,10 @@ impl NetworkManager {
         let _host_guard = self.acquire_host_guard().await?;
         let mut blocked = self.existing_slots().await?;
         let (slot, network) = loop {
-            let slot = self.allocate(&blocked)?;
+            let slot = match requested_slot {
+                Some(slot) => self.reserve(slot, &blocked)?,
+                None => self.allocate(&blocked)?,
+            };
             let network = network_slot(slot, owner);
             let add_namespace = vec!["netns".into(), "add".into(), network.netns.clone()];
             match self.run_ip(&add_namespace).await {
@@ -265,6 +294,13 @@ impl NetworkManager {
                     self.release(slot);
                     let refreshed = self.existing_slots().await?;
                     if refreshed.contains(&slot) {
+                        if requested_slot.is_some() {
+                            return Err(NetworkCreateError::clean(BlazeError::BackendError {
+                                msg: format!(
+                                    "required network slot {slot} is unavailable during restore"
+                                ),
+                            }));
+                        }
                         blocked.extend(refreshed);
                         continue;
                     }
@@ -420,6 +456,29 @@ impl NetworkManager {
         Err(BlazeError::BackendError {
             msg: format!("network slots exhausted (max {NET_MAX_SLOT})"),
         })
+    }
+
+    fn reserve(&self, slot: usize, blocked: &HashSet<usize>) -> Result<usize> {
+        if slot >= NET_MAX_SLOT {
+            return Err(BlazeError::BackendError {
+                msg: format!("network slot {slot} is outside 0..{NET_MAX_SLOT}"),
+            });
+        }
+        if blocked.contains(&slot) {
+            return Err(BlazeError::BackendError {
+                msg: format!("required network slot {slot} is unavailable during restore"),
+            });
+        }
+        let mut state = self.state.lock().map_err(|_| BlazeError::BackendError {
+            msg: "network slot allocator lock poisoned".to_string(),
+        })?;
+        if !state.used.insert(slot) {
+            return Err(BlazeError::BackendError {
+                msg: format!("required network slot {slot} is already reserved"),
+            });
+        }
+        state.next = (slot + 1) % NET_MAX_SLOT;
+        Ok(slot)
     }
 
     async fn existing_slots(&self) -> Result<HashSet<usize>> {
@@ -812,6 +871,46 @@ mod tests {
             !calls
                 .iter()
                 .any(|args| args == &["netns", "del", "blz-ns-0"])
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_recreates_the_requested_network_slot() {
+        let runner = Arc::new(FakeIpRunner::default());
+        let manager = NetworkManager::with_runner(runner.clone());
+        manager.state.lock().expect("state lock").next = 11;
+
+        let slot = manager
+            .create_at(Uuid::from_u128(1), 7, |_| Ok(()))
+            .await
+            .expect("restore slot");
+
+        assert_eq!(slot.slot(), 7);
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|args| args == &["netns", "add", test_network_slot(7).netns()])
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_an_occupied_network_slot() {
+        let namespace = format!("{}\n", test_network_slot(7).netns());
+        let runner = Arc::new(FakeIpRunner::with_responses([success(
+            namespace.as_bytes(),
+        )]));
+        let manager = NetworkManager::with_runner(runner.clone());
+
+        let error = manager
+            .create_at(Uuid::from_u128(1), 7, |_| Ok(()))
+            .await
+            .expect_err("occupied restore slot");
+
+        assert!(error.to_string().contains("slot 7 is unavailable"));
+        assert_eq!(
+            runner.calls(),
+            vec![vec!["netns".to_string(), "list".to_string()]]
         );
     }
 

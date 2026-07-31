@@ -153,6 +153,8 @@ impl CheckpointStore {
             backend_version: input.backend_version,
             created_at: Utc::now(),
             snapshot_kind: input.snapshot_kind,
+            expose_guest_socket: input.expose_guest_socket,
+            network_slot: input.network_slot,
             artifacts,
         };
         validate_checkpoint_manifest(&metadata, stage.sandbox_id, &stage.id)?;
@@ -971,6 +973,8 @@ mod tests {
             backend: BackendKind::Mock,
             backend_version: Some("mock-v1".to_string()),
             snapshot_kind: SnapshotKind::Full,
+            expose_guest_socket: true,
+            network_slot: None,
         }
     }
 
