@@ -8,9 +8,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use blaze_core::backend::{BackendKind, SpawnRequest};
+use blaze_core::backend::{
+    BackendKind, SnapshotKind, SnapshotRequest, SnapshotResult, SpawnRequest,
+};
 use blaze_core::policy::{FirecrackerConfig, VmConfig, parse_memory_value, to_mib_ceil};
 use blaze_core::{BlazeError, Result};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::client::conn::http1;
+use hyper::{Method, Request};
+use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -24,11 +31,13 @@ use super::{
     spawn_result, stopped_marker, terminate_child,
 };
 
+const MAX_API_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Firecracker backend factory.
 pub struct FirecrackerSpawner {
     images_dir: PathBuf,
+    api_timeout: Duration,
     socket_timeout: Duration,
-    version: Mutex<Option<String>>,
 }
 
 impl FirecrackerSpawner {
@@ -36,9 +45,22 @@ impl FirecrackerSpawner {
     pub fn new(images_dir: PathBuf) -> Self {
         Self {
             images_dir,
+            api_timeout: Duration::from_secs(30),
             socket_timeout: Duration::from_secs(5),
-            version: Mutex::new(None),
         }
+    }
+
+    async fn capture_for(
+        &self,
+        binary_path: &Path,
+        api_socket: PathBuf,
+    ) -> Result<FirecrackerCapture> {
+        let backend_version = read_backend_version(binary_path).await?;
+        Ok(FirecrackerCapture::new(
+            api_socket,
+            self.api_timeout,
+            backend_version,
+        ))
     }
 
     async fn start(
@@ -50,6 +72,9 @@ impl FirecrackerSpawner {
         validate_regular_file(&self.images_dir.join("vmlinux"), "vmlinux")?;
         tokio::fs::create_dir_all(&request.run_dir).await?;
         let api_socket = request.run_dir.join("api.sock");
+        let capture = self
+            .capture_for(&request.binary_path, api_socket.clone())
+            .await?;
         let guest_socket = request.run_dir.join("vsock.uds");
         let pid_file = request.run_dir.join("firecracker.pid");
         let stopped_marker = stopped_marker(&request.run_dir);
@@ -78,7 +103,7 @@ impl FirecrackerSpawner {
             let owner: DynBackendInstance = Arc::new(FirecrackerInstance::new(
                 request.instance_id,
                 child,
-                api_socket,
+                capture,
                 guest_socket,
                 fc_config.enable_vsock,
                 pid_file,
@@ -90,7 +115,7 @@ impl FirecrackerSpawner {
         let instance = FirecrackerInstance::new(
             request.instance_id,
             child,
-            api_socket,
+            capture,
             guest_socket,
             fc_config.enable_vsock,
             pid_file,
@@ -119,10 +144,7 @@ impl BackendSpawner for FirecrackerSpawner {
             return Ok(false);
         }
         match read_backend_version(binary_path).await {
-            Ok(version) => {
-                *self.version.lock().await = Some(version);
-                Ok(true)
-            }
+            Ok(_) => Ok(true),
             Err(error) => {
                 tracing::debug!(%error, binary = %binary_path.display(), "firecracker version probe failed");
                 Ok(false)
@@ -138,7 +160,7 @@ impl BackendSpawner for FirecrackerSpawner {
 struct FirecrackerInstance {
     instance_id: Uuid,
     child: Mutex<Option<Child>>,
-    api_socket: PathBuf,
+    capture: FirecrackerCapture,
     guest_socket: PathBuf,
     pid_file: PathBuf,
     stopped_marker: PathBuf,
@@ -149,7 +171,7 @@ impl FirecrackerInstance {
     fn new(
         instance_id: Uuid,
         child: Child,
-        api_socket: PathBuf,
+        capture: FirecrackerCapture,
         guest_socket: PathBuf,
         enable_vsock: bool,
         pid_file: PathBuf,
@@ -158,7 +180,7 @@ impl FirecrackerInstance {
         Self {
             instance_id,
             child: Mutex::new(Some(child)),
-            api_socket,
+            capture,
             guest_socket: configured_guest_socket(enable_vsock, guest_socket),
             pid_file,
             stopped_marker,
@@ -169,8 +191,20 @@ impl FirecrackerInstance {
 
 #[async_trait]
 impl BackendInstance for FirecrackerInstance {
+    fn instance_id(&self) -> Uuid {
+        self.instance_id
+    }
+
     fn backend(&self) -> BackendKind {
         BackendKind::Firecracker
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some(&self.capture.backend_version)
+    }
+
+    fn supports_checkpoint_capture(&self) -> bool {
+        true
     }
 
     fn guest_socket_path(&self) -> &Path {
@@ -198,6 +232,62 @@ impl BackendInstance for FirecrackerInstance {
         Ok(Some(spawn_result(self.instance_id, status)))
     }
 
+    async fn pause(&self) -> Result<()> {
+        self.capture
+            .api
+            .call_json(
+                Method::PATCH,
+                "/vm",
+                Some(serde_json::json!({"state": "Paused"})),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn resume(&self) -> Result<()> {
+        self.capture
+            .api
+            .call_json(
+                Method::PATCH,
+                "/vm",
+                Some(serde_json::json!({"state": "Resumed"})),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn snapshot(&self, request: SnapshotRequest) -> Result<SnapshotResult> {
+        let SnapshotRequest {
+            snapshot_path,
+            mem_path,
+            kind: SnapshotKind::Full,
+        } = request;
+        for path in [&snapshot_path, &mem_path] {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        self.capture
+            .api
+            .call_json(
+                Method::PUT,
+                "/snapshot/create",
+                Some(serde_json::json!({
+                    "snapshot_path": snapshot_path,
+                    "mem_file_path": mem_path,
+                    "snapshot_type": "Full"
+                })),
+            )
+            .await?;
+        Ok(SnapshotResult {
+            snapshot_path,
+            mem_path,
+        })
+    }
+
     async fn kill(&self) -> Result<()> {
         if self.killed.load(Ordering::Acquire) {
             return Ok(());
@@ -218,9 +308,112 @@ impl BackendInstance for FirecrackerInstance {
     }
 }
 
+struct FirecrackerCapture {
+    api: FirecrackerApiClient,
+    backend_version: String,
+}
+
+impl FirecrackerCapture {
+    fn new(api_socket: PathBuf, api_timeout: Duration, backend_version: String) -> Self {
+        Self {
+            api: FirecrackerApiClient::new(api_socket, api_timeout),
+            backend_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FirecrackerApiClient {
+    socket: PathBuf,
+    timeout: Duration,
+}
+
+impl FirecrackerApiClient {
+    fn new(socket: PathBuf, timeout: Duration) -> Self {
+        Self { socket, timeout }
+    }
+
+    async fn call_json(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<Vec<u8>> {
+        let operation = async {
+            let stream = UnixStream::connect(&self.socket).await?;
+            let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(backend_protocol_error)?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::debug!(%error, "firecracker API connection ended");
+                }
+            });
+            let bytes = match body {
+                Some(body) => {
+                    serde_json::to_vec(&body).map_err(|error| BlazeError::BackendError {
+                        msg: format!("serialize Firecracker API request: {error}"),
+                    })?
+                }
+                None => Vec::new(),
+            };
+            let mut builder = Request::builder()
+                .method(method.clone())
+                .uri(format!("http://localhost{path}"));
+            if !bytes.is_empty() {
+                builder = builder.header("content-type", "application/json");
+            }
+            let request = builder
+                .body(Full::new(Bytes::from(bytes)))
+                .map_err(|error| BlazeError::BackendError {
+                    msg: format!("build Firecracker API request: {error}"),
+                })?;
+            let response = sender
+                .send_request(request)
+                .await
+                .map_err(backend_protocol_error)?;
+            let status = response.status();
+            let mut response_body = response.into_body();
+            let mut collected = Vec::new();
+            while let Some(frame) = response_body.frame().await {
+                let frame = frame.map_err(backend_protocol_error)?;
+                if let Ok(data) = frame.into_data() {
+                    let remaining = MAX_API_RESPONSE_BYTES.saturating_sub(collected.len());
+                    collected.extend_from_slice(&data[..data.len().min(remaining)]);
+                    if data.len() > remaining {
+                        return Err(BlazeError::BackendError {
+                            msg: format!(
+                                "Firecracker {method} {path} response exceeded \
+                                 {MAX_API_RESPONSE_BYTES} bytes"
+                            ),
+                        });
+                    }
+                }
+            }
+            if !status.is_success() {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "Firecracker {method} {path} returned {status}: {}",
+                        String::from_utf8_lossy(&collected)
+                    ),
+                });
+            }
+            Ok(collected)
+        };
+        tokio::time::timeout(self.timeout, operation)
+            .await
+            .map_err(|_| BlazeError::BackendError {
+                msg: format!(
+                    "Firecracker {method} {path} timed out after {:?}",
+                    self.timeout
+                ),
+            })?
+    }
+}
+
 impl FirecrackerInstance {
     async fn cleanup(&self) -> Result<()> {
-        remove_if_exists(&self.api_socket).await?;
+        remove_if_exists(&self.capture.api.socket).await?;
         remove_if_exists(&self.guest_socket).await?;
         remove_if_exists(&self.pid_file).await?;
         Ok(())
@@ -325,14 +518,29 @@ fn configure_logs(command: &mut Command, run_dir: &Path, serial_log: bool) -> Re
 }
 
 async fn read_backend_version(binary_path: &Path) -> Result<String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(5),
-        Command::new(binary_path).arg("--version").output(),
-    )
-    .await
-    .map_err(|_| BlazeError::BackendError {
-        msg: format!("firecracker probe timed out: {}", binary_path.display()),
-    })??;
+    let mut busy_retries = 0;
+    let output = loop {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(binary_path).arg("--version").output(),
+        )
+        .await
+        {
+            Ok(Ok(output)) => break output,
+            Ok(Err(error))
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && busy_retries < 3 =>
+            {
+                busy_retries += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                return Err(BlazeError::BackendError {
+                    msg: format!("firecracker probe timed out: {}", binary_path.display()),
+                });
+            }
+        }
+    };
     if !output.status.success() {
         return Err(BlazeError::BackendError {
             msg: format!(
@@ -471,6 +679,12 @@ fn path_string<'a>(path: &'a Path, label: &str) -> Result<&'a str> {
     })
 }
 
+fn backend_protocol_error(error: hyper::Error) -> BlazeError {
+    BlazeError::BackendError {
+        msg: format!("Firecracker API protocol error: {error}"),
+    }
+}
+
 pub(super) async fn cleanup_orphan_run_dir(instance_id: Uuid, run_dir: &Path) -> Result<()> {
     let stopped_marker = stopped_marker(run_dir);
     if stopped_marker.is_file() {
@@ -503,7 +717,22 @@ pub(super) async fn cleanup_orphan_run_dir(instance_id: Uuid, run_dir: &Path) ->
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::convert::Infallible;
+
     use blaze_core::storage::StorageSlot;
+    #[cfg(target_os = "linux")]
+    use http_body_util::BodyExt;
+    #[cfg(target_os = "linux")]
+    use hyper::Response;
+    #[cfg(target_os = "linux")]
+    use hyper::server::conn::http1 as server_http1;
+    #[cfg(target_os = "linux")]
+    use hyper::service::service_fn;
+    #[cfg(target_os = "linux")]
+    use tokio::net::UnixListener;
+    #[cfg(target_os = "linux")]
+    use tokio::sync::oneshot;
 
     use super::*;
 
@@ -522,6 +751,282 @@ mod tests {
     fn version_parser_rejects_missing_or_ambiguous_version() {
         assert!(parse_backend_version(b"Firecracker exiting successfully\n").is_err());
         assert!(parse_backend_version(b"Firecracker v1.15.0\nFirecracker v1.16.0\n").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn spawn_api(
+        socket: &Path,
+        call_count: usize,
+    ) -> oneshot::Receiver<Vec<(Method, String, serde_json::Value)>> {
+        let listener = UnixListener::bind(socket).expect("bind");
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let observed = Arc::new(Mutex::new(Vec::with_capacity(call_count)));
+            for _ in 0..call_count {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let observed = observed.clone();
+                let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                    let observed = observed.clone();
+                    async move {
+                        let method = request.method().clone();
+                        let path = request.uri().path().to_string();
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("request body")
+                            .to_bytes();
+                        let body = if body.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::from_slice(&body).expect("request JSON")
+                        };
+                        observed.lock().await.push((method, path, body));
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(hyper::StatusCode::NO_CONTENT)
+                                .body(Full::new(Bytes::new()))
+                                .expect("response"),
+                        )
+                    }
+                });
+                server_http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .expect("serve");
+            }
+            let calls = observed.lock().await.clone();
+            let _ = tx.send(calls);
+        });
+        rx
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_api_response(
+        socket: &Path,
+        status: hyper::StatusCode,
+        body: Vec<u8>,
+        delay: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).expect("bind");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let body = Bytes::from(body);
+            let service = service_fn(move |_request: Request<hyper::body::Incoming>| {
+                let body = body.clone();
+                async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .body(Full::new(body))
+                            .expect("response"),
+                    )
+                }
+            });
+            let _ = server_http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_version_binary(path: &Path, output: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staged = path.with_extension("new");
+        std::fs::write(&staged, format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n"))
+            .expect("write version binary");
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+            .expect("make version binary executable");
+        std::fs::rename(staged, path).expect("replace version binary");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn launch_capture_reads_the_requested_binary_each_time() {
+        let temp = tempfile::tempdir().expect("temp");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        write_version_binary(&first, "Firecracker v1.15.0");
+        write_version_binary(&second, "Firecracker v1.16.0");
+        let spawner = FirecrackerSpawner::new(temp.path().join("images"));
+
+        let first_capture = spawner
+            .capture_for(&first, temp.path().join("first.sock"))
+            .await
+            .expect("first capture");
+        let second_capture = spawner
+            .capture_for(&second, temp.path().join("second.sock"))
+            .await
+            .expect("second capture");
+        assert_eq!(first_capture.backend_version, "Firecracker v1.15.0");
+        assert_eq!(second_capture.backend_version, "Firecracker v1.16.0");
+
+        write_version_binary(&first, "Firecracker v1.17.0");
+        let replaced_capture = spawner
+            .capture_for(&first, temp.path().join("replaced.sock"))
+            .await
+            .expect("replaced capture");
+        assert_eq!(replaced_capture.backend_version, "Firecracker v1.17.0");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn probe_checks_each_requested_binary() {
+        let temp = tempfile::tempdir().expect("temp");
+        let valid = temp.path().join("valid");
+        let invalid = temp.path().join("invalid");
+        write_version_binary(&valid, "Firecracker v1.16.0");
+        write_version_binary(&invalid, "not a Firecracker version");
+        let spawner = FirecrackerSpawner::new(temp.path().join("images"));
+
+        assert!(spawner.probe(&valid).await.expect("valid probe"));
+        assert!(!spawner.probe(&invalid).await.expect("invalid probe"));
+
+        write_version_binary(&invalid, "Firecracker v1.17.0");
+        assert!(spawner.probe(&invalid).await.expect("replaced probe"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn instance_reports_version_and_captures_full_snapshot_over_uds() {
+        let temp = tempfile::tempdir().expect("temp");
+        let api_socket = temp.path().join("api.sock");
+        let observed = spawn_api(&api_socket, 3).await;
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let instance_id = Uuid::new_v4();
+        let instance = FirecrackerInstance::new(
+            instance_id,
+            child,
+            FirecrackerCapture::new(
+                api_socket,
+                Duration::from_secs(1),
+                "Firecracker v1.16.0".to_string(),
+            ),
+            PathBuf::new(),
+            false,
+            temp.path().join("firecracker.pid"),
+            stopped_marker(temp.path()),
+        );
+        let snapshot_path = temp.path().join("checkpoint/vmstate.snap");
+        let mem_path = temp.path().join("checkpoint/memory.snap");
+
+        assert_eq!(instance.instance_id(), instance_id);
+        assert_eq!(instance.version(), Some("Firecracker v1.16.0"));
+        assert!(instance.supports_checkpoint_capture());
+        instance.pause().await.expect("pause");
+        let result = instance
+            .snapshot(SnapshotRequest {
+                snapshot_path: snapshot_path.clone(),
+                mem_path: mem_path.clone(),
+                kind: SnapshotKind::Full,
+            })
+            .await
+            .expect("snapshot");
+        instance.resume().await.expect("resume");
+
+        assert_eq!(result.snapshot_path, snapshot_path);
+        assert_eq!(result.mem_path, mem_path);
+        let calls = observed.await.expect("observed calls");
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    Method::PATCH,
+                    "/vm".to_string(),
+                    serde_json::json!({"state": "Paused"}),
+                ),
+                (
+                    Method::PUT,
+                    "/snapshot/create".to_string(),
+                    serde_json::json!({
+                        "snapshot_path": snapshot_path,
+                        "mem_file_path": mem_path,
+                        "snapshot_type": "Full",
+                    }),
+                ),
+                (
+                    Method::PATCH,
+                    "/vm".to_string(),
+                    serde_json::json!({"state": "Resumed"}),
+                ),
+            ]
+        );
+        instance.kill().await.expect("kill");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn api_client_reports_non_success_response_body() {
+        let temp = tempfile::tempdir().expect("temp");
+        let socket = temp.path().join("api.sock");
+        let server = spawn_api_response(
+            &socket,
+            hyper::StatusCode::BAD_REQUEST,
+            b"invalid VM state".to_vec(),
+            Duration::ZERO,
+        );
+        let client = FirecrackerApiClient::new(socket, Duration::from_secs(1));
+
+        let error = client
+            .call_json(Method::PATCH, "/vm", None)
+            .await
+            .expect_err("non-success response");
+        server.await.expect("server");
+
+        let message = error.to_string();
+        assert!(message.contains("400 Bad Request"));
+        assert!(message.contains("invalid VM state"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn api_client_rejects_an_oversized_response() {
+        let temp = tempfile::tempdir().expect("temp");
+        let socket = temp.path().join("api.sock");
+        let server = spawn_api_response(
+            &socket,
+            hyper::StatusCode::OK,
+            vec![b'x'; MAX_API_RESPONSE_BYTES + 1],
+            Duration::ZERO,
+        );
+        let client = FirecrackerApiClient::new(socket, Duration::from_secs(1));
+
+        let error = client
+            .call_json(Method::GET, "/vm", None)
+            .await
+            .expect_err("oversized response");
+        server.await.expect("server");
+
+        assert!(error.to_string().contains("response exceeded 65536 bytes"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn api_client_times_out_a_stalled_response() {
+        let temp = tempfile::tempdir().expect("temp");
+        let socket = temp.path().join("api.sock");
+        let server = spawn_api_response(
+            &socket,
+            hyper::StatusCode::OK,
+            Vec::new(),
+            Duration::from_millis(200),
+        );
+        let client = FirecrackerApiClient::new(socket, Duration::from_millis(20));
+
+        let error = client
+            .call_json(Method::GET, "/vm", None)
+            .await
+            .expect_err("stalled response");
+        server.await.expect("server");
+
+        assert!(error.to_string().contains("timed out after 20ms"));
     }
 
     #[test]
@@ -632,7 +1137,11 @@ mod tests {
         let owner: DynBackendInstance = Arc::new(FirecrackerInstance::new(
             Uuid::new_v4(),
             child,
-            temp.path().join("api.sock"),
+            FirecrackerCapture::new(
+                temp.path().join("api.sock"),
+                Duration::from_secs(1),
+                "Firecracker v1.16.0".to_string(),
+            ),
             temp.path().join("guest.sock"),
             true,
             pid_file.clone(),
