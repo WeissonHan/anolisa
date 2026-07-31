@@ -2,6 +2,7 @@
 //! Backend process ownership and runtime lifecycle abstraction.
 
 pub mod firecracker;
+pub mod gvisor;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -23,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub use firecracker::FirecrackerSpawner;
+pub use gvisor::GvisorSpawner;
 
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 const STOPPED_MARKER: &str = "backend.stopped";

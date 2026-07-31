@@ -22,7 +22,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::api;
 use crate::error::{BlazeDaemonError, Result};
 use crate::spawner::{
-    BubblewrapSpawner, DynSpawner, FirecrackerSpawner, MockSpawner, SpawnerRegistry,
+    BubblewrapSpawner, DynSpawner, FirecrackerSpawner, GvisorSpawner, MockSpawner, SpawnerRegistry,
 };
 use crate::state::ServerState;
 
@@ -125,10 +125,19 @@ fn ensure_dirs(cfg: &DaemonConfig) -> Result<()> {
 ///   3. fallback → [`MockSpawner`]
 async fn build_spawners(cfg: &DaemonConfig) -> (SpawnerRegistry, BackendKind) {
     let firecracker: DynSpawner = Arc::new(FirecrackerSpawner::new(cfg.storage.images_dir.clone()));
+    let gvisor: DynSpawner = Arc::new(GvisorSpawner::new(
+        cfg.storage.images_dir.clone(),
+        cfg.daemon.state_dir.clone(),
+        cfg.backends
+            .get(BackendKind::Gvisor.as_str())
+            .cloned()
+            .unwrap_or_default(),
+    ));
     let bubblewrap: DynSpawner = Arc::new(BubblewrapSpawner);
     let mock: DynSpawner = Arc::new(MockSpawner);
     let mut spawners = SpawnerRegistry::new();
     spawners.insert(BackendKind::Firecracker, firecracker.clone());
+    spawners.insert(BackendKind::Gvisor, gvisor.clone());
     spawners.insert(BackendKind::Bubblewrap, bubblewrap.clone());
     spawners.insert(BackendKind::Mock, mock);
 
@@ -154,6 +163,33 @@ async fn build_spawners(cfg: &DaemonConfig) -> (SpawnerRegistry, BackendKind) {
                     ?err,
                     binary = %fc_path.display(),
                     "firecracker probe error, trying next backend",
+                );
+            }
+        }
+    }
+
+    // --- gVisor (runsc) -------------------------------------------------
+    if let Some(path) = cfg.backends.get(BackendKind::Gvisor.as_str()).cloned() {
+        match gvisor.probe(&path).await {
+            Ok(true) => {
+                tracing::info!(
+                    binary = %path.display(),
+                    images_dir = %cfg.storage.images_dir.display(),
+                    "data plane: using GvisorSpawner",
+                );
+                return (spawners, BackendKind::Gvisor);
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    binary = %path.display(),
+                    "gvisor (runsc) binary probe failed, trying next backend",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    binary = %path.display(),
+                    "gvisor probe error, trying next backend",
                 );
             }
         }
