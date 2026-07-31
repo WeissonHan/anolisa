@@ -126,13 +126,21 @@ images_dir = "/var/lib/blaze/images"
 | GET | `/v1/pools/{backend}/{class}` | 获取 pool 状态 |
 | POST | `/v1/pools/{backend}/{class}/drain` | 排空 pool |
 | PUT | `/v1/pools/{backend}/{class}/sizing` | 调整 pool 大小 |
-| GET | `/v1/templates` | 列出模板 |
-| GET | `/v1/templates/{id}` | 查看模板详情 |
+| GET | `/v1/templates` | 列出内存模板 registry 条目 |
+| GET | `/v1/templates/{id}` | 查看内存模板 registry 条目 |
 | POST | `/v1/templates/gc` | 触发模板 GC |
+| GET | `/v1/runtime-templates` | 列出已发布的 runtime artifact |
+| GET | `/v1/runtime-templates/{name}` | 查看已发布的 runtime artifact |
+| POST | `/v1/runtime-templates/import` | 从配置的导入根目录发布 artifact |
 | GET | `/v1/policies` | 列出已加载策略 |
 | GET | `/v1/hooks` | 列出内核 hook |
 | GET | `/v1/metrics` | Prometheus 指标 |
 | POST | `/v1/admin/reload` | 热加载策略 |
+
+`/v1/runtime-templates` 路由管理持久 artifact 目录，与已有的内存
+`/v1/templates` registry 相互独立。导入条目不会让 sandbox create 自动
+选择它。接受的 artifact、配置上限和发布规则参见
+[Runtime 模板目录](docs/design/runtime-template-catalog_zh.md)。
 
 ### 生命周期管理与恢复
 

@@ -128,13 +128,22 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | GET | `/v1/pools/{backend}/{class}` | Get pool status |
 | POST | `/v1/pools/{backend}/{class}/drain` | Drain a pool |
 | PUT | `/v1/pools/{backend}/{class}/sizing` | Resize a pool |
-| GET | `/v1/templates` | List templates |
-| GET | `/v1/templates/{id}` | Inspect a template |
+| GET | `/v1/templates` | List in-memory template registry entries |
+| GET | `/v1/templates/{id}` | Inspect an in-memory template registry entry |
 | POST | `/v1/templates/gc` | Trigger template GC |
+| GET | `/v1/runtime-templates` | List published runtime artifact sets |
+| GET | `/v1/runtime-templates/{name}` | Inspect a published runtime artifact set |
+| POST | `/v1/runtime-templates/import` | Publish artifacts from the configured import root |
 | GET | `/v1/policies` | List loaded policies |
 | GET | `/v1/hooks` | List kernel hooks |
 | GET | `/v1/metrics` | Prometheus metrics |
 | POST | `/v1/admin/reload` | Hot-reload policies |
+
+The `/v1/runtime-templates` routes manage a durable artifact catalog that is
+separate from the existing in-memory `/v1/templates` registry. Importing an
+entry does not make sandbox creation select it. See
+[Runtime template catalog](docs/design/runtime-template-catalog.md) for the
+accepted artifacts, configuration limits, and publication rules.
 
 ### Managed lifecycle and recovery
 
