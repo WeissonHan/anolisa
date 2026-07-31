@@ -11,13 +11,15 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use blaze_core::backend::{BackendKind, BackendStatus, select_backend};
 use blaze_core::kernel::HookKind;
 use blaze_core::lifecycle::{SandboxInstance, SandboxState, StartPath};
 use blaze_core::policy::{ImageMetadata, RuntimeDecision, WorkloadClass, parse_duration};
 use blaze_core::pool::{PoolConfig, PoolKey};
 use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body, Bytes, Incoming};
 use hyper::header::CONTENT_TYPE;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -27,9 +29,12 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
+use crate::guest::MAX_GUEST_FILE_BYTES;
 use crate::request_body;
 use crate::sandbox::CreateSandbox;
 use crate::state::ServerState;
+
+const MAX_EXEC_TIMEOUT_SECS: u32 = 20;
 
 /// Top-level request handler. Always returns `Ok(Response)`; internal
 /// errors are turned into JSON error bodies so hyper never sees a panic.
@@ -37,6 +42,17 @@ pub async fn handle(
     req: Request<Incoming>,
     state: Arc<ServerState>,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
+    handle_request(req, state).await
+}
+
+async fn handle_request<B>(
+    req: Request<B>,
+    state: Arc<ServerState>,
+) -> std::result::Result<Response<Full<Bytes>>, Infallible>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     state.metrics.inc(&state.metrics.requests_total);
 
     let method = req.method().clone();
@@ -63,6 +79,13 @@ pub async fn handle(
     Ok(resp)
 }
 
+const fn max_base64_len(decoded_bytes: usize) -> usize {
+    decoded_bytes
+        .saturating_add(2)
+        .saturating_div(3)
+        .saturating_mul(4)
+}
+
 async fn dispatch(
     method: &Method,
     path: &str,
@@ -85,6 +108,15 @@ async fn dispatch(
         }
         ("GET", ["v1", "instances", id]) | ("GET", ["v1", "sandboxes", id]) => {
             get_instance(state, id)
+        }
+        ("POST", ["v1", "sandboxes", id, "exec"]) | ("POST", ["v1", "instances", id, "exec"]) => {
+            exec_instance(state, id, &body).await
+        }
+        ("POST", ["v1", "sandboxes", id, "read"]) | ("POST", ["v1", "instances", id, "read"]) => {
+            read_instance_file(state, id, &body).await
+        }
+        ("POST", ["v1", "sandboxes", id, "write"]) | ("POST", ["v1", "instances", id, "write"]) => {
+            write_instance_file(state, id, &body).await
         }
         ("POST", ["v1", "instances", id, "checkpoint"]) => checkpoint(state, id).await,
         ("POST", ["v1", "instances", id, "reset"]) => reset_instance(state, id).await,
@@ -189,7 +221,7 @@ async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Respon
         workload_class: Some(req.workload_class),
         kernel_version: req.kernel_version.clone(),
     };
-    let decision = {
+    let mut decision = {
         let engine = state
             .policy
             .lock()
@@ -202,6 +234,18 @@ async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Respon
             }
         }
     };
+    if let Some(pool) = decision.pool.as_mut()
+        && pool.warm_ttl.is_none()
+    {
+        let default_warm_ttl = state
+            .config
+            .lock()
+            .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()))?
+            .pool
+            .default_warm_ttl
+            .clone();
+        pool.warm_ttl = Some(default_warm_ttl);
+    }
 
     // Constrain availability to the implementation selected at daemon boot.
     let availability: Vec<BackendStatus> = {
@@ -331,12 +375,120 @@ async fn destroy_instance(state: &Arc<ServerState>, id: &str) -> Result<Response
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct ExecRequest {
+    cmd: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    timeout: Option<u32>,
+}
+
+async fn exec_instance(
+    state: &Arc<ServerState>,
+    id: &str,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>> {
+    let request: ExecRequest = serde_json::from_slice(body)
+        .map_err(|error| BlazeDaemonError::BadRequest(format!("invalid exec body: {error}")))?;
+    if request.cmd.is_empty() {
+        return Err(BlazeDaemonError::BadRequest(
+            "exec command is required".to_string(),
+        ));
+    }
+    let timeout = request.timeout.unwrap_or(MAX_EXEC_TIMEOUT_SECS);
+    if timeout == 0 || timeout > MAX_EXEC_TIMEOUT_SECS {
+        return Err(BlazeDaemonError::BadRequest(format!(
+            "exec timeout must be between 1 and {MAX_EXEC_TIMEOUT_SECS} seconds"
+        )));
+    }
+    let result = state
+        .manager
+        .exec(
+            parse_uuid(id)?,
+            request.cmd,
+            request.cwd,
+            request.env,
+            timeout,
+        )
+        .await?;
+    json_ok(&json!({
+        "exit_code": result.exit_code,
+        "stdout_b64": BASE64.encode(result.stdout),
+        "stderr_b64": BASE64.encode(result.stderr),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct FileRequest {
+    path: String,
+    #[serde(default)]
+    data_b64: Option<String>,
+}
+
+async fn read_instance_file(
+    state: &Arc<ServerState>,
+    id: &str,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>> {
+    let request: FileRequest = serde_json::from_slice(body)
+        .map_err(|error| BlazeDaemonError::BadRequest(format!("invalid read body: {error}")))?;
+    let data = state
+        .manager
+        .read_file(parse_uuid(id)?, request.path)
+        .await?;
+    json_ok(&json!({"data_b64": BASE64.encode(data)}))
+}
+
+async fn write_instance_file(
+    state: &Arc<ServerState>,
+    id: &str,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>> {
+    let request: FileRequest = serde_json::from_slice(body)
+        .map_err(|error| BlazeDaemonError::BadRequest(format!("invalid write body: {error}")))?;
+    let encoded = request
+        .data_b64
+        .ok_or_else(|| BlazeDaemonError::BadRequest("data_b64 is required".to_string()))?;
+    let data = decode_guest_file(&encoded, MAX_GUEST_FILE_BYTES)?;
+    state
+        .manager
+        .write_file(parse_uuid(id)?, request.path, &data)
+        .await?;
+    json_ok(&json!({"written": true, "bytes": data.len()}))
+}
+
+fn decode_guest_file(encoded: &str, limit: usize) -> Result<Vec<u8>> {
+    let encoded_limit = max_base64_len(limit);
+    if encoded.len() > encoded_limit {
+        return Err(crate::guest::GuestError::PayloadTooLarge {
+            actual: encoded.len(),
+            limit: encoded_limit,
+        }
+        .into());
+    }
+    let data = BASE64
+        .decode(encoded)
+        .map_err(|error| BlazeDaemonError::BadRequest(format!("invalid base64: {error}")))?;
+    if data.len() > limit {
+        return Err(crate::guest::GuestError::PayloadTooLarge {
+            actual: data.len(),
+            limit,
+        }
+        .into());
+    }
+    Ok(data)
+}
+
 /// Stop every tracked sandbox after the daemon has stopped accepting work.
 ///
 /// Cleanup starts concurrently for all known owners and shares one deadline.
 /// This lets independent owners finish after another owner fails or stalls
 /// without multiplying the daemon's shutdown time by the sandbox count.
-/// Timed-out tasks are cancelled and joined before this function returns.
+/// Timed-out sandbox tasks are cancelled and joined. Runtime-pool shutdown
+/// retains control of its nested worker and joins that worker itself.
 pub(crate) async fn shutdown_instances(state: &Arc<ServerState>, budget: Duration) -> Result<()> {
     let ids = state.manager.owned_instance_ids()?;
 
@@ -346,33 +498,52 @@ pub(crate) async fn shutdown_instances(state: &Arc<ServerState>, budget: Duratio
     for id in ids {
         let state = state.clone();
         let task = tasks.spawn(async move { state.manager.destroy(id).await.map(|_| ()) });
-        task_owners.insert(task.id(), id);
+        task_owners.insert(task.id(), id.to_string());
     }
+    let pool_state = state.clone();
+    let mut pool_shutdown = Box::pin(async move {
+        pool_state
+            .manager
+            .shutdown_runtime_pool_until(deadline)
+            .await
+    });
+    let mut pool_pending = true;
+    let mut deadline_sleep = Box::pin(tokio::time::sleep_until(deadline));
 
     let mut failures = BTreeMap::new();
     let mut deadline_expired = false;
-    while !tasks.is_empty() {
-        match tokio::time::timeout_at(deadline, tasks.join_next_with_id()).await {
-            Ok(Some(Ok((task_id, result)))) => {
-                let Some(id) = task_owners.remove(&task_id) else {
-                    failures.insert(
-                        format!("task-{task_id}"),
-                        "cleanup result had no tracked sandbox owner".to_string(),
-                    );
-                    continue;
-                };
+    while !tasks.is_empty() || pool_pending {
+        tokio::select! {
+            result = &mut pool_shutdown, if pool_pending => {
+                pool_pending = false;
                 if let Err(error) = result {
-                    failures.insert(id.to_string(), error.to_string());
+                    failures.insert("runtime-pool".to_string(), error.to_string());
                 }
             }
-            Ok(Some(Err(error))) => {
-                let key = task_owners
-                    .remove(&error.id())
-                    .map_or_else(|| format!("task-{}", error.id()), |id| id.to_string());
-                failures.insert(key, format!("cleanup task failed: {error}"));
+            task = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                match task {
+                    Some(Ok((task_id, result))) => {
+                        let Some(id) = task_owners.remove(&task_id) else {
+                            failures.insert(
+                                format!("task-{task_id}"),
+                                "cleanup result had no tracked sandbox owner".to_string(),
+                            );
+                            continue;
+                        };
+                        if let Err(error) = result {
+                            failures.insert(id, error.to_string());
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let key = task_owners
+                            .remove(&error.id())
+                            .unwrap_or_else(|| format!("task-{}", error.id()));
+                        failures.insert(key, format!("cleanup task failed: {error}"));
+                    }
+                    None => {}
+                }
             }
-            Ok(None) => break,
-            Err(_) => {
+            _ = &mut deadline_sleep => {
                 deadline_expired = true;
                 break;
             }
@@ -380,7 +551,7 @@ pub(crate) async fn shutdown_instances(state: &Arc<ServerState>, budget: Duratio
     }
 
     if deadline_expired {
-        let mut timed_out_owners = task_owners.values().copied().collect::<BTreeSet<_>>();
+        let mut timed_out_owners = task_owners.values().cloned().collect::<BTreeSet<_>>();
         tasks.abort_all();
         while let Some(result) = tasks.join_next_with_id().await {
             match result {
@@ -394,13 +565,14 @@ pub(crate) async fn shutdown_instances(state: &Arc<ServerState>, budget: Duratio
                     };
                     timed_out_owners.remove(&id);
                     if let Err(error) = result {
-                        failures.insert(id.to_string(), error.to_string());
+                        failures.insert(id, error.to_string());
                     }
                 }
                 Err(error) => {
                     let owner = task_owners.remove(&error.id());
-                    let key =
-                        owner.map_or_else(|| format!("task-{}", error.id()), |id| id.to_string());
+                    let key = owner
+                        .clone()
+                        .unwrap_or_else(|| format!("task-{}", error.id()));
                     if !error.is_cancelled() {
                         if let Some(id) = owner {
                             timed_out_owners.remove(&id);
@@ -411,11 +583,18 @@ pub(crate) async fn shutdown_instances(state: &Arc<ServerState>, budget: Duratio
             }
         }
         for id in timed_out_owners {
-            failures.entry(id.to_string()).or_insert_with(|| {
+            failures.entry(id).or_insert_with(|| {
                 format!("cleanup did not finish within the shared {budget:?} budget")
             });
         }
+        if pool_pending {
+            pool_pending = false;
+            if let Err(error) = pool_shutdown.await {
+                failures.insert("runtime-pool".to_string(), error.to_string());
+            }
+        }
     }
+    debug_assert!(!pool_pending);
 
     if failures.is_empty() {
         Ok(())
@@ -425,7 +604,7 @@ pub(crate) async fn shutdown_instances(state: &Arc<ServerState>, budget: Duratio
             .map(|(owner, error)| format!("{owner}: {error}"))
             .collect::<Vec<_>>();
         Err(BlazeDaemonError::RecoveryRequired(format!(
-            "daemon shutdown left {} sandbox cleanup operation(s) incomplete: {}",
+            "daemon shutdown left {} runtime cleanup operation(s) incomplete: {}",
             failures.len(),
             failures.join("; ")
         )))
@@ -670,10 +849,13 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Result<Response
 fn error_response(err: &BlazeDaemonError) -> Response<Full<Bytes>> {
     let status =
         StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let body = json!({
+    let mut body = json!({
         "error": err.to_string(),
         "status": status.as_u16(),
     });
+    if let Some(code) = err.api_code() {
+        body["code"] = json!(code);
+    }
     let bytes = serde_json::to_vec_pretty(&body)
         .unwrap_or_else(|_| br#"{"error":"serialize_failed"}"#.to_vec());
     Response::builder()
@@ -697,8 +879,8 @@ mod tests {
     use std::collections::HashMap;
     use std::future;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -706,7 +888,7 @@ mod tests {
     use blaze_core::backend::{BackendKind, SpawnRequest};
     use blaze_core::config::DaemonConfig;
     use blaze_core::kernel::HookRegistry;
-    use blaze_core::lifecycle::{BackendOwnership, OperationKind};
+    use blaze_core::lifecycle::{BackendOwnership, OperationKind, RuntimeLocation};
     use blaze_core::policy::{
         BackendConfigs, FallbackOnMissingHook, PolicyEngine, PolicyFile, PolicyHooks, PolicyMatch,
         PolicyPool, PolicySelect, ResetMode, WorkloadClass,
@@ -719,9 +901,12 @@ mod tests {
     use http_body_util::BodyExt;
 
     use crate::file_provider::FileStorageProvider;
+    use crate::runtime_pool::PoolPrototype;
+    #[cfg(target_os = "linux")]
+    use crate::spawner::BubblewrapSpawner;
     use crate::spawner::{
-        BackendInstance, BackendSpawner, BubblewrapSpawner, DynBackendInstance, DynSpawner,
-        MockSpawner, SpawnFailure, SpawnResult, SpawnerRegistry,
+        BackendInstance, BackendSpawner, DynBackendInstance, DynSpawner, MockSpawner, SpawnFailure,
+        SpawnResult, SpawnerRegistry,
     };
     use crate::state::ServerState;
 
@@ -764,7 +949,7 @@ mod tests {
                 min: 0,
                 target: 0,
                 max: 1,
-                warm_ttl: "30m".into(),
+                warm_ttl: Some("30m".into()),
                 reset_mode: ResetMode::FullRecreate,
             }),
             checkpoint: None,
@@ -834,6 +1019,111 @@ mod tests {
         .expect("created json")
     }
 
+    async fn wait_for_ready_runtime(state: &Arc<ServerState>) -> Uuid {
+        let runtime_root = state.state_dir.join("runtime-pool");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.manager.runtime_pool_status().ready > 0
+                    && let Ok(mut entries) = tokio::fs::read_dir(&runtime_root).await
+                {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let Ok(instance_id) = Uuid::parse_str(&entry.file_name().to_string_lossy())
+                        else {
+                            continue;
+                        };
+                        let Ok(raw) = tokio::fs::read(entry.path().join("ownership.json")).await
+                        else {
+                            continue;
+                        };
+                        let Ok(ownership) = serde_json::from_slice::<serde_json::Value>(&raw)
+                        else {
+                            continue;
+                        };
+                        if ownership["phase"]["kind"] == "ready" {
+                            return instance_id;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("runtime pool produces a ready slot")
+    }
+
+    fn warm_runtime_state(
+        temp: &tempfile::TempDir,
+        prefork: bool,
+        spawner: DynSpawner,
+    ) -> (Arc<ServerState>, PathBuf) {
+        let mut config = test_config(temp);
+        config.storage.pool_size = 1;
+        config.storage.prefork = prefork;
+        std::fs::create_dir_all(config.daemon.state_dir.join("runtime-pool"))
+            .expect("runtime pool root");
+        let instances_dir = config.storage.instances_dir.clone();
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            instances_dir.clone(),
+        ));
+        (
+            build_test_state(
+                config,
+                test_policy(BackendKind::Mock, true),
+                spawners(BackendKind::Mock, spawner),
+                BackendKind::Mock,
+                storage,
+            ),
+            instances_dir,
+        )
+    }
+
+    async fn assert_warm_runtime_round_trip(prefork: bool) {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, instances_dir) = warm_runtime_state(&temp, prefork, Arc::new(MockSpawner));
+
+        let _bootstrap = created_json(&state, &test_request()).await;
+        let ready_id = wait_for_ready_runtime(&state).await;
+        let claimed = created_json(&state, &test_request()).await;
+        let claimed_id =
+            Uuid::parse_str(claimed["instance"]["id"].as_str().expect("claimed ID")).expect("UUID");
+
+        assert_eq!(claimed_id, ready_id);
+        assert_eq!(claimed["start_path"], "warm");
+        assert_eq!(claimed["instance"]["runtime_location"], "warm-pool");
+        assert!(claimed["instance"]["runtime_owner_token"].is_string());
+
+        state.manager.begin_shutdown();
+        assert!(
+            state
+                .manager
+                .destroy(claimed_id)
+                .await
+                .expect("destroy claim")
+        );
+        let terminal = state.manager.get(claimed_id).expect("terminal lifecycle");
+        assert!(terminal.is_clean_terminal());
+        assert!(!instances_dir.join(claimed_id.to_string()).exists());
+        assert!(
+            !state
+                .state_dir
+                .join("runtime-pool")
+                .join(claimed_id.to_string())
+                .exists()
+        );
+        assert!(
+            !state
+                .state_dir
+                .join("runtime-pool")
+                .join(".cleanup")
+                .join(claimed_id.to_string())
+                .exists()
+        );
+        shutdown_instances(&state, Duration::from_secs(1))
+            .await
+            .expect("shutdown remaining owners");
+    }
+
     async fn dispatched_json(
         state: &Arc<ServerState>,
         method: Method,
@@ -843,6 +1133,32 @@ mod tests {
         let response = dispatch(&method, path, "", body, state)
             .await
             .expect("dispatch");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let value = serde_json::from_slice(&body).expect("response json");
+        (status, value)
+    }
+
+    async fn handled_json(
+        state: &Arc<ServerState>,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(hyper::header::CONTENT_LENGTH, body.len())
+            .body(Full::new(Bytes::from(body)))
+            .expect("request");
+        let response = handle_request(request, state.clone())
+            .await
+            .expect("infallible response");
         let status = response.status();
         let body = response
             .into_body()
@@ -1248,9 +1564,166 @@ mod tests {
         }
     }
 
+    struct StalledGuestOwner {
+        instance_id: Uuid,
+        socket: PathBuf,
+        kill_count: Arc<AtomicUsize>,
+        killed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl BackendInstance for StalledGuestOwner {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Mock
+        }
+
+        fn guest_socket_path(&self) -> &Path {
+            &self.socket
+        }
+
+        async fn try_wait(&self) -> blaze_core::Result<Option<SpawnResult>> {
+            Ok(self.killed.load(Ordering::Acquire).then_some(SpawnResult {
+                instance_id: self.instance_id,
+                exit_code: Some(0),
+                signal: None,
+            }))
+        }
+
+        async fn kill(&self) -> blaze_core::Result<()> {
+            if !self.killed.swap(true, Ordering::AcqRel) {
+                self.kill_count.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(())
+        }
+    }
+
+    struct StalledGuestSpawner {
+        spawned: Arc<tokio::sync::Notify>,
+        kill_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl BackendSpawner for StalledGuestSpawner {
+        async fn spawn(
+            &self,
+            request: SpawnRequest,
+        ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
+            self.spawned.notify_one();
+            Ok(Arc::new(StalledGuestOwner {
+                instance_id: request.instance_id,
+                socket: request.run_dir.join("missing-guest.uds"),
+                kill_count: self.kill_count.clone(),
+                killed: AtomicBool::new(false),
+            }))
+        }
+
+        async fn probe(&self, _binary_path: &Path) -> blaze_core::Result<bool> {
+            Ok(true)
+        }
+
+        async fn cleanup_orphan(
+            &self,
+            _instance_id: Uuid,
+            _run_dir: &Path,
+        ) -> blaze_core::Result<()> {
+            Ok(())
+        }
+    }
+
     struct CountingStorage {
         inner: FileStorageProvider,
         release_count: Arc<AtomicUsize>,
+    }
+
+    struct PoolWorkerReleaseStorage {
+        inner: FileStorageProvider,
+        acquire_count: AtomicUsize,
+        residual_attempt: usize,
+        delayed_id: Mutex<Option<String>>,
+        release_started: Arc<AtomicUsize>,
+        release_active: Arc<AtomicUsize>,
+        release_completed: Arc<AtomicUsize>,
+        release_delay: Duration,
+    }
+
+    struct ActiveRelease {
+        active: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ActiveRelease {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for PoolWorkerReleaseStorage {
+        async fn probe(&self) -> blaze_core::Result<bool> {
+            self.inner.probe().await
+        }
+
+        async fn acquire(
+            &self,
+            opts: &AcquireOpts,
+        ) -> std::result::Result<StorageSlot, StorageAcquireError> {
+            let attempt = self.acquire_count.fetch_add(1, Ordering::AcqRel) + 1;
+            let slot = self.inner.acquire(opts).await?;
+            if attempt == self.residual_attempt {
+                *self.delayed_id.lock().expect("delayed ID") = Some(slot.id.clone());
+                return Err(StorageAcquireError::with_residual(
+                    BlazeError::StorageError {
+                        msg: "injected pool build residual".to_string(),
+                    },
+                    slot,
+                ));
+            }
+            Ok(slot)
+        }
+
+        async fn release(&self, slot: StorageSlot) -> blaze_core::Result<()> {
+            self.release_by_id(&slot.id).await
+        }
+
+        async fn release_by_id(&self, instance_id: &str) -> blaze_core::Result<()> {
+            let delayed =
+                self.delayed_id.lock().expect("delayed ID").as_deref() == Some(instance_id);
+            if delayed {
+                self.release_active.fetch_add(1, Ordering::AcqRel);
+                let _active = ActiveRelease {
+                    active: self.release_active.clone(),
+                };
+                self.release_started.fetch_add(1, Ordering::AcqRel);
+                tokio::time::sleep(self.release_delay).await;
+                self.inner.release_by_id(instance_id).await?;
+                self.release_completed.fetch_add(1, Ordering::AcqRel);
+                return Ok(());
+            }
+            self.inner.release_by_id(instance_id).await
+        }
+
+        fn supports_runtime_pool_recovery(&self) -> bool {
+            true
+        }
+
+        async fn list_owned_ids(&self) -> blaze_core::Result<Vec<String>> {
+            self.inner.list_owned_ids().await
+        }
+
+        async fn reconstruct(&self, instance_id: &str) -> blaze_core::Result<StorageSlot> {
+            self.inner.reconstruct(instance_id).await
+        }
+
+        async fn flush_dirty(&self, slot: &StorageSlot) -> blaze_core::Result<()> {
+            self.inner.flush_dirty(slot).await
+        }
+
+        fn pool_status(&self) -> PoolStatus {
+            self.inner.pool_status()
+        }
+
+        async fn drain_pool(&self) -> blaze_core::Result<usize> {
+            self.inner.drain_pool().await
+        }
     }
 
     #[async_trait]
@@ -1464,6 +1937,198 @@ mod tests {
                 SandboxState::Destroyed
             );
         }
+    }
+
+    #[tokio::test]
+    async fn non_prefork_runtime_claim_completes_create_and_destroy() {
+        assert_warm_runtime_round_trip(false).await;
+    }
+
+    #[tokio::test]
+    async fn prefork_runtime_claim_completes_create_and_destroy() {
+        assert_warm_runtime_round_trip(true).await;
+    }
+
+    #[tokio::test]
+    async fn omitted_policy_ttl_is_resolved_in_create_response() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut config = test_config(&temp);
+        config.pool.default_warm_ttl = "1h".into();
+        let instances_dir = config.storage.instances_dir.clone();
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            instances_dir,
+        ));
+        let mut policy = test_policy(BackendKind::Mock, true);
+        policy.pool.as_mut().expect("pool").warm_ttl = None;
+        let state = build_test_state(
+            config,
+            policy,
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+
+        let created = created_json(&state, &test_request()).await;
+        assert_eq!(created["decision"]["pool"]["warm_ttl"], "1h");
+        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("instance ID"))
+            .expect("UUID");
+        assert!(state.manager.destroy(id).await.expect("destroy instance"));
+        shutdown_instances(&state, Duration::from_millis(100))
+            .await
+            .expect("no owners remain");
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn visible_lifecycle_publish_error_keeps_one_cleanup_owner() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, instances_dir) = warm_runtime_state(&temp, false, Arc::new(MockSpawner));
+        let _bootstrap = created_json(&state, &test_request()).await;
+        let ready_id = wait_for_ready_runtime(&state).await;
+        let hook = crate::failpoint::TestFailpoint::new(&["warm-runtime-lifecycle-publish-result"]);
+
+        let error = hook
+            .run(create_instance(&state, &test_request()))
+            .await
+            .expect_err("visible lifecycle publication must be compensated");
+
+        assert!(error.to_string().contains("publication reported an error"));
+        let terminal = state.manager.get(ready_id).expect("terminal lifecycle");
+        assert!(terminal.is_clean_terminal());
+        assert!(state.manager.backend_owner(ready_id).is_none());
+        assert!(!instances_dir.join(ready_id.to_string()).exists());
+        assert!(
+            !state
+                .state_dir
+                .join("runtime-pool")
+                .join(ready_id.to_string())
+                .exists()
+        );
+        assert!(
+            !state
+                .state_dir
+                .join("runtime-pool")
+                .join(".cleanup")
+                .join(ready_id.to_string())
+                .exists()
+        );
+
+        state.manager.begin_shutdown();
+        shutdown_instances(&state, Duration::from_secs(1))
+            .await
+            .expect("shutdown remaining owners");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambiguous_lifecycle_publish_remains_counted_until_restart() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, instances_dir) = warm_runtime_state(
+            &temp,
+            false,
+            Arc::new(CountingSpawner {
+                kill_count: Arc::new(AtomicUsize::new(0)),
+                orphan_cleanup_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let _bootstrap = created_json(&state, &test_request()).await;
+        let ready_id = wait_for_ready_runtime(&state).await;
+        let external = tempfile::tempdir().expect("external lifecycle owner");
+        symlink(external.path(), state.state_dir.join(ready_id.to_string()))
+            .expect("linked lifecycle owner");
+
+        let error = create_instance(&state, &test_request())
+            .await
+            .expect_err("ambiguous lifecycle publication must stop the claim");
+
+        assert!(error.to_string().contains("publication was ambiguous"));
+        let status = state.manager.runtime_pool_status();
+        assert_eq!(status.ready, 0);
+        assert_eq!(status.leased, 0);
+        assert_eq!(status.unresolved, 1);
+        assert_eq!(status.deficit, 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(state.manager.runtime_pool_status().unresolved, 1);
+        assert!(instances_dir.join(ready_id.to_string()).exists());
+
+        state.manager.begin_shutdown();
+        let shutdown = shutdown_instances(&state, Duration::from_secs(1))
+            .await
+            .expect_err("shutdown must report the unresolved owner");
+        assert!(shutdown.to_string().contains(&ready_id.to_string()));
+        assert!(
+            shutdown
+                .to_string()
+                .contains("unresolved lifecycle publication")
+        );
+        assert_eq!(state.manager.runtime_pool_status().unresolved, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_claim_retains_one_recoverable_owner() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, instances_dir) =
+            warm_runtime_state(&temp, false, Arc::new(PartialSpawnSpawner));
+
+        let _bootstrap_error = create_instance(&state, &test_request())
+            .await
+            .expect_err("bootstrap spawn fails after pool configuration");
+        let ready_id = wait_for_ready_runtime(&state).await;
+        let error = create_instance(&state, &test_request())
+            .await
+            .expect_err("runtime claim spawn fails");
+
+        assert!(error.to_string().contains("cleanup incomplete"));
+        let retained = state.manager.get(ready_id).expect("retained lifecycle");
+        assert_eq!(retained.runtime_location, RuntimeLocation::WarmPool);
+        assert_eq!(
+            retained.operation.as_ref().map(|operation| operation.kind),
+            Some(OperationKind::Destroy)
+        );
+        assert!(!retained.is_clean_terminal());
+        let ownership: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                state
+                    .state_dir
+                    .join("runtime-pool")
+                    .join(ready_id.to_string())
+                    .join("ownership.json"),
+            )
+            .expect("retained ownership"),
+        )
+        .expect("ownership JSON");
+        assert_eq!(ownership["phase"]["kind"], "lifecycle-cleanup");
+
+        assert!(
+            state
+                .manager
+                .destroy(ready_id)
+                .await
+                .expect("retry retained cleanup")
+        );
+        assert!(
+            state
+                .manager
+                .get(ready_id)
+                .expect("terminal lifecycle")
+                .is_clean_terminal()
+        );
+        assert!(!instances_dir.join(ready_id.to_string()).exists());
+        assert!(
+            !state
+                .state_dir
+                .join("runtime-pool")
+                .join(ready_id.to_string())
+                .exists()
+        );
+
+        state.manager.begin_shutdown();
+        shutdown_instances(&state, Duration::from_secs(1))
+            .await
+            .expect("shutdown bootstrap owner");
     }
 
     /// When multiple backend binaries exist on disk but the daemon probed
@@ -1750,6 +2415,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guest_manager_waits_for_the_lifecycle_lock() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("instance id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+
+        let operation = state.manager.operation_lock(uuid).lock_owned().await;
+        let exec_state = state.clone();
+        let mut pending_exec = tokio::spawn(async move {
+            exec_state
+                .manager
+                .exec(uuid, "printf guest-lock".into(), None, None, 5)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending_exec)
+                .await
+                .is_err(),
+            "guest operation bypassed the lifecycle lock"
+        );
+        drop(operation);
+
+        let exec = pending_exec
+            .await
+            .expect("exec task")
+            .expect("managed exec");
+        assert_eq!(exec.stdout, b"printf guest-lock");
+    }
+
+    #[tokio::test]
     async fn manager_cleanup_releases_tracked_runtime_resources() {
         let temp = tempfile::tempdir().expect("temp");
         let config = test_config(&temp);
@@ -1823,7 +2530,7 @@ mod tests {
                 min: 0,
                 target: 0,
                 max: 1,
-                warm_ttl: "30m".into(),
+                warm_ttl: Some("30m".into()),
                 reset_mode: ResetMode::FullRecreate,
             }),
             checkpoint: None,
@@ -1916,6 +2623,309 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_guest_routes_use_owned_runtime() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("instance id");
+
+        let (status, exec) = dispatched_json(
+            &state,
+            Method::POST,
+            &format!("/v1/sandboxes/{id}/exec"),
+            serde_json::to_vec(&json!({
+                "cmd": "printf routed",
+                "timeout": 5,
+            }))
+            .expect("exec request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(exec["exit_code"], 0);
+        assert_eq!(exec["stdout_b64"], BASE64.encode(b"printf routed"));
+
+        let encoded = "AAEC/2d1ZXN0";
+        let (status, written) = dispatched_json(
+            &state,
+            Method::POST,
+            &format!("/v1/instances/{id}/write"),
+            serde_json::to_vec(&json!({
+                "path": "/tmp/value",
+                "data_b64": encoded,
+            }))
+            .expect("write request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(written["bytes"], 9);
+
+        let (status, read) = dispatched_json(
+            &state,
+            Method::POST,
+            &format!("/v1/sandboxes/{id}/read"),
+            serde_json::to_vec(&json!({"path": "/tmp/value"})).expect("read request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["data_b64"], encoded);
+
+        let invalid_timeout = dispatch(
+            &Method::POST,
+            &format!("/v1/sandboxes/{id}/exec"),
+            "",
+            serde_json::to_vec(&json!({
+                "cmd": "true",
+                "timeout": MAX_EXEC_TIMEOUT_SECS + 1,
+            }))
+            .expect("invalid request"),
+            &state,
+        )
+        .await
+        .expect_err("timeout above the API limit must fail");
+        assert!(matches!(invalid_timeout, BlazeDaemonError::BadRequest(_)));
+
+        assert_eq!(
+            decode_guest_file(&BASE64.encode(b"1234"), 4).expect("boundary"),
+            b"1234"
+        );
+        assert!(matches!(
+            decode_guest_file(&BASE64.encode(b"12345"), 4),
+            Err(BlazeDaemonError::Guest(
+                crate::guest::GuestError::PayloadTooLarge { .. }
+            ))
+        ));
+        assert!(matches!(
+            decode_guest_file("not/base64!", 16),
+            Err(BlazeDaemonError::BadRequest(_))
+        ));
+
+        let (status, destroyed) = dispatched_json(
+            &state,
+            Method::DELETE,
+            &format!("/v1/sandboxes/{id}"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(destroyed["destroyed"], true);
+    }
+
+    #[tokio::test]
+    async fn guest_write_respects_http_and_decoded_limits() {
+        const EXTENDED_BODY_LIMIT: usize = 22 * 1024 * 1024;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let default_limit = config.api.max_body_bytes;
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("instance id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        let path = format!("/v1/sandboxes/{id}/write");
+
+        let envelope_payload = vec![b'y'; 800 * 1024];
+        let envelope_body = serde_json::to_vec(&json!({
+            "path": "/tmp/http-envelope",
+            "data_b64": BASE64.encode(&envelope_payload),
+        }))
+        .expect("write request above the default HTTP limit");
+        assert!(envelope_body.len() > default_limit);
+        let (status, error) =
+            handled_json(&state, Method::POST, &path, envelope_body.clone()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error["status"], 413);
+
+        state.config.lock().expect("config").api.max_body_bytes = EXTENDED_BODY_LIMIT;
+        let (status, written) = handled_json(&state, Method::POST, &path, envelope_body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(written["bytes"], envelope_payload.len());
+        assert_eq!(
+            state
+                .manager
+                .read_file(uuid, "/tmp/http-envelope".into())
+                .await
+                .expect("read envelope payload"),
+            envelope_payload
+        );
+
+        let mut payload = vec![b'z'; MAX_GUEST_FILE_BYTES];
+        let body = serde_json::to_vec(&json!({
+            "path": "/tmp/max-size",
+            "data_b64": BASE64.encode(&payload),
+        }))
+        .expect("write request");
+        assert!(body.len() <= EXTENDED_BODY_LIMIT);
+
+        let (status, written) = handled_json(&state, Method::POST, &path, body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(written["bytes"], MAX_GUEST_FILE_BYTES);
+        let readback = state
+            .manager
+            .read_file(uuid, "/tmp/max-size".into())
+            .await
+            .expect("read maximum file");
+        assert_eq!(readback, payload);
+        drop(readback);
+
+        payload.push(b'z');
+        let oversized = serde_json::to_vec(&json!({
+            "path": "/tmp/too-large",
+            "data_b64": BASE64.encode(&payload),
+        }))
+        .expect("oversized write request");
+        assert!(oversized.len() <= EXTENDED_BODY_LIMIT);
+        let (status, error) = handled_json(&state, Method::POST, &path, oversized).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error["status"], 413);
+    }
+
+    #[tokio::test]
+    async fn write_route_reports_unknown_after_delivery_failure() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("instance id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        state
+            .manager
+            .backend_owner(uuid)
+            .expect("mock owner")
+            .kill()
+            .await
+            .expect("stop mock guest");
+
+        let socket = temp.path().join("uncertain.uds");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind guest endpoint");
+        state
+            .manager
+            .insert_backend_owner(
+                uuid,
+                Arc::new(StalledGuestOwner {
+                    instance_id: uuid,
+                    socket,
+                    kill_count: Arc::new(AtomicUsize::new(0)),
+                    killed: AtomicBool::new(false),
+                }),
+            )
+            .expect("replace backend owner");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept guest request");
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut connect = String::new();
+            reader.read_line(&mut connect).await.expect("read connect");
+            assert_eq!(connect, "CONNECT 5000\n");
+            reader
+                .get_mut()
+                .write_all(b"OK 5000\n")
+                .await
+                .expect("write handshake");
+            let mut request = String::new();
+            reader
+                .read_line(&mut request)
+                .await
+                .expect("read guest request");
+            let request: serde_json::Value =
+                serde_json::from_str(&request).expect("parse guest request");
+            assert_eq!(request["op"], "write");
+        });
+
+        let body = serde_json::to_vec(&json!({
+            "path": "/tmp/value",
+            "data_b64": BASE64.encode(b"value"),
+        }))
+        .expect("write request");
+        let (status, error) = handled_json(
+            &state,
+            Method::POST,
+            &format!("/v1/sandboxes/{id}/write"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(error["code"], "guest_outcome_unknown");
+        server.await.expect("guest server");
+    }
+
+    #[tokio::test]
+    async fn unknown_guest_outcome_has_stable_api_code() {
+        let response = error_response(&BlazeDaemonError::Guest(
+            crate::guest::GuestError::OutcomeUnknown("response lost".into()),
+        ));
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(value["code"], "guest_outcome_unknown");
+        assert_eq!(value["status"], 504);
+
+        let response = error_response(&BlazeDaemonError::Guest(
+            crate::guest::GuestError::ResponseTooLarge {
+                actual: 5,
+                limit: 4,
+            },
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(value["code"], "guest_response_too_large");
+
+        let response = error_response(&BlazeDaemonError::Guest(crate::guest::GuestError::Timeout(
+            "connect stalled".into(),
+        )));
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(value["code"], "guest_timeout");
+    }
+
+    #[tokio::test]
     async fn create_publishes_ownership_before_provider_acquire() {
         let temp = tempfile::tempdir().expect("temp");
         let config = test_config(&temp);
@@ -1970,6 +2980,146 @@ mod tests {
         );
         assert!(state.manager.backend_owner(id).is_none());
         assert!(!instances_dir.join(id.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_readiness_and_completes_create_compensation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let instances_dir = config.storage.instances_dir.clone();
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            instances_dir.clone(),
+        ));
+        let spawned = Arc::new(tokio::sync::Notify::new());
+        let kill_count = Arc::new(AtomicUsize::new(0));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(
+                BackendKind::Mock,
+                Arc::new(StalledGuestSpawner {
+                    spawned: spawned.clone(),
+                    kill_count: kill_count.clone(),
+                }),
+            ),
+            BackendKind::Mock,
+            storage,
+        );
+        let create_state = state.clone();
+        let create =
+            tokio::spawn(async move { create_instance(&create_state, &test_request()).await });
+        tokio::time::timeout(Duration::from_secs(1), spawned.notified())
+            .await
+            .expect("backend started");
+
+        state.manager.begin_shutdown();
+        let error = tokio::time::timeout(Duration::from_secs(1), create)
+            .await
+            .expect("create cancellation")
+            .expect("create task")
+            .expect_err("readiness must be cancelled");
+        assert!(matches!(
+            error,
+            BlazeDaemonError::Guest(crate::guest::GuestError::Cancelled)
+        ));
+
+        let instance = state
+            .manager
+            .list()
+            .expect("instances")
+            .into_iter()
+            .next()
+            .expect("cancelled create record");
+        assert_eq!(instance.state, SandboxState::Destroyed);
+        assert!(instance.operation.is_none());
+        assert_eq!(instance.backend_ownership, BackendOwnership::Stopped);
+        assert!(state.manager.backend_owner(instance.id).is_none());
+        assert_eq!(kill_count.load(Ordering::Acquire), 1);
+        assert!(!instances_dir.join(instance.id.to_string()).exists());
+        shutdown_instances(&state, Duration::from_millis(100))
+            .await
+            .expect("no ownership remains");
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_joins_an_active_pool_worker_before_returning() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut config = test_config(&temp);
+        config.storage.pool_size = 1;
+        config.storage.prefork = false;
+        std::fs::create_dir_all(config.daemon.state_dir.join("runtime-pool"))
+            .expect("runtime pool root");
+        let release_started = Arc::new(AtomicUsize::new(0));
+        let release_active = Arc::new(AtomicUsize::new(0));
+        let release_completed = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(PoolWorkerReleaseStorage {
+            inner: FileStorageProvider::with_images(
+                config.storage.images_dir.clone(),
+                config.storage.instances_dir.clone(),
+            ),
+            acquire_count: AtomicUsize::new(0),
+            residual_attempt: 1,
+            delayed_id: Mutex::new(None),
+            release_started: release_started.clone(),
+            release_active: release_active.clone(),
+            release_completed: release_completed.clone(),
+            release_delay: Duration::from_secs(1),
+        });
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, true),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        state
+            .manager
+            .configure_runtime_pool_for_test(PoolPrototype {
+                image_digest: "sha256:pool-shutdown".to_string(),
+                policy_name: "pool-shutdown".to_string(),
+                workload_class: WorkloadClass::AgentTool,
+                templates: Vec::new(),
+                kernel_hooks: Vec::new(),
+                binary_path: PathBuf::from("/unused"),
+                runtime_backend: BackendKind::Mock,
+                backend: BackendConfigs::default(),
+                vm: None,
+                warm_ttl: Duration::from_secs(60),
+            })
+            .expect("configure runtime pool");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while release_active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pool worker starts delayed cleanup");
+
+        let error = shutdown_instances(&state, Duration::from_millis(40))
+            .await
+            .expect_err("pool cleanup exceeds the shared budget");
+
+        assert!(error.to_string().contains("runtime-pool"));
+        assert_eq!(release_started.load(Ordering::Acquire), 1);
+        assert_eq!(release_completed.load(Ordering::Acquire), 0);
+        assert_eq!(
+            release_active.load(Ordering::Acquire),
+            0,
+            "shutdown returned while the pool worker was still running"
+        );
+        assert!(!state.manager.runtime_pool_has_tracked_worker());
+        let status = state.manager.runtime_pool_status();
+        assert_eq!(status.cleanup_pending, 0);
+        assert_eq!(status.quarantined, 1);
+
+        state
+            .manager
+            .shutdown_runtime_pool_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("retry releases the retained pool owner");
+        assert_eq!(release_completed.load(Ordering::Acquire), 1);
+        assert_eq!(state.manager.runtime_pool_status().quarantined, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2438,6 +3588,37 @@ mod tests {
     #[tokio::test]
     async fn warm_final_commit_failure_restores_the_claim() {
         assert_warm_state_commit_failure_restores_claim("warm-final-state-commit").await;
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn guest_readiness_failure_compensates_owned_resources() {
+        let request = test_request();
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let hook = crate::failpoint::TestFailpoint::new(&["create-guest-ready"]);
+
+        hook.run(create_instance(&state, &request))
+            .await
+            .expect_err("guest readiness failure");
+
+        let instance = state
+            .instances
+            .lock()
+            .expect("instances")
+            .values()
+            .next()
+            .cloned()
+            .expect("destroyed create");
+        assert_eq!(instance.state, SandboxState::Destroyed);
+        assert!(state.manager.backend_owner(instance.id).is_none());
+        assert!(
+            !temp
+                .path()
+                .join("instances")
+                .join(instance.id.to_string())
+                .exists()
+        );
     }
 
     #[cfg(feature = "test-failpoints")]

@@ -15,21 +15,49 @@ Designed as the per-host agent for E2B-style orchestrator platforms.
 - **Policy-driven backend selection** — workload class → backend priority list
 - **Lifecycle state machine** — 9 states: Pending, Creating, Running, Paused,
   Checkpointed, RecoveryRequired, Reset, Warm, and Destroyed
-- **Warm pool management** — pre-warmed instances with TTL-based GC
+- **Guest operations** — bounded command execution and file transfer for
+  running backends that expose a guest endpoint
+- **Runtime slot capacity** — independent storage slots with optional backend
+  prefork and TTL-based cleanup
 - **Template registry** — in-memory template tracking with idle eviction
 - **Kernel hook registry** — state tracking for pre/post hooks
 - **Prometheus metrics** — request counts, instance gauges, pool sizes
 - **Spawners** — FirecrackerSpawner, BubblewrapSpawner, MockSpawner
 - **Optional VM networking** — isolated namespace, tap, veth, and NAT per Firecracker VM
 
+## Installation
+
+Blaze is a Labs component. This source tree contains its ANOLISA component
+manifest and RPM packaging, but not every configured component repository
+publishes a `blaze` candidate. Preview repository resolution before applying
+the system installation:
+
+```bash
+sudo anolisa --install-mode system --dry-run install blaze
+sudo anolisa --install-mode system install blaze
+```
+
+On an RPM repository that publishes Blaze:
+
+```bash
+sudo yum install blaze
+```
+
+For a developer source build:
+
+```bash
+cd src/blaze
+cargo build --release --locked
+```
+
 ## Quick Start
 
 ```bash
-# Build
-cd src/blaze
-cargo build --release
+# Choose one startup method; do not run both at the same time.
+# Packaged installation
+sudo systemctl enable --now blazed
 
-# Run daemon (dev: override policy.dir to use local examples)
+# Source build alternative (override policy.dir to use local examples)
 sudo ./target/release/blazed daemon start --config examples/config.toml
 # Note: the default config sets policy.dir = /etc/anolisa/blaze/policies.
 # For source-checkout testing, create a symlink or override:
@@ -42,8 +70,12 @@ curl --unix-socket /run/blaze/api.sock http://localhost/v1/health
 # Create a sandbox
 curl -X POST --unix-socket /run/blaze/api.sock http://localhost/v1/sandboxes \
   -H 'Content-Type: application/json' \
-  -d '{"workload_class":"agent-rl","image_digest":"sha256:..."}'
+  -d '{"workload_class":"agent-tool","image_digest":"sha256:..."}'
 ```
+
+The quick-start request uses an example policy with Firecracker guest transport
+disabled, so an image without the compatible guest agent does not wait for guest
+readiness. Enable the transport only for images that run that agent.
 
 ## Configuration
 
@@ -71,6 +103,18 @@ byte count:
 [api]
 max_body_bytes = 1048576
 ```
+
+Guest files are limited to 16 MiB after base64 decoding. A full-size write is
+larger on the wire because JSON and base64 add overhead, so the default 1 MiB
+request limit intentionally rejects it. Set at least 22 MiB when callers need
+the full decoded limit:
+
+```toml
+[api]
+max_body_bytes = 23068672
+```
+
+The daemon checks both the HTTP request size and the decoded file size.
 
 ### VM Resource Configuration
 
@@ -114,12 +158,33 @@ provider = "file"       # Storage provider selection. Currently supported: "file
                         # "auto" probes available providers in priority order (currently equivalent to "file").
                         # Other values will log a warning and fall back to file.
 images_dir = "/var/lib/blaze/images"
-# pool_size = 0           # [Reserved] Warm pool slots (not yet active)
-# prefork = false         # [Reserved] Pre-start VMs in pool (not yet active)
+pool_size = 0            # Background runtime slots; zero disables construction
+prefork = false          # Start the backend before a slot becomes ready
 # flush_interval = "30s"  # [Reserved] Dirty data flush period (not yet active)
+
+[pool]
+default_warm_ttl = "30m" # Used when an eligible policy omits warm_ttl
+gc_interval = "5m"       # Expiry and capacity maintenance interval
 ```
 
 The `file` provider uses standard filesystem operations for sandbox storage. The `auto` provider probes available backends in priority order (currently equivalent to `file`). Unrecognized values will log a warning and fall back to `file`.
+
+When `pool_size` is non-zero, the first eligible create request fixes one
+compatible build shape and starts background construction. Every slot owns
+storage; a slot owns a running backend only when `prefork` is enabled.
+`pool_size` limits pool-owned and in-flight slots, not sandboxes that have
+already completed lifecycle handoff. Incompatible requests continue through
+the existing create flow. A policy is eligible only when its `[pool]` section
+sets `enabled = true`; its optional `warm_ttl` overrides `default_warm_ttl`.
+
+On restart, the daemon cleans unclaimed slot journals before serving requests;
+it does not restore old slots to the ready queue. That cleanup uses the
+currently configured provider and storage/runtime roots, so those settings
+must continue to identify the same owned directories across a restart. The
+`/v1/pools` endpoints below expose a separate lifecycle recycling-pool
+contract and do not expose this background runtime capacity. Public reset
+currently returns `501`, so no production path returns a used sandbox to that
+pool.
 
 ## API Endpoints
 
@@ -130,17 +195,23 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | POST | `/v1/sandboxes` | Create a sandbox |
 | GET | `/v1/sandboxes/{id}` | Get sandbox details |
 | DELETE | `/v1/sandboxes/{id}` | Destroy a sandbox |
+| POST | `/v1/sandboxes/{id}/exec` | Execute a guest command |
+| POST | `/v1/sandboxes/{id}/read` | Read a guest file |
+| POST | `/v1/sandboxes/{id}/write` | Replace a guest file |
 | GET | `/v1/instances` | Alias for listing sandboxes |
 | POST | `/v1/instances` | Alias for creating a sandbox |
 | GET | `/v1/instances/{id}` | Alias for sandbox details |
 | DELETE | `/v1/instances/{id}` | Alias for destroying a sandbox |
 | POST | `/v1/instances/{id}/destroy` | Compatible destroy action |
+| POST | `/v1/instances/{id}/exec` | Compatible guest command action |
+| POST | `/v1/instances/{id}/read` | Compatible guest file read action |
+| POST | `/v1/instances/{id}/write` | Compatible guest file write action |
 | POST | `/v1/instances/{id}/checkpoint` | Reserved; returns `501` until backend and storage capture is implemented |
 | POST | `/v1/instances/{id}/reset` | Reserved; returns `501` until runtime reset is implemented |
-| GET | `/v1/pools` | List warm pools |
-| GET | `/v1/pools/{backend}/{class}` | Get pool status |
-| POST | `/v1/pools/{backend}/{class}/drain` | Drain a pool |
-| PUT | `/v1/pools/{backend}/{class}/sizing` | Resize a pool |
+| GET | `/v1/pools` | List lifecycle recycling pools |
+| GET | `/v1/pools/{backend}/{class}` | Get lifecycle recycling-pool status |
+| POST | `/v1/pools/{backend}/{class}/drain` | Drain a lifecycle recycling pool |
+| PUT | `/v1/pools/{backend}/{class}/sizing` | Resize a lifecycle recycling pool |
 | GET | `/v1/templates` | List templates |
 | GET | `/v1/templates/{id}` | Inspect a template |
 | POST | `/v1/templates/gc` | Trigger template GC |
@@ -156,9 +227,11 @@ resources. A successful create finishes in `Running`; a successful destroy
 finishes in `Destroyed`. If compensation cannot release every owned resource,
 the sandbox remains visible as `RecoveryRequired` so destroy can be retried.
 
-At startup, the daemon reconciles each non-terminal sandbox independently.
-Failure to clean up one sandbox does not prevent the remaining records from
-being processed or the API from starting.
+Runtime-slot reconciliation completes before this lifecycle pass. An
+inventory, journal, or runtime cleanup error stops startup. After it succeeds,
+the daemon reconciles each non-terminal sandbox independently. Failure to
+clean up one sandbox does not prevent the remaining records from being
+processed or the API from starting.
 
 During graceful shutdown, the daemon first stops accepting work and drains
 accepted connections. It then attempts bounded cleanup for every persisted
@@ -173,9 +246,55 @@ sandbox is running with no active lifecycle operation, then return `501`
 without changing runtime or persisted state. Their backend and storage
 operations are not implemented here.
 
+### Guest operations
+
+Guest operations are available only while a sandbox is `Running` and its
+backend reports a guest endpoint. A cold create that reports such an endpoint
+waits for the guest agent to answer before publishing `Running`. Backends with
+guest support disabled skip that wait, and later guest-operation requests
+return HTTP 409. A prefork runtime waits for guest readiness before its slot
+becomes ready when the backend exposes a guest endpoint. Claim checks backend
+liveness without repeating guest readiness. A storage-only slot waits after it
+starts its backend.
+
+Guest operations and lifecycle changes use the same per-sandbox operation
+lock. A request may wait for an earlier lifecycle action. After it obtains the
+lock, the manager checks `Running` again; if destroy or another state change
+won the race, the guest request fails without contacting the old runtime.
+
+The endpoints accept JSON:
+
+```json
+{"cmd":"uname -a","cwd":"/","env":{"LANG":"C"},"timeout":10}
+```
+
+```json
+{"path":"/tmp/input","data_b64":"aGVsbG8="}
+```
+
+`read` takes only `path`; successful file reads and command output use standard
+base64 in the response. Exec timeouts must be from 1 through 20 seconds. Guest
+files are limited to 16 MiB after decoding, and response frames are bounded.
+
+An exec or write failure before request delivery is an ordinary transport
+failure. A bounded wait that expires before delivery uses
+`"code": "guest_timeout"`. If delivery began but the daemon cannot determine
+the result, the API returns HTTP 504 with
+`"code": "guest_outcome_unknown"`; callers must reconcile state instead of
+automatically replaying the operation. Reads do not change guest state and
+remain safe for caller-directed retry. An oversized read response returns
+HTTP 502 with `"code": "guest_response_too_large"`. For exec or write after
+delivery starts, an oversized or otherwise untrusted response instead leaves
+the outcome unknown. An oversized caller request returns HTTP 413.
+
+Each request is fully buffered. The limits bound one request, not the sum of
+concurrent requests, so callers should also bound guest-operation concurrency.
+Streaming files, interactive terminals, and session reuse are not supported.
+
 #### Health Check
 
-`GET /v1/health` returns daemon status including storage pool readiness:
+`GET /v1/health` returns daemon status including provider storage-pool
+readiness:
 
 ```json
 {
@@ -185,6 +304,13 @@ operations are not implemented here.
 }
 ```
 
+The `storage_pool` object does not report background runtime-slot capacity.
+
+## Documentation
+
+- [Runtime slot user guide](../../docs/user-guide/en/runtime/blaze/QUICKSTART.md)
+- [Runtime slot ownership design](docs/design/runtime-slot-ownership.md)
+
 ## Project Layout
 
 ```
@@ -192,6 +318,7 @@ src/blaze/
 ├── crates/
 │   ├── blaze-core/   # Library: policy, lifecycle, pool, template, kernel, config
 │   └── blazed/       # Binary: daemon, API server, spawners, metrics
+├── docs/design/       # Component design documents
 ├── examples/         # config.toml, policies/
 ├── dist/             # blazed.service, blaze.spec, tmpfiles
 └── manifests/        # Component metadata

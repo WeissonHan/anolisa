@@ -137,6 +137,7 @@ impl FirecrackerSpawner {
                             ),
                             Some(network),
                             self.network.clone(),
+                            fc_config.enable_vsock,
                         ));
                         return Err(SpawnFailure::compensate_started(source, owner).await);
                     }
@@ -153,6 +154,7 @@ impl FirecrackerSpawner {
                             ),
                             None,
                             self.network.clone(),
+                            fc_config.enable_vsock,
                         ));
                         return Err(SpawnFailure::compensate_started(
                             BlazeError::BackendError {
@@ -177,6 +179,7 @@ impl FirecrackerSpawner {
                             ),
                             None,
                             self.network.clone(),
+                            fc_config.enable_vsock,
                         ));
                         return Err(SpawnFailure::compensate_started(
                             BlazeError::BackendError {
@@ -216,6 +219,7 @@ impl FirecrackerSpawner {
                             network_file,
                         ),
                         network,
+                        fc_config.enable_vsock,
                         error,
                     )
                     .await);
@@ -234,6 +238,7 @@ impl FirecrackerSpawner {
                         network_file,
                     ),
                     network,
+                    fc_config.enable_vsock,
                     error,
                 )
                 .await);
@@ -254,6 +259,7 @@ impl FirecrackerSpawner {
                         network_file,
                     ),
                     network,
+                    fc_config.enable_vsock,
                     error,
                 )
                 .await);
@@ -272,6 +278,7 @@ impl FirecrackerSpawner {
                             network_file,
                         ),
                         network,
+                        fc_config.enable_vsock,
                         error,
                     )
                     .await);
@@ -293,6 +300,7 @@ impl FirecrackerSpawner {
                             network_file,
                         ),
                         network,
+                        fc_config.enable_vsock,
                         source.into(),
                     )
                     .await);
@@ -311,6 +319,7 @@ impl FirecrackerSpawner {
                 ),
                 network,
                 self.network.clone(),
+                fc_config.enable_vsock,
             ));
             return Err(SpawnFailure::compensate_started(error, owner).await);
         }
@@ -327,6 +336,7 @@ impl FirecrackerSpawner {
             ),
             network,
             self.network.clone(),
+            fc_config.enable_vsock,
         );
         Ok(Arc::new(instance))
     }
@@ -336,6 +346,7 @@ impl FirecrackerSpawner {
         instance_id: Uuid,
         files: FirecrackerRuntimeFiles,
         network: Option<NetworkSlot>,
+        enable_vsock: bool,
         source: BlazeError,
     ) -> SpawnFailure {
         if network.is_none() {
@@ -347,6 +358,7 @@ impl FirecrackerSpawner {
             files,
             network,
             self.network.clone(),
+            enable_vsock,
         ));
         SpawnFailure::compensate_started(source, owner).await
     }
@@ -395,6 +407,7 @@ struct FirecrackerInstance {
     child: Mutex<Option<Child>>,
     exit_result: Mutex<Option<SpawnResult>>,
     files: FirecrackerRuntimeFiles,
+    guest_socket: PathBuf,
     network: Mutex<Option<NetworkSlot>>,
     network_manager: Arc<NetworkManager>,
     cleanup_complete: AtomicBool,
@@ -432,12 +445,15 @@ impl FirecrackerInstance {
         files: FirecrackerRuntimeFiles,
         network: Option<NetworkSlot>,
         network_manager: Arc<NetworkManager>,
+        enable_vsock: bool,
     ) -> Self {
+        let guest_socket = configured_guest_socket(enable_vsock, files.guest_socket.clone());
         Self {
             instance_id,
             child: Mutex::new(child),
             exit_result: Mutex::new(None),
             files,
+            guest_socket,
             network: Mutex::new(network),
             network_manager,
             cleanup_complete: AtomicBool::new(false),
@@ -450,6 +466,10 @@ impl FirecrackerInstance {
 impl BackendInstance for FirecrackerInstance {
     fn backend(&self) -> BackendKind {
         BackendKind::Firecracker
+    }
+
+    fn guest_socket_path(&self) -> &Path {
+        &self.guest_socket
     }
 
     async fn try_wait(&self) -> Result<Option<SpawnResult>> {
@@ -745,6 +765,9 @@ async fn wait_for_socket(socket: &Path, child: &mut Child, timeout: Duration) ->
 }
 
 async fn remove_if_exists(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -801,6 +824,10 @@ fn read_network_metadata(path: &Path) -> Result<(NetworkSlot, NetworkProcessStat
 
 fn network_metadata_temp(path: &Path) -> PathBuf {
     path.with_extension("json.tmp")
+}
+
+fn configured_guest_socket(enable_vsock: bool, socket: PathBuf) -> PathBuf {
+    if enable_vsock { socket } else { PathBuf::new() }
 }
 
 fn validate_regular_file(path: &Path, label: &str) -> Result<()> {
@@ -1152,6 +1179,7 @@ mod tests {
             ),
             Some(slot.clone()),
             network_manager,
+            false,
         ));
 
         owner.kill().await.expect_err("first cleanup must fail");
@@ -1203,6 +1231,7 @@ mod tests {
             ),
             Some(slot.clone()),
             Arc::new(NetworkManager::with_runner(runner.clone())),
+            false,
         );
 
         let first_error = loop {
@@ -1513,6 +1542,55 @@ mod tests {
     }
 
     #[test]
+    fn vm_config_and_reported_guest_transport_agree() {
+        let temp = tempfile::tempdir().expect("temp");
+        let request = spawn_request(temp.path());
+        let socket = temp.path().join("vsock.uds");
+        let disabled = FirecrackerConfig::default();
+        let disabled_path = write_vm_config(
+            &temp.path().join("images"),
+            &request,
+            &disabled,
+            &socket,
+            None,
+        )
+        .expect("disabled config");
+        let disabled_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(disabled_path).expect("read disabled config"))
+                .expect("parse disabled config");
+        assert!(disabled_value.get("vsock").is_none());
+        assert!(
+            configured_guest_socket(disabled.enable_vsock, socket.clone())
+                .as_os_str()
+                .is_empty()
+        );
+
+        let enabled = FirecrackerConfig {
+            enable_vsock: true,
+            ..FirecrackerConfig::default()
+        };
+        let enabled_path = write_vm_config(
+            &temp.path().join("images"),
+            &request,
+            &enabled,
+            &socket,
+            None,
+        )
+        .expect("enabled config");
+        let enabled_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(enabled_path).expect("read enabled config"))
+                .expect("parse enabled config");
+        assert_eq!(
+            enabled_value["vsock"]["uds_path"],
+            path_string(&socket, "socket").unwrap()
+        );
+        assert_eq!(
+            configured_guest_socket(enabled.enable_vsock, socket.clone()),
+            socket
+        );
+    }
+
+    #[test]
     fn serial_log_rotates_before_reuse() {
         let temp = tempfile::tempdir().expect("temp");
         let log = temp.path().join("serial.log");
@@ -1593,6 +1671,7 @@ mod tests {
             ),
             None,
             Arc::new(NetworkManager::default()),
+            true,
         ));
         let failure = SpawnFailure::compensate_started(
             BlazeError::BackendError {

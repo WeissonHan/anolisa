@@ -93,6 +93,20 @@ pub enum StartPath {
     Warm,
 }
 
+/// Canonical directory family that owns backend runtime artifacts.
+///
+/// This is independent from [`StartPath`]: a sandbox can be activated through
+/// a warm lifecycle transition while retaining its original sandbox directory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeLocation {
+    /// Runtime artifacts live under the sandbox's lifecycle state directory.
+    #[default]
+    Sandbox,
+    /// Runtime artifacts live under the daemon's warm-slot directory.
+    WarmPool,
+}
+
 /// Durable knowledge about whether a backend may still own a live process.
 ///
 /// `Unknown` is the safe default for state written by older daemon versions.
@@ -119,6 +133,12 @@ pub struct SandboxInstance {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub policy_name: String,
+    /// Canonical directory family containing backend runtime artifacts.
+    #[serde(default)]
+    pub runtime_location: RuntimeLocation,
+    /// Stable nonce that links a claimed warm runtime to its slot journal.
+    #[serde(default)]
+    pub runtime_owner_token: Option<Uuid>,
     /// Last durably known backend ownership state.
     #[serde(default)]
     pub backend_ownership: BackendOwnership,
@@ -149,9 +169,48 @@ impl SandboxInstance {
             created_at: now,
             updated_at: now,
             policy_name,
+            runtime_location: RuntimeLocation::Sandbox,
+            runtime_owner_token: None,
             backend_ownership: BackendOwnership::NotStarted,
             operation: None,
         }
+    }
+
+    /// Adopt a ready runtime slot into a recoverable create operation.
+    pub fn new_warm_claim(
+        id: Uuid,
+        backend: BackendKind,
+        workload_class: WorkloadClass,
+        image_digest: String,
+        policy_name: String,
+        backend_ownership: BackendOwnership,
+        runtime_owner_token: Uuid,
+    ) -> Result<Self> {
+        if !matches!(
+            backend_ownership,
+            BackendOwnership::NotStarted | BackendOwnership::Running
+        ) {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "ready runtime slot {id} has invalid backend ownership {backend_ownership:?}"
+                ),
+            });
+        }
+        let mut instance = Self::new(
+            backend,
+            workload_class,
+            image_digest,
+            StartPath::Warm,
+            policy_name,
+        );
+        instance.id = id;
+        instance.state = SandboxState::Warm;
+        instance.runtime_location = RuntimeLocation::WarmPool;
+        instance.runtime_owner_token = Some(runtime_owner_token);
+        instance.backend_ownership = backend_ownership;
+        instance.begin_operation(OperationKind::Create)?;
+        instance.transition(SandboxState::Creating)?;
+        Ok(instance)
     }
 
     /// Record a new operation before starting its first owned-resource
@@ -191,6 +250,16 @@ impl SandboxInstance {
     pub fn finish_operation(&mut self) {
         self.operation = None;
         self.updated_at = Utc::now();
+    }
+
+    /// Return whether lifecycle metadata proves that no runtime owner remains.
+    pub fn is_clean_terminal(&self) -> bool {
+        self.state == SandboxState::Destroyed
+            && self.operation.is_none()
+            && matches!(
+                self.backend_ownership,
+                BackendOwnership::NotStarted | BackendOwnership::Stopped
+            )
     }
 
     /// Apply a state transition. Returns
@@ -395,6 +464,39 @@ mod tests {
     }
 
     #[test]
+    fn clean_terminal_requires_safe_ownership_and_no_operation() {
+        let mut destroyed = fresh();
+        destroyed
+            .transition(SandboxState::Destroyed)
+            .expect("destroyed");
+        for ownership in [BackendOwnership::NotStarted, BackendOwnership::Stopped] {
+            destroyed.backend_ownership = ownership;
+            assert!(destroyed.is_clean_terminal());
+        }
+
+        destroyed.backend_ownership = BackendOwnership::Running;
+        assert!(!destroyed.is_clean_terminal());
+
+        let mut unfinished = fresh();
+        unfinished
+            .begin_operation(OperationKind::Create)
+            .expect("begin create");
+        unfinished
+            .transition(SandboxState::Destroyed)
+            .expect("destroyed");
+        unfinished.backend_ownership = BackendOwnership::Stopped;
+        assert!(!unfinished.is_clean_terminal());
+
+        let mut running = fresh();
+        running
+            .transition(SandboxState::Creating)
+            .expect("creating");
+        running.transition(SandboxState::Running).expect("running");
+        running.backend_ownership = BackendOwnership::Stopped;
+        assert!(!running.is_clean_terminal());
+    }
+
+    #[test]
     fn recovery_required_can_finish_but_cannot_be_reentered() {
         let mut inst = fresh();
         inst.transition(SandboxState::Creating).expect("creating");
@@ -577,6 +679,84 @@ mod tests {
         let loaded: SandboxInstance = serde_json::from_value(value).expect("legacy state");
         assert!(loaded.operation.is_none());
         assert_eq!(loaded.backend_ownership, BackendOwnership::Unknown);
+        assert_eq!(loaded.runtime_location, RuntimeLocation::Sandbox);
+        assert!(loaded.runtime_owner_token.is_none());
+    }
+
+    #[test]
+    fn warm_start_classification_does_not_move_runtime_artifacts() {
+        let mut instance = fresh();
+        instance
+            .transition(SandboxState::Creating)
+            .expect("creating");
+        instance.transition(SandboxState::Running).expect("running");
+        instance.transition(SandboxState::Reset).expect("reset");
+        instance.transition(SandboxState::Warm).expect("warm");
+        instance
+            .transition(SandboxState::Creating)
+            .expect("warm creating");
+
+        assert_eq!(instance.start_path, StartPath::Warm);
+        assert_eq!(instance.runtime_location, RuntimeLocation::Sandbox);
+    }
+
+    #[test]
+    fn runtime_location_round_trips() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut instance = fresh();
+        let owner_token = Uuid::new_v4();
+        instance.runtime_location = RuntimeLocation::WarmPool;
+        instance.runtime_owner_token = Some(owner_token);
+        instance.persist(tmp.path()).expect("persist");
+
+        let loaded = SandboxInstance::load(tmp.path(), instance.id).expect("load");
+
+        assert_eq!(loaded.runtime_location, RuntimeLocation::WarmPool);
+        assert_eq!(loaded.runtime_owner_token, Some(owner_token));
+    }
+
+    #[test]
+    fn warm_claim_starts_one_durable_create_operation() {
+        let id = Uuid::new_v4();
+        let owner_token = Uuid::new_v4();
+
+        let instance = SandboxInstance::new_warm_claim(
+            id,
+            BackendKind::Mock,
+            WorkloadClass::AgentTool,
+            "sha256:warm".into(),
+            "warm-policy".into(),
+            BackendOwnership::Running,
+            owner_token,
+        )
+        .expect("warm claim");
+
+        assert_eq!(instance.id, id);
+        assert_eq!(instance.state, SandboxState::Creating);
+        assert_eq!(instance.start_path, StartPath::Warm);
+        assert_eq!(instance.runtime_location, RuntimeLocation::WarmPool);
+        assert_eq!(instance.runtime_owner_token, Some(owner_token));
+        assert_eq!(instance.backend_ownership, BackendOwnership::Running);
+        assert_eq!(
+            instance.operation.as_ref().map(|operation| operation.kind),
+            Some(OperationKind::Create)
+        );
+    }
+
+    #[test]
+    fn warm_claim_rejects_an_unstable_backend_owner() {
+        let error = SandboxInstance::new_warm_claim(
+            Uuid::new_v4(),
+            BackendKind::Mock,
+            WorkloadClass::AgentTool,
+            "sha256:warm".into(),
+            "warm-policy".into(),
+            BackendOwnership::Starting,
+            Uuid::new_v4(),
+        )
+        .expect_err("starting backend cannot be claimed");
+
+        assert!(matches!(error, BlazeError::BackendError { .. }));
     }
 
     #[test]

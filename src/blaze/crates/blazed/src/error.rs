@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Local errors for the blazed binary (daemon + CLI client).
+//! Local errors for the daemon binary and HTTP API.
 //!
 //! Wraps [`blaze_core::BlazeError`] so the daemon can additionally
 //! surface I/O, hyper, and CLI-side failures without expanding the
@@ -15,6 +15,9 @@ pub type Result<T> = std::result::Result<T, BlazeDaemonError>;
 pub enum BlazeDaemonError {
     #[error("core error: {0}")]
     Core(#[from] blaze_core::BlazeError),
+
+    #[error(transparent)]
+    Guest(#[from] crate::guest::GuestError),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -94,6 +97,37 @@ pub enum BlazeDaemonError {
 }
 
 impl BlazeDaemonError {
+    /// Stable machine-readable code for errors that callers must branch on.
+    pub fn api_code(&self) -> Option<&'static str> {
+        match self {
+            BlazeDaemonError::Guest(crate::guest::GuestError::Io(_)) => {
+                Some("guest_transport_error")
+            }
+            BlazeDaemonError::Guest(crate::guest::GuestError::Json(_))
+            | BlazeDaemonError::Guest(crate::guest::GuestError::Protocol(_)) => {
+                Some("guest_response_invalid")
+            }
+            BlazeDaemonError::Guest(crate::guest::GuestError::InvalidArgument(_)) => {
+                Some("guest_invalid_request")
+            }
+            BlazeDaemonError::Guest(crate::guest::GuestError::Timeout(_)) => Some("guest_timeout"),
+            BlazeDaemonError::Guest(crate::guest::GuestError::OutcomeUnknown(_)) => {
+                Some("guest_outcome_unknown")
+            }
+            BlazeDaemonError::Guest(crate::guest::GuestError::Rejected(_)) => {
+                Some("guest_rejected")
+            }
+            BlazeDaemonError::Guest(crate::guest::GuestError::PayloadTooLarge { .. }) => {
+                Some("guest_request_too_large")
+            }
+            BlazeDaemonError::Guest(crate::guest::GuestError::ResponseTooLarge { .. }) => {
+                Some("guest_response_too_large")
+            }
+            BlazeDaemonError::Guest(crate::guest::GuestError::Cancelled) => Some("guest_cancelled"),
+            _ => None,
+        }
+    }
+
     /// HTTP status code that should accompany this error in API responses.
     pub fn status_code(&self) -> u16 {
         match self {
@@ -108,6 +142,12 @@ impl BlazeDaemonError {
             | BlazeDaemonError::Core(blaze_core::BlazeError::InvalidStateTransition { .. }) => 422,
             BlazeDaemonError::Core(blaze_core::BlazeError::OperationInProgress { .. }) => 409,
             BlazeDaemonError::Core(blaze_core::BlazeError::BackendUnavailable { .. }) => 503,
+            BlazeDaemonError::Guest(crate::guest::GuestError::InvalidArgument(_)) => 400,
+            BlazeDaemonError::Guest(crate::guest::GuestError::Timeout(_)) => 504,
+            BlazeDaemonError::Guest(crate::guest::GuestError::OutcomeUnknown(_)) => 504,
+            BlazeDaemonError::Guest(crate::guest::GuestError::PayloadTooLarge { .. }) => 413,
+            BlazeDaemonError::Guest(crate::guest::GuestError::Cancelled) => 503,
+            BlazeDaemonError::Guest(_) => 502,
             _ => 500,
         }
     }

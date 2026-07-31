@@ -2,26 +2,36 @@
 //! Recoverable sandbox create, warm activation, destroy, and startup cleanup.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use blaze_core::BlazeError;
 use blaze_core::backend::{BackendKind, SpawnRequest};
 use blaze_core::lifecycle::{
-    BackendOwnership, OperationKind, SandboxInstance, SandboxState, StartPath,
+    BackendOwnership, OperationKind, RuntimeLocation, SandboxInstance, SandboxState, StartPath,
 };
-use blaze_core::policy::RuntimeDecision;
+use blaze_core::policy::{RuntimeDecision, parse_duration};
 use blaze_core::pool::{PoolKey, PoolManager};
 use blaze_core::storage::{AcquireOpts, StorageProvider, StorageSlot};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
+use crate::guest::{GuestClient, GuestExecResult, MAX_GUEST_FILE_BYTES};
 use crate::metrics::Metrics;
+#[cfg(test)]
+use crate::runtime_pool::RuntimePoolStatus;
+use crate::runtime_pool::{
+    DurableRuntimeOwner, PoolPrototype, RuntimePoolLease, RuntimeWarmPool, begin_lifecycle_cleanup,
+    reconcile_runtime_slots, remove_lifecycle_tombstone, runtime_dir as derive_runtime_dir,
+    tombstone_lifecycle_slot,
+};
 use crate::spawner::{DynBackendInstance, SpawnerRegistry};
 
 const INSTANCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Inputs already parsed and policy-evaluated by the API.
 #[derive(Debug, Clone)]
@@ -75,6 +85,7 @@ pub struct SandboxManager {
     backend_instances: Arc<Mutex<HashMap<Uuid, DynBackendInstance>>>,
     operation_locks: Mutex<HashMap<Uuid, Weak<AsyncMutex<()>>>>,
     pool: Arc<Mutex<PoolManager>>,
+    runtime_pool: Arc<RuntimeWarmPool>,
     spawners: Arc<SpawnerRegistry>,
     active_backend: BackendKind,
     storage: Arc<dyn StorageProvider>,
@@ -82,6 +93,7 @@ pub struct SandboxManager {
     rootfs_size: u64,
     mem_size: u64,
     metrics: Arc<Metrics>,
+    cancellation: CancellationToken,
 }
 
 /// Construction inputs grouped to keep daemon wiring explicit.
@@ -94,6 +106,10 @@ pub struct SandboxManagerInit {
     pub state_dir: PathBuf,
     pub rootfs_size: u64,
     pub mem_size: u64,
+    pub pool_size: usize,
+    pub prefork: bool,
+    pub default_warm_ttl: String,
+    pub gc_interval: String,
 }
 
 /// Shared read-only resources retained by [`crate::state::ServerState`].
@@ -106,7 +122,7 @@ pub struct SandboxManagerResources {
 
 impl SandboxManager {
     /// Build a manager around state loaded from the durable state directory.
-    pub fn new(init: SandboxManagerInit) -> (Self, SandboxManagerResources) {
+    pub fn new(init: SandboxManagerInit) -> Result<(Self, SandboxManagerResources)> {
         let SandboxManagerInit {
             instances,
             pool,
@@ -116,33 +132,63 @@ impl SandboxManager {
             state_dir,
             rootfs_size,
             mem_size,
+            pool_size,
+            prefork,
+            default_warm_ttl,
+            gc_interval,
         } = init;
         let instances = Arc::new(Mutex::new(instances));
         let backend_instances = Arc::new(Mutex::new(HashMap::new()));
         let pool = Arc::new(Mutex::new(pool));
         let metrics = Arc::new(Metrics::new());
+        let spawners = Arc::new(spawners);
+        let cancellation = CancellationToken::new();
+        let default_warm_ttl = parse_duration(&default_warm_ttl).ok_or_else(|| {
+            BlazeDaemonError::Internal(
+                "pool.default_warm_ttl passed validation but could not be parsed".to_string(),
+            )
+        })?;
+        let gc_interval = parse_duration(&gc_interval).ok_or_else(|| {
+            BlazeDaemonError::Internal(
+                "pool.gc_interval passed validation but could not be parsed".to_string(),
+            )
+        })?;
+        let runtime_pool = RuntimeWarmPool::new(
+            pool_size,
+            prefork,
+            rootfs_size,
+            mem_size,
+            state_dir.join("runtime-pool"),
+            storage.clone(),
+            spawners.clone(),
+            default_warm_ttl,
+            gc_interval,
+            cancellation.clone(),
+        )?;
         let resources = SandboxManagerResources {
             #[cfg(test)]
             instances: instances.clone(),
             pool: pool.clone(),
             metrics: metrics.clone(),
         };
-        (
+        Ok((
             Self {
                 instances,
                 backend_instances,
                 operation_locks: Mutex::new(HashMap::new()),
                 pool,
-                spawners: Arc::new(spawners),
+                runtime_pool,
+                spawners,
                 active_backend,
                 storage,
                 state_dir,
                 rootfs_size,
                 mem_size,
                 metrics,
+                cancellation,
             },
             resources,
-        )
+        ))
     }
 
     /// Return the async operation lock that serializes one sandbox mutation.
@@ -151,6 +197,23 @@ impl SandboxManager {
             Ok(mut locks) => operation_lock(&mut locks, id),
             Err(poisoned) => operation_lock(&mut poisoned.into_inner(), id),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_pool_status(&self) -> RuntimePoolStatus {
+        self.runtime_pool.status()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_pool_has_tracked_worker(&self) -> bool {
+        self.runtime_pool.has_tracked_worker()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_runtime_pool_for_test(&self, prototype: PoolPrototype) -> Result<bool> {
+        self.runtime_pool
+            .configure(prototype)
+            .map_err(BlazeDaemonError::from)
     }
 
     /// Hold the per-sandbox mutation lock after confirming that the persisted
@@ -241,6 +304,40 @@ impl SandboxManager {
         Ok(ids)
     }
 
+    /// Execute one command through the running sandbox guest.
+    pub async fn exec(
+        &self,
+        id: Uuid,
+        command: String,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        timeout_secs: u32,
+    ) -> Result<GuestExecResult> {
+        let _operation = self.lock_quiescent_state(id, SandboxState::Running).await?;
+        self.guest_client(id)?
+            .exec(command, cwd, env, timeout_secs)
+            .await
+            .map_err(BlazeDaemonError::from)
+    }
+
+    /// Read one file through the running sandbox guest.
+    pub async fn read_file(&self, id: Uuid, path: String) -> Result<Vec<u8>> {
+        let _operation = self.lock_quiescent_state(id, SandboxState::Running).await?;
+        self.guest_client(id)?
+            .read_file(path)
+            .await
+            .map_err(BlazeDaemonError::from)
+    }
+
+    /// Replace one file through the running sandbox guest.
+    pub async fn write_file(&self, id: Uuid, path: String, data: &[u8]) -> Result<()> {
+        let _operation = self.lock_quiescent_state(id, SandboxState::Running).await?;
+        self.guest_client(id)?
+            .write_file(path, data)
+            .await
+            .map_err(BlazeDaemonError::from)
+    }
+
     /// Create a cold sandbox or activate a compatible warm runtime.
     pub async fn create(&self, request: CreateSandbox) -> Result<CreateSandboxResult> {
         let pool_key = PoolKey::new(
@@ -249,6 +346,30 @@ impl SandboxManager {
             request.image_digest.clone(),
         );
         if request.decision.pool_eligible {
+            let warm_ttl = request
+                .decision
+                .pool
+                .as_ref()
+                .and_then(|pool| pool.warm_ttl.as_deref())
+                .and_then(parse_duration)
+                .unwrap_or_else(|| self.runtime_pool.default_warm_ttl());
+            let configured = self.runtime_pool.configure(PoolPrototype {
+                image_digest: request.image_digest.clone(),
+                policy_name: request.decision.policy_name.clone(),
+                workload_class: request.decision.workload_class,
+                templates: request.decision.templates.clone(),
+                kernel_hooks: request.decision.kernel_hooks.clone(),
+                binary_path: request.binary_path.clone(),
+                runtime_backend: request.runtime_backend,
+                backend: request.decision.backend.clone(),
+                vm: request.decision.vm.clone(),
+                warm_ttl,
+            })?;
+            if configured && let Some(lease) = self.runtime_pool.acquire().await? {
+                let result = self.activate_runtime_slot(lease, request).await?;
+                self.metrics.inc(&self.metrics.pool_hits);
+                return Ok(result);
+            }
             if let Some(result) = self.activate_warm(&pool_key).await? {
                 self.metrics.inc(&self.metrics.pool_hits);
                 return Ok(result);
@@ -294,7 +415,7 @@ impl SandboxManager {
         };
         crate::failpoint::pause("create-after-storage-acquire").await;
 
-        let run_dir = self.state_dir.join(instance.id.to_string());
+        let run_dir = self.runtime_dir_for(&instance);
         let spawner = match self.spawners.get(self.active_backend) {
             Some(spawner) => spawner,
             None => {
@@ -357,6 +478,20 @@ impl SandboxManager {
             Ok(backend_instance) => {
                 instance.backend_ownership = BackendOwnership::Running;
                 let actual_backend = backend_instance.backend();
+                if let Err(error) = self
+                    .wait_for_guest_ready(&backend_instance, "create-guest-ready")
+                    .await
+                {
+                    return Err(self
+                        .cleanup_failed_create(
+                            &mut instance,
+                            storage,
+                            Some(backend_instance),
+                            false,
+                            error.into(),
+                        )
+                        .await);
+                }
                 let mut backend_instance = Some(backend_instance);
                 let registered = match self.backend_instances.lock() {
                     Ok(mut instances) => {
@@ -423,6 +558,319 @@ impl SandboxManager {
                 .await);
         }
         self.metrics.inc(&self.metrics.instances_created);
+        Ok(CreateSandboxResult {
+            instance,
+            selected_backend: actual_backend,
+        })
+    }
+
+    async fn activate_runtime_slot(
+        &self,
+        mut lease: RuntimePoolLease,
+        request: CreateSandbox,
+    ) -> Result<CreateSandboxResult> {
+        {
+            let slot = lease.slot()?;
+            if slot.runtime_backend != request.runtime_backend {
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "runtime slot {} records backend {} instead of requested {}",
+                    slot.instance_id, slot.runtime_backend, request.runtime_backend
+                )));
+            }
+            let expected_ownership = if slot.backend.is_some() {
+                BackendOwnership::Running
+            } else {
+                BackendOwnership::NotStarted
+            };
+            if slot.backend_ownership != expected_ownership {
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "runtime slot {} has backend ownership {:?} with backend handle present={}",
+                    slot.instance_id,
+                    slot.backend_ownership,
+                    slot.backend.is_some()
+                )));
+            }
+        }
+
+        let owner_token = Uuid::new_v4();
+        let instance_id = lease.slot()?.instance_id;
+        let operation_lock = self.operation_lock(instance_id);
+        let _operation = operation_lock.lock().await;
+        lease.begin_handoff(owner_token).await?;
+        let slot = lease.slot()?;
+        let reconstructed = self
+            .storage
+            .reconstruct(&slot.instance_id.to_string())
+            .await?;
+        if reconstructed != slot.storage {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "runtime slot {} storage paths changed before lifecycle handoff",
+                slot.instance_id
+            )));
+        }
+
+        let mut instance = SandboxInstance::new_warm_claim(
+            slot.instance_id,
+            slot.runtime_backend,
+            request.decision.workload_class,
+            request.image_digest,
+            request.decision.policy_name,
+            slot.backend_ownership,
+            owner_token,
+        )?;
+        let publication = instance
+            .persist(&self.state_dir)
+            .map_err(BlazeDaemonError::from)
+            .and_then(|()| crate::failpoint::state("warm-runtime-lifecycle-publish-result"));
+        let publication_failure = match publication {
+            Ok(()) => None,
+            Err(error) => match inspect_warm_claim_publication(&self.state_dir, &instance) {
+                WarmClaimPublication::Absent => return Err(error),
+                WarmClaimPublication::Published(published) => {
+                    instance = published;
+                    Some(BlazeDaemonError::RecoveryRequired(format!(
+                        "runtime slot {} lifecycle publication reported an error after state \
+                         became visible: {error}",
+                        instance.id
+                    )))
+                }
+                WarmClaimPublication::Ambiguous(reason) => {
+                    let unresolved =
+                        format!("lifecycle publication was ambiguous after {error}: {reason}");
+                    lease.retain_unresolved(owner_token, unresolved.clone())?;
+                    return Err(BlazeDaemonError::RecoveryRequired(format!(
+                        "runtime slot {} {unresolved}; ownership remains counted in the runtime \
+                         pool and requires startup reconciliation",
+                        instance.id
+                    )));
+                }
+            },
+        };
+        let retained_state = self.retain_instance(instance.clone());
+        let retained_backend = slot
+            .backend
+            .as_ref()
+            .and_then(|backend| self.retain_backend(instance.id, backend.clone()));
+        let mut registered = slot.backend.is_some();
+        lease.transfer_to_lifecycle();
+
+        let handoff = lease.finish_handoff(owner_token).await;
+        let mut slot = lease.into_slot()?;
+        let mut transfer_errors = [retained_state, retained_backend]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if let Err(error) = handoff {
+            transfer_errors.push(format!("finish durable ownership handoff: {error}"));
+        }
+        if let Some(error) = publication_failure {
+            transfer_errors.push(error.to_string());
+        }
+        if !transfer_errors.is_empty() {
+            let failure = BlazeDaemonError::RecoveryRequired(format!(
+                "runtime slot {} lifecycle handoff failed: {}",
+                instance.id,
+                transfer_errors.join("; ")
+            ));
+            return Err(self
+                .cleanup_failed_create(
+                    &mut instance,
+                    slot.storage,
+                    slot.backend,
+                    registered,
+                    failure,
+                )
+                .await);
+        }
+
+        let actual_backend = if let Some(backend) = slot.backend.as_ref() {
+            backend.backend()
+        } else {
+            let spawner = match self.spawners.get(instance.backend) {
+                Some(spawner) => spawner,
+                None => {
+                    let failure = BlazeDaemonError::Internal(format!(
+                        "runtime backend {} has no registered spawner",
+                        instance.backend
+                    ));
+                    return Err(self
+                        .cleanup_failed_create(&mut instance, slot.storage, None, false, failure)
+                        .await);
+                }
+            };
+            instance.backend_ownership = BackendOwnership::Starting;
+            if let Err(error) = instance.persist(&self.state_dir) {
+                return Err(self
+                    .cleanup_failed_create(&mut instance, slot.storage, None, false, error.into())
+                    .await);
+            }
+            if let Some(error) = self.retain_instance(instance.clone()) {
+                return Err(self
+                    .cleanup_failed_create(
+                        &mut instance,
+                        slot.storage,
+                        None,
+                        false,
+                        BlazeDaemonError::Internal(error),
+                    )
+                    .await);
+            }
+            if let Err(error) = spawner.prepare_spawn(&slot.run_dir).await {
+                return Err(self
+                    .cleanup_failed_create(&mut instance, slot.storage, None, false, error.into())
+                    .await);
+            }
+            let spawn = spawner
+                .spawn(SpawnRequest {
+                    instance_id: instance.id,
+                    run_dir: slot.run_dir.clone(),
+                    binary_path: request.binary_path,
+                    storage: slot.storage.clone(),
+                    backend: request.decision.backend,
+                    vm: request.decision.vm,
+                })
+                .await;
+            let backend = match spawn {
+                Ok(backend) => backend,
+                Err(error) => {
+                    let (source, owner) = error.into_parts();
+                    instance.backend_ownership = if owner.is_some() {
+                        BackendOwnership::Running
+                    } else {
+                        BackendOwnership::Stopped
+                    };
+                    let persist = instance.persist(&self.state_dir).err();
+                    let retained = self.retain_instance(instance.clone());
+                    let mut details = Vec::new();
+                    if let Some(error) = persist {
+                        details.push(format!("backend failure state persistence failed: {error}"));
+                    }
+                    if let Some(error) = retained {
+                        details.push(error);
+                    }
+                    let original = if details.is_empty() {
+                        source.into()
+                    } else {
+                        BlazeDaemonError::RecoveryRequired(format!(
+                            "{source}; {}",
+                            details.join("; ")
+                        ))
+                    };
+                    return Err(self
+                        .cleanup_failed_create(&mut instance, slot.storage, owner, false, original)
+                        .await);
+                }
+            };
+            let actual_backend = backend.backend();
+            instance.backend_ownership = BackendOwnership::Running;
+            let persist = instance.persist(&self.state_dir);
+            let retained_state = self.retain_instance(instance.clone());
+            let retained_backend = self.retain_backend(instance.id, backend.clone());
+            registered = true;
+            slot.backend = Some(backend.clone());
+            if actual_backend != instance.backend {
+                let failure = BlazeDaemonError::RecoveryRequired(format!(
+                    "runtime slot {} expected backend {} but spawner returned {}",
+                    instance.id, instance.backend, actual_backend
+                ));
+                return Err(self
+                    .cleanup_failed_create(
+                        &mut instance,
+                        slot.storage,
+                        slot.backend,
+                        registered,
+                        failure,
+                    )
+                    .await);
+            }
+            if let Err(error) = persist {
+                return Err(self
+                    .cleanup_failed_create(
+                        &mut instance,
+                        slot.storage,
+                        slot.backend,
+                        registered,
+                        error.into(),
+                    )
+                    .await);
+            }
+            if let Some(error) = retained_state.or(retained_backend) {
+                return Err(self
+                    .cleanup_failed_create(
+                        &mut instance,
+                        slot.storage,
+                        slot.backend,
+                        registered,
+                        BlazeDaemonError::Internal(error),
+                    )
+                    .await);
+            }
+            if let Err(error) = self
+                .wait_for_guest_ready(&backend, "warm-runtime-guest-ready")
+                .await
+            {
+                return Err(self
+                    .cleanup_failed_create(
+                        &mut instance,
+                        slot.storage,
+                        slot.backend,
+                        registered,
+                        error.into(),
+                    )
+                    .await);
+            }
+            actual_backend
+        };
+
+        if actual_backend != instance.backend {
+            let failure = BlazeDaemonError::RecoveryRequired(format!(
+                "runtime slot {} expected backend {} but owner is {}",
+                instance.id, instance.backend, actual_backend
+            ));
+            return Err(self
+                .cleanup_failed_create(
+                    &mut instance,
+                    slot.storage,
+                    slot.backend,
+                    registered,
+                    failure,
+                )
+                .await);
+        }
+        if let Err(error) = instance.transition(SandboxState::Running) {
+            return Err(self
+                .cleanup_failed_create(
+                    &mut instance,
+                    slot.storage,
+                    slot.backend,
+                    registered,
+                    error.into(),
+                )
+                .await);
+        }
+        instance.finish_operation();
+        if let Err(error) = instance.persist(&self.state_dir) {
+            return Err(self
+                .cleanup_failed_create(
+                    &mut instance,
+                    slot.storage,
+                    slot.backend,
+                    registered,
+                    error.into(),
+                )
+                .await);
+        }
+        if let Some(error) = self.retain_instance(instance.clone()) {
+            return Err(self
+                .cleanup_failed_create(
+                    &mut instance,
+                    slot.storage,
+                    slot.backend,
+                    registered,
+                    BlazeDaemonError::Internal(error),
+                )
+                .await);
+        }
         Ok(CreateSandboxResult {
             instance,
             selected_backend: actual_backend,
@@ -622,7 +1070,7 @@ impl SandboxManager {
             }
             None => match self.spawners.get(metadata.backend) {
                 Some(spawner) => match spawner
-                    .cleanup_orphan(id, &self.state_dir.join(id.to_string()))
+                    .cleanup_orphan(id, &self.runtime_dir_for(metadata))
                     .await
                 {
                     Ok(()) => true,
@@ -706,7 +1154,22 @@ impl SandboxManager {
             .map_err(|_| poisoned("backend_instances"))?
             .contains_key(&id);
         if is_clean_terminal(&original) && !has_retained_backend {
+            if original.runtime_location == RuntimeLocation::WarmPool {
+                let owner_token = required_runtime_owner_token(&original)?;
+                remove_lifecycle_tombstone(&self.state_dir.join("runtime-pool"), id, owner_token)
+                    .await
+                    .map_err(|error| {
+                        BlazeDaemonError::RecoveryRequired(format!(
+                            "destroy {id}: finish runtime tombstone cleanup: {error}"
+                        ))
+                    })?;
+            }
             return Ok(false);
+        }
+        if original.runtime_location == RuntimeLocation::WarmPool {
+            self.cleanup_warm_runtime_locked(&mut original).await?;
+            self.metrics.inc(&self.metrics.instances_destroyed);
+            return Ok(true);
         }
 
         if original.operation.as_ref().map(|operation| operation.kind)
@@ -750,7 +1213,7 @@ impl SandboxManager {
                     match self.spawners.get(original.backend) {
                         Some(spawner) => {
                             spawner
-                                .cleanup_orphan(id, &self.state_dir.join(id.to_string()))
+                                .cleanup_orphan(id, &self.runtime_dir_for(&original))
                                 .await
                         }
                         None => Err(BlazeError::BackendError {
@@ -796,6 +1259,7 @@ impl SandboxManager {
                  storage retained"
             )));
         }
+        self.forget_backend(id);
 
         if let Err(error) = self.storage.release_by_id(&id.to_string()).await {
             let recovery = self.mark_recovery(id).err();
@@ -831,16 +1295,103 @@ impl SandboxManager {
                 "destroy {id}: resources released but {error}"
             )));
         }
-        match self.backend_instances.lock() {
-            Ok(mut instances) => {
-                instances.remove(&id);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove(&id);
-            }
-        }
         self.metrics.inc(&self.metrics.instances_destroyed);
         Ok(true)
+    }
+
+    async fn cleanup_warm_runtime_locked(&self, instance: &mut SandboxInstance) -> Result<()> {
+        let id = instance.id;
+        instance.begin_destroy_recovery();
+        crate::failpoint::state("destroy-intent-state-commit")?;
+        instance.persist(&self.state_dir)?;
+        if let Some(error) = self.retain_instance(instance.clone()) {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "cleanup warm runtime {id}: {error}; resources retained"
+            )));
+        }
+
+        let owner_token = required_runtime_owner_token(instance)?;
+        begin_lifecycle_cleanup(
+            &self.state_dir.join("runtime-pool"),
+            id,
+            instance.backend,
+            owner_token,
+        )
+        .await
+        .map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "cleanup warm runtime {id}: persist cleanup ownership: {error}"
+            ))
+        })?;
+
+        let backend = self
+            .backend_instances
+            .lock()
+            .map_err(|_| poisoned("backend_instances"))?
+            .get(&id)
+            .cloned();
+        crate::failpoint::backend("destroy-kill")?;
+        if let Some(backend) = backend.as_ref() {
+            backend.kill().await?;
+        } else if !matches!(
+            instance.backend_ownership,
+            BackendOwnership::NotStarted | BackendOwnership::Stopped
+        ) {
+            let spawner = self.spawners.get(instance.backend).ok_or_else(|| {
+                BlazeDaemonError::RecoveryRequired(format!(
+                    "cleanup warm runtime {id}: no recovery spawner registered for {}",
+                    instance.backend
+                ))
+            })?;
+            spawner
+                .cleanup_orphan(id, &self.runtime_dir_for(instance))
+                .await?;
+        }
+
+        instance.backend_ownership = BackendOwnership::Stopped;
+        crate::failpoint::state("destroy-stop-state-commit")?;
+        instance.persist(&self.state_dir)?;
+        if let Some(error) = self.retain_instance(instance.clone()) {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "cleanup warm runtime {id}: backend stopped but {error}; storage retained"
+            )));
+        }
+        self.forget_backend(id);
+
+        self.storage.release_by_id(&id.to_string()).await?;
+        if instance.state != SandboxState::Destroyed {
+            instance.transition(SandboxState::Destroyed)?;
+        }
+        crate::failpoint::state("destroy-released-state-commit")?;
+        instance.persist(&self.state_dir)?;
+        if let Some(error) = self.retain_instance(instance.clone()) {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "cleanup warm runtime {id}: resources released but {error}"
+            )));
+        }
+
+        tombstone_lifecycle_slot(&self.state_dir.join("runtime-pool"), id, owner_token)
+            .await
+            .map_err(|error| {
+                BlazeDaemonError::RecoveryRequired(format!(
+                    "cleanup warm runtime {id}: tombstone runtime directory: {error}"
+                ))
+            })?;
+        instance.finish_operation();
+        crate::failpoint::state("destroy-final-state-commit")?;
+        instance.persist(&self.state_dir)?;
+        if let Some(error) = self.retain_instance(instance.clone()) {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "cleanup warm runtime {id}: lifecycle is terminal but {error}"
+            )));
+        }
+        remove_lifecycle_tombstone(&self.state_dir.join("runtime-pool"), id, owner_token)
+            .await
+            .map_err(|error| {
+                BlazeDaemonError::RecoveryRequired(format!(
+                    "cleanup warm runtime {id}: remove runtime tombstone: {error}"
+                ))
+            })
     }
 
     /// Reconcile every record that is not cleanly terminal without aborting
@@ -849,11 +1400,97 @@ impl SandboxManager {
         self.cleanup_owned_instances().await
     }
 
+    /// Release unclaimed runtime slots before the daemon starts listening.
+    ///
+    /// Any ambiguous ownership record stops startup so the daemon never
+    /// serves an incomplete resource inventory.
+    pub async fn reconcile_runtime_pool_startup(&self) -> Result<usize> {
+        let durable_owners = match self.instances.lock() {
+            Ok(instances) => instances
+                .values()
+                .map(|instance| (instance.id, DurableRuntimeOwner::from(instance)))
+                .collect(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .values()
+                .map(|instance| (instance.id, DurableRuntimeOwner::from(instance)))
+                .collect(),
+        };
+        reconcile_runtime_slots(
+            &self.state_dir.join("runtime-pool"),
+            &durable_owners,
+            self.storage.as_ref(),
+            self.spawners.as_ref(),
+        )
+        .await
+    }
+
+    /// Cancel readiness polling before the daemon drains active requests.
+    pub fn begin_shutdown(&self) {
+        self.runtime_pool.begin_shutdown();
+        self.cancellation.cancel();
+    }
+
+    /// Stop background capacity work and release pool-owned slots within the
+    /// daemon's shared runtime cleanup deadline.
+    pub async fn shutdown_runtime_pool_until(&self, deadline: tokio::time::Instant) -> Result<()> {
+        self.runtime_pool
+            .shutdown_until(deadline)
+            .await
+            .map_err(BlazeDaemonError::from)
+    }
+
     /// Release every lifecycle record and retained backend owner, continuing
     /// after individual failures.
     pub async fn cleanup_owned_instances(&self) -> ReconcileReport {
         self.cleanup_owned_instances_with_timeout(INSTANCE_CLEANUP_TIMEOUT)
             .await
+    }
+
+    fn guest_client(&self, id: Uuid) -> Result<GuestClient> {
+        let backend = self
+            .backend_instances
+            .lock()
+            .map_err(|_| poisoned("backend_instances"))?
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| {
+                BlazeDaemonError::Conflict(format!("instance {id} has no backend owner"))
+            })?;
+        let socket = backend.guest_socket_path();
+        if socket.as_os_str().is_empty() {
+            return Err(BlazeDaemonError::Conflict(format!(
+                "instance {id} has no guest transport"
+            )));
+        }
+        Ok(GuestClient::new(
+            socket.to_path_buf(),
+            GUEST_REQUEST_TIMEOUT,
+            MAX_GUEST_FILE_BYTES,
+        ))
+    }
+
+    async fn wait_for_guest_ready(
+        &self,
+        backend: &DynBackendInstance,
+        failpoint: &str,
+    ) -> crate::guest::Result<()> {
+        let socket = backend.guest_socket_path();
+        if socket.as_os_str().is_empty() {
+            return Ok(());
+        }
+        crate::failpoint::guest(failpoint)?;
+        GuestClient::new(
+            socket.to_path_buf(),
+            GUEST_REQUEST_TIMEOUT,
+            MAX_GUEST_FILE_BYTES,
+        )
+        .wait_ready(GUEST_REQUEST_TIMEOUT, &self.cancellation)
+        .await
+    }
+
+    fn runtime_dir_for(&self, instance: &SandboxInstance) -> PathBuf {
+        derive_runtime_dir(&self.state_dir, instance.runtime_location, instance.id)
     }
 
     /// Release owned instances with a caller-supplied per-instance deadline.
@@ -914,7 +1551,7 @@ impl SandboxManager {
                         "instance cleanup exceeded {} ms per-record deadline",
                         item_timeout.as_millis()
                     );
-                    let recovery = self.mark_recovery(id).err();
+                    let recovery = self.mark_recovery_if_nonterminal(id).err();
                     report.failures.push(ReconcileFailure {
                         instance_id: id,
                         error: match recovery {
@@ -926,7 +1563,7 @@ impl SandboxManager {
                     });
                 }
                 Ok(Err(error)) => {
-                    let recovery = self.mark_recovery(id).err();
+                    let recovery = self.mark_recovery_if_nonterminal(id).err();
                     report.failures.push(ReconcileFailure {
                         instance_id: id,
                         error: match recovery {
@@ -950,6 +1587,11 @@ impl SandboxManager {
         registered: bool,
         original: BlazeDaemonError,
     ) -> BlazeDaemonError {
+        if instance.runtime_location == RuntimeLocation::WarmPool {
+            return self
+                .cleanup_failed_warm_create(instance, storage, backend, registered, original)
+                .await;
+        }
         if instance.operation.is_none()
             && let Err(error) = instance.begin_operation(OperationKind::Create)
         {
@@ -1043,6 +1685,54 @@ impl SandboxManager {
         ))
     }
 
+    async fn cleanup_failed_warm_create(
+        &self,
+        instance: &mut SandboxInstance,
+        storage: StorageSlot,
+        backend: Option<DynBackendInstance>,
+        registered: bool,
+        original: BlazeDaemonError,
+    ) -> BlazeDaemonError {
+        let id = instance.id;
+        let has_retained_backend = match self.backend_instances.lock() {
+            Ok(instances) => instances.contains_key(&id),
+            Err(poisoned) => poisoned.into_inner().contains_key(&id),
+        };
+        if !has_retained_backend {
+            match backend {
+                Some(backend) => {
+                    if let Some(error) = self.retain_backend(id, backend) {
+                        return BlazeDaemonError::RecoveryRequired(format!(
+                            "{original}; instance {id}: {error}"
+                        ));
+                    }
+                }
+                None if registered => {
+                    return BlazeDaemonError::RecoveryRequired(format!(
+                        "{original}; instance {id}: registered backend owner is missing"
+                    ));
+                }
+                None => {}
+            }
+        }
+        if storage.id != id.to_string() {
+            return BlazeDaemonError::RecoveryRequired(format!(
+                "{original}; instance {id}: warm storage owner {} does not match lifecycle ID",
+                storage.id
+            ));
+        }
+
+        match self.cleanup_warm_runtime_locked(instance).await {
+            Ok(()) => {
+                self.metrics.inc(&self.metrics.instances_destroyed);
+                original
+            }
+            Err(error) => BlazeDaemonError::RecoveryRequired(format!(
+                "{original}; instance {id}: cleanup incomplete: {error}"
+            )),
+        }
+    }
+
     fn retain_failed_acquire(
         &self,
         instance: &mut SandboxInstance,
@@ -1103,6 +1793,15 @@ impl SandboxManager {
         self.mark_instance_recovery(self.get(id)?)
     }
 
+    fn mark_recovery_if_nonterminal(&self, id: Uuid) -> Result<()> {
+        let instance = self.get(id)?;
+        if instance.is_clean_terminal() {
+            Ok(())
+        } else {
+            self.mark_instance_recovery(instance)
+        }
+    }
+
     fn mark_instance_recovery(&self, mut instance: SandboxInstance) -> Result<()> {
         if instance.state == SandboxState::Destroyed {
             if instance.operation.as_ref().map(|operation| operation.kind)
@@ -1138,6 +1837,17 @@ impl SandboxManager {
         }
     }
 
+    fn forget_backend(&self, id: Uuid) {
+        match self.backend_instances.lock() {
+            Ok(mut instances) => {
+                instances.remove(&id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(&id);
+            }
+        }
+    }
+
     fn retain_instance(&self, instance: SandboxInstance) -> Option<String> {
         match self.instances.lock() {
             Ok(mut instances) => {
@@ -1157,12 +1867,89 @@ fn poisoned(name: &str) -> BlazeDaemonError {
 }
 
 fn is_clean_terminal(instance: &SandboxInstance) -> bool {
-    instance.state == SandboxState::Destroyed
-        && instance.operation.is_none()
-        && matches!(
-            instance.backend_ownership,
-            BackendOwnership::NotStarted | BackendOwnership::Stopped
-        )
+    instance.is_clean_terminal()
+}
+
+enum WarmClaimPublication {
+    Absent,
+    Published(SandboxInstance),
+    Ambiguous(String),
+}
+
+fn inspect_warm_claim_publication(
+    state_dir: &Path,
+    expected: &SandboxInstance,
+) -> WarmClaimPublication {
+    let owner_dir = state_dir.join(expected.id.to_string());
+    match std::fs::symlink_metadata(&owner_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WarmClaimPublication::Absent;
+        }
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return WarmClaimPublication::Ambiguous(format!(
+                "{} is not a real lifecycle owner directory",
+                owner_dir.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return WarmClaimPublication::Ambiguous(format!(
+                "inspect {}: {error}",
+                owner_dir.display()
+            ));
+        }
+    }
+
+    let path = owner_dir.join("state.json");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WarmClaimPublication::Ambiguous(format!(
+                "{} has no lifecycle state file",
+                owner_dir.display()
+            ));
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return WarmClaimPublication::Ambiguous(format!(
+                "{} is not a regular lifecycle file",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return WarmClaimPublication::Ambiguous(format!("inspect {}: {error}", path.display()));
+        }
+    }
+
+    let published = match SandboxInstance::load(state_dir, expected.id) {
+        Ok(published) => published,
+        Err(error) => {
+            return WarmClaimPublication::Ambiguous(format!("load {}: {error}", path.display()));
+        }
+    };
+    let expected_value = serde_json::to_value(expected);
+    let published_value = serde_json::to_value(&published);
+    match (expected_value, published_value) {
+        (Ok(expected_value), Ok(published_value)) if expected_value == published_value => {
+            WarmClaimPublication::Published(published)
+        }
+        (Err(error), _) | (_, Err(error)) => WarmClaimPublication::Ambiguous(format!(
+            "compare visible lifecycle state {}: {error}",
+            path.display()
+        )),
+        _ => WarmClaimPublication::Ambiguous(format!(
+            "{} does not match the claimed runtime owner",
+            path.display()
+        )),
+    }
+}
+
+fn required_runtime_owner_token(instance: &SandboxInstance) -> Result<Uuid> {
+    instance.runtime_owner_token.ok_or_else(|| {
+        BlazeDaemonError::RecoveryRequired(format!(
+            "warm runtime {} has no durable ownership token",
+            instance.id
+        ))
+    })
 }
 
 fn operation_lock(
@@ -1200,5 +1987,38 @@ mod operation_lock_tests {
         }
 
         assert_eq!(locks.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_owner_directory_is_an_ambiguous_publication() {
+        use std::os::unix::fs::symlink;
+
+        let state = tempfile::tempdir().expect("state root");
+        let external = tempfile::tempdir().expect("external owner");
+        let expected = SandboxInstance::new_warm_claim(
+            Uuid::new_v4(),
+            BackendKind::Mock,
+            blaze_core::policy::WorkloadClass::AgentTool,
+            "sha256:test".to_string(),
+            "test-policy".to_string(),
+            BackendOwnership::NotStarted,
+            Uuid::new_v4(),
+        )
+        .expect("warm claim");
+        expected
+            .persist(external.path())
+            .expect("external lifecycle state");
+        symlink(
+            external.path().join(expected.id.to_string()),
+            state.path().join(expected.id.to_string()),
+        )
+        .expect("linked owner directory");
+
+        assert!(matches!(
+            inspect_warm_claim_publication(state.path(), &expected),
+            WarmClaimPublication::Ambiguous(reason)
+                if reason.contains("not a real lifecycle owner directory")
+        ));
     }
 }

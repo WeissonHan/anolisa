@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blaze_core::backend::BackendKind;
-use blaze_core::config::{DaemonConfig, PolicyLoadErrorMode};
+use blaze_core::config::{DaemonConfig, PolicyLoadErrorMode, validate_runtime_storage_paths};
 use blaze_core::kernel::HookRegistry;
 use blaze_core::policy::PolicyEngine;
 use blaze_core::pool::PoolManager;
@@ -202,6 +202,13 @@ pub async fn run(config_path: &Path) -> Result<()> {
         active_backend,
         storage,
     )?);
+    let reconciled_slots = state.manager.reconcile_runtime_pool_startup().await?;
+    if reconciled_slots > 0 {
+        tracing::warn!(
+            runtimes = reconciled_slots,
+            "reconciled unclaimed runtime slots"
+        );
+    }
     let reconciliation = state.manager.reconcile_startup().await;
     tracing::info!(
         attempted = reconciliation.attempted,
@@ -240,9 +247,14 @@ fn ensure_dirs(cfg: &DaemonConfig) -> Result<()> {
     std::fs::create_dir_all(&cfg.template.dir)?;
     std::fs::create_dir_all(&cfg.storage.images_dir)?;
     std::fs::create_dir_all(&cfg.storage.instances_dir)?;
+    let state_dir = std::fs::canonicalize(&cfg.daemon.state_dir)?;
     let images_dir = std::fs::canonicalize(&cfg.storage.images_dir)?;
     let instances_dir = std::fs::canonicalize(&cfg.storage.instances_dir)?;
-    blaze_core::config::validate_storage_paths(&images_dir, &instances_dir)?;
+    let runtime_root = state_dir.join("runtime-pool");
+    validate_runtime_storage_paths(&runtime_root, &images_dir, &instances_dir)?;
+    std::fs::create_dir_all(&runtime_root)?;
+    let runtime_root = std::fs::canonicalize(runtime_root)?;
+    validate_runtime_storage_paths(&runtime_root, &images_dir, &instances_dir)?;
     if let Some(parent) = cfg.daemon.socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -414,6 +426,7 @@ async fn serve(
 
     uds.stop_accepting();
     drop(tcp);
+    state.manager.begin_shutdown();
     let drain = connections.shutdown(SHUTDOWN_BUDGET.connection_drain);
     let cleanup = api::shutdown_instances(&state, SHUTDOWN_BUDGET.runtime_cleanup);
     let shutdown_result = finish_shutdown(drain, cleanup).await;
@@ -498,6 +511,7 @@ fn reload_policies(state: &Arc<ServerState>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::future;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -511,6 +525,53 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Release);
         }
+    }
+
+    fn directory_config(root: &Path) -> DaemonConfig {
+        let mut config = DaemonConfig::default();
+        config.daemon.state_dir = root.join("state");
+        config.daemon.socket = root.join("run").join("blazed.sock");
+        config.storage.images_dir = root.join("images");
+        config.storage.instances_dir = root.join("instances");
+        config.template.dir = root.join("templates");
+        config.policy.dir = root.join("policies");
+        config
+    }
+
+    #[test]
+    fn ensure_dirs_accepts_disjoint_runtime_and_storage_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = directory_config(temp.path());
+
+        ensure_dirs(&config).expect("disjoint ownership roots");
+
+        assert!(config.daemon.state_dir.join("runtime-pool").is_dir());
+        assert!(config.storage.images_dir.is_dir());
+        assert!(config.storage.instances_dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dirs_rejects_canonical_runtime_storage_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = directory_config(temp.path());
+        std::fs::create_dir_all(&config.daemon.state_dir).expect("state dir");
+        std::fs::create_dir_all(&config.storage.instances_dir).expect("instances dir");
+        symlink(
+            &config.storage.instances_dir,
+            config.daemon.state_dir.join("runtime-pool"),
+        )
+        .expect("runtime alias");
+
+        let error = ensure_dirs(&config).expect_err("canonical overlap must be rejected");
+
+        assert!(matches!(
+            error,
+            BlazeDaemonError::Core(blaze_core::BlazeError::ConfigError { .. })
+        ));
+        assert!(error.to_string().contains("must be disjoint"));
     }
 
     #[tokio::test]
