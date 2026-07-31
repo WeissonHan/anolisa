@@ -448,6 +448,7 @@ async fn serve(
     uds.stop_accepting();
     drop(tcp);
     state.manager.begin_shutdown();
+    state.manager.cancel_runtime_template_imports();
     if let Some(flush_loop) = flush_loop.as_mut() {
         service_result = merge_stage_result(
             service_result,
@@ -456,11 +457,12 @@ async fn serve(
         );
     }
     let drain = connections.shutdown(SHUTDOWN_BUDGET.connection_drain);
+    let imports = state.manager.wait_for_runtime_template_imports();
     let cleanup = api::shutdown_instances(&state, SHUTDOWN_BUDGET.runtime_cleanup);
     service_result = merge_stage_result(
         service_result,
-        "connection drain and runtime cleanup",
-        finish_shutdown(drain, cleanup).await,
+        "connection drain, runtime template import shutdown, and runtime cleanup",
+        finish_shutdown(drain, imports, cleanup).await,
     );
     tracing::info!("blaze daemon stopped");
     service_result
@@ -484,20 +486,42 @@ fn merge_stage_result(current: Result<()>, stage: &str, next: Result<()>) -> Res
     }
 }
 
-async fn finish_shutdown<Drain, Cleanup>(drain: Drain, cleanup: Cleanup) -> Result<()>
+async fn finish_shutdown<Drain, Imports, Cleanup>(
+    drain: Drain,
+    imports: Imports,
+    cleanup: Cleanup,
+) -> Result<()>
 where
     Drain: Future<Output = Result<()>>,
+    Imports: Future<Output = Result<()>>,
     Cleanup: Future<Output = Result<()>>,
 {
     let drain_result = drain.await;
+    let import_result = imports.await;
     let cleanup_result = cleanup.await;
-    match (drain_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(drain), Err(cleanup)) => Err(BlazeDaemonError::RecoveryRequired(format!(
-            "connection drain failed: {drain}; runtime cleanup failed: {cleanup}"
-        ))),
+    let mut failures = Vec::new();
+    if let Err(error) = drain_result {
+        failures.push(("connection drain", error));
     }
+    if let Err(error) = import_result {
+        failures.push(("runtime template import shutdown", error));
+    }
+    if let Err(error) = cleanup_result {
+        failures.push(("runtime cleanup", error));
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    if failures.len() == 1 {
+        return Err(failures.remove(0).1);
+    }
+    Err(BlazeDaemonError::RecoveryRequired(
+        failures
+            .into_iter()
+            .map(|(stage, error)| format!("{stage} failed: {error}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    ))
 }
 
 async fn serve_connection<I>(
@@ -717,12 +741,36 @@ mod tests {
             cleanup_observed.store(true, Ordering::Release);
             Ok(())
         };
-        let error = finish_shutdown(connections.shutdown(Duration::from_millis(10)), cleanup)
-            .await
-            .expect_err("connection timeout must be reported");
+        let error = finish_shutdown(
+            connections.shutdown(Duration::from_millis(10)),
+            future::ready(Ok(())),
+            cleanup,
+        )
+        .await
+        .expect_err("connection timeout must be reported");
 
         assert!(error.to_string().contains("connection drain timed out"));
         assert!(cleanup_started.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn shutdown_preserves_import_and_runtime_failures() {
+        let error = finish_shutdown(
+            future::ready(Ok(())),
+            future::ready(Err(BlazeDaemonError::Internal(
+                "import did not stop".to_string(),
+            ))),
+            future::ready(Err(BlazeDaemonError::Internal(
+                "runtime cleanup failed".to_string(),
+            ))),
+        )
+        .await
+        .expect_err("both failures must be reported");
+        let message = error.to_string();
+
+        assert!(message.contains("runtime template import shutdown failed"));
+        assert!(message.contains("import did not stop"));
+        assert!(message.contains("runtime cleanup failed"));
     }
 
     #[test]

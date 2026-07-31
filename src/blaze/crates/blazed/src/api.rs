@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,6 +150,11 @@ async fn dispatch(
         ("POST", ["v1", "templates", "gc"]) => gc_templates(state),
         ("GET", ["v1", "templates"]) => list_templates(state),
         ("GET", ["v1", "templates", id]) => inspect_template(state, id),
+        ("GET", ["v1", "runtime-templates"]) => list_runtime_templates(state).await,
+        ("GET", ["v1", "runtime-templates", name]) => get_runtime_template(state, name).await,
+        ("POST", ["v1", "runtime-templates", "import"]) => {
+            import_runtime_template(state, &body).await
+        }
         ("GET", ["v1", "policies"]) => list_policies(state),
         ("GET", ["v1", "hooks"]) => list_hooks(state),
         ("GET", ["v1", "metrics"]) => metrics(state),
@@ -863,6 +869,39 @@ fn inspect_template(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<
     json_ok(&view)
 }
 
+async fn list_runtime_templates(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    json_ok(&state.manager.list_runtime_templates().await?)
+}
+
+async fn get_runtime_template(
+    state: &Arc<ServerState>,
+    name: &str,
+) -> Result<Response<Full<Bytes>>> {
+    json_ok(&state.manager.get_runtime_template(name.to_string()).await?)
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportRuntimeTemplateRequest {
+    name: String,
+    source: PathBuf,
+    #[serde(default)]
+    description: String,
+}
+
+async fn import_runtime_template(
+    state: &Arc<ServerState>,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>> {
+    let request: ImportRuntimeTemplateRequest = serde_json::from_slice(body).map_err(|error| {
+        BlazeDaemonError::BadRequest(format!("invalid runtime template import body: {error}"))
+    })?;
+    let imported = state
+        .manager
+        .import_runtime_template(request.name, request.source, request.description)
+        .await?;
+    json_response(StatusCode::CREATED, &imported)
+}
+
 fn gc_templates(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
     let idle_ttl = {
         let cfg = state
@@ -1018,6 +1057,7 @@ mod tests {
         config.daemon.state_dir = temp.path().join("state");
         config.storage.images_dir = temp.path().join("images");
         config.storage.instances_dir = temp.path().join("instances");
+        config.runtime_templates.dir = temp.path().join("runtime-templates");
         std::fs::create_dir_all(&config.daemon.state_dir).expect("state");
         std::fs::create_dir_all(&config.storage.images_dir).expect("images");
         std::fs::create_dir_all(&config.storage.instances_dir).expect("instances");
@@ -2337,6 +2377,7 @@ mod tests {
         // Minimal config with both backends present.
         let mut config = DaemonConfig::default();
         config.daemon.state_dir = tmp.join("state");
+        config.runtime_templates.dir = tmp.join("runtime-templates");
         let _ = std::fs::create_dir_all(&config.daemon.state_dir);
         config.backends.insert("firecracker".into(), fc_bin.clone());
         config
@@ -4468,6 +4509,7 @@ mod tests {
         config.daemon.state_dir = temp.path().join("state");
         config.storage.images_dir = temp.path().join("images");
         config.storage.instances_dir = temp.path().join("instances");
+        config.runtime_templates.dir = temp.path().join("runtime-templates");
         std::fs::create_dir_all(&config.daemon.state_dir).expect("state");
         std::fs::create_dir_all(&config.storage.images_dir).expect("images");
         std::fs::create_dir_all(&config.storage.instances_dir).expect("instances");
@@ -6481,5 +6523,136 @@ mod tests {
             state.instances.lock().expect("instances")[&stopped_id].state,
             SandboxState::Destroyed
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_template_routes_import_list_and_get_published_artifacts() {
+        let temp = tempfile::tempdir().expect("temp");
+        let import_root = temp.path().join("imports");
+        let source = import_root.join("source");
+        std::fs::create_dir(&import_root).expect("import root");
+        std::fs::create_dir(&source).expect("source");
+        std::fs::write(source.join("vmstate.snap"), b"snapshot").expect("snapshot");
+        std::fs::write(source.join("mem.bin"), b"memory").expect("memory");
+        std::fs::write(source.join("rootfs.ext4"), b"rootfs").expect("rootfs");
+
+        let mut config = DaemonConfig::default();
+        config.daemon.state_dir = temp.path().join("state");
+        config.storage.images_dir = temp.path().join("images");
+        config.storage.instances_dir = temp.path().join("instances");
+        config.template.dir = temp.path().join("templates");
+        config.runtime_templates.dir = temp.path().join("runtime-templates");
+        config.runtime_templates.import_root = Some(import_root);
+        for directory in [
+            &config.daemon.state_dir,
+            &config.storage.images_dir,
+            &config.storage.instances_dir,
+            &config.template.dir,
+            &config.runtime_templates.dir,
+        ] {
+            std::fs::create_dir_all(directory).expect("directory");
+        }
+        let storage: Arc<dyn blaze_core::storage::StorageProvider> =
+            Arc::new(FileStorageProvider::with_images(
+                config.storage.images_dir.clone(),
+                config.storage.instances_dir.clone(),
+            ));
+        let state = Arc::new(
+            ServerState::build(
+                config,
+                PolicyEngine::with_policies(Vec::new()),
+                PoolManager::new(),
+                TemplateRegistry::new(),
+                HookRegistry::new(),
+                spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+                BackendKind::Mock,
+                storage,
+            )
+            .expect("state"),
+        );
+
+        let request = serde_json::to_vec(&json!({
+            "name": "runtime-base",
+            "source": "source",
+            "description": "reusable runtime",
+        }))
+        .expect("request");
+        let imported = dispatch(
+            &Method::POST,
+            "/v1/runtime-templates/import",
+            "",
+            request.clone(),
+            &state,
+        )
+        .await
+        .expect("import");
+        assert_eq!(imported.status(), StatusCode::CREATED);
+        let imported = serde_json::from_slice::<serde_json::Value>(
+            &imported
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+        )
+        .expect("json");
+        assert_eq!(imported["name"], "runtime-base");
+        assert_eq!(imported["description"], "reusable runtime");
+
+        let listed = dispatch(
+            &Method::GET,
+            "/v1/runtime-templates",
+            "",
+            Vec::new(),
+            &state,
+        )
+        .await
+        .expect("list");
+        let listed = serde_json::from_slice::<serde_json::Value>(
+            &listed.into_body().collect().await.expect("body").to_bytes(),
+        )
+        .expect("json");
+        assert_eq!(listed.as_array().expect("templates").len(), 1);
+        assert_eq!(listed[0]["name"], "runtime-base");
+
+        let fetched = dispatch(
+            &Method::GET,
+            "/v1/runtime-templates/runtime-base",
+            "",
+            Vec::new(),
+            &state,
+        )
+        .await
+        .expect("get");
+        let fetched = serde_json::from_slice::<serde_json::Value>(
+            &fetched
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+        )
+        .expect("json");
+        assert_eq!(fetched, imported);
+
+        let duplicate = dispatch(
+            &Method::POST,
+            "/v1/runtime-templates/import",
+            "",
+            request,
+            &state,
+        )
+        .await
+        .expect_err("duplicate");
+        assert!(matches!(duplicate, BlazeDaemonError::Conflict(_)));
+
+        let legacy = dispatch(&Method::GET, "/v1/templates", "", Vec::new(), &state)
+            .await
+            .expect("legacy template registry");
+        let legacy = serde_json::from_slice::<serde_json::Value>(
+            &legacy.into_body().collect().await.expect("body").to_bytes(),
+        )
+        .expect("json");
+        assert_eq!(legacy, json!([]));
     }
 }

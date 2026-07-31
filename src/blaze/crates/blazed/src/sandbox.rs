@@ -6,6 +6,7 @@ mod flush;
 mod hibernate;
 mod manager;
 mod restore;
+pub(crate) mod template;
 
 pub(crate) use flush::FlushLoop;
 pub use hibernate::{HibernateSandbox, ResumeSandbox};

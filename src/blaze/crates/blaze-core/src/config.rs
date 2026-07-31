@@ -32,6 +32,8 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub template: TemplateSection,
     #[serde(default)]
+    pub runtime_templates: RuntimeTemplateSection,
+    #[serde(default)]
     pub metrics: MetricsSection,
 }
 
@@ -137,6 +139,45 @@ impl Default for TemplateSection {
             dir: default_template_dir(),
             gc_interval: default_template_gc_interval(),
             idle_ttl: default_template_idle_ttl(),
+        }
+    }
+}
+
+/// Published runtime artifact catalog and its local import boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeTemplateSection {
+    /// Directory containing atomically published runtime artifact sets.
+    #[serde(default = "default_runtime_template_dir")]
+    pub dir: PathBuf,
+    /// Optional root containing operator-prepared import sources.
+    ///
+    /// Imports are disabled when this value is absent. API callers provide a
+    /// relative path below this root rather than an arbitrary daemon path.
+    #[serde(default)]
+    pub import_root: Option<PathBuf>,
+    /// Maximum number of regular files accepted from one source directory.
+    #[serde(default = "default_runtime_template_max_files")]
+    pub max_files: usize,
+    /// Maximum final artifact and generated metadata bytes for one import.
+    #[serde(default = "default_runtime_template_max_bytes")]
+    pub max_bytes: u64,
+    /// Maximum serialized size of one published `template.json`.
+    #[serde(default = "default_runtime_template_max_metadata_bytes")]
+    pub max_metadata_bytes: u64,
+    /// Maximum aggregate bytes retained by the published catalog.
+    #[serde(default = "default_runtime_template_max_total_bytes")]
+    pub max_total_bytes: u64,
+}
+
+impl Default for RuntimeTemplateSection {
+    fn default() -> Self {
+        Self {
+            dir: default_runtime_template_dir(),
+            import_root: None,
+            max_files: default_runtime_template_max_files(),
+            max_bytes: default_runtime_template_max_bytes(),
+            max_metadata_bytes: default_runtime_template_max_metadata_bytes(),
+            max_total_bytes: default_runtime_template_max_total_bytes(),
         }
     }
 }
@@ -272,13 +313,54 @@ impl DaemonConfig {
                 });
             }
         }
+        let runtime_root = self.daemon.state_dir.join("runtime-pool");
         validate_runtime_storage_paths(
-            &self.daemon.state_dir.join("runtime-pool"),
+            &runtime_root,
             &self.storage.images_dir,
             &self.storage.instances_dir,
         )?;
         self.storage.flush_schedule()?;
         self.storage.flush_timeout_duration()?;
+        validate_runtime_template_paths(
+            &self.runtime_templates.dir,
+            self.runtime_templates.import_root.as_deref(),
+            &runtime_root,
+            &self.storage.images_dir,
+            &self.storage.instances_dir,
+            &self.template.dir,
+        )?;
+        if self.runtime_templates.max_files == 0 {
+            return Err(BlazeError::ConfigError {
+                source: ConfigErrorSource::InvalidValue(
+                    "runtime_templates.max_files must be greater than zero".to_string(),
+                ),
+            });
+        }
+        if self.runtime_templates.max_bytes == 0 {
+            return Err(BlazeError::ConfigError {
+                source: ConfigErrorSource::InvalidValue(
+                    "runtime_templates.max_bytes must be greater than zero".to_string(),
+                ),
+            });
+        }
+        if self.runtime_templates.max_metadata_bytes == 0
+            || self.runtime_templates.max_metadata_bytes > self.runtime_templates.max_bytes
+        {
+            return Err(BlazeError::ConfigError {
+                source: ConfigErrorSource::InvalidValue(
+                    "runtime_templates.max_metadata_bytes must be greater than zero and no \
+                     larger than max_bytes"
+                        .to_string(),
+                ),
+            });
+        }
+        if self.runtime_templates.max_total_bytes == 0 {
+            return Err(BlazeError::ConfigError {
+                source: ConfigErrorSource::InvalidValue(
+                    "runtime_templates.max_total_bytes must be greater than zero".to_string(),
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -338,6 +420,77 @@ pub fn validate_runtime_storage_paths(
     Ok(())
 }
 
+fn validate_runtime_template_paths(
+    dir: &Path,
+    import_root: Option<&Path>,
+    runtime_root: &Path,
+    images_dir: &Path,
+    instances_dir: &Path,
+    template_dir: &Path,
+) -> Result<()> {
+    validate_absolute_root(dir, "runtime_templates.dir")?;
+    if let Some(import_root) = import_root {
+        validate_absolute_root(import_root, "runtime_templates.import_root")?;
+    }
+
+    let mut roots = vec![
+        ("runtime slot root", runtime_root),
+        ("storage.images_dir", images_dir),
+        ("storage.instances_dir", instances_dir),
+        ("template.dir", template_dir),
+    ];
+    if let Some(import_root) = import_root {
+        roots.push(("runtime_templates.import_root", import_root));
+    }
+    for (label, root) in roots {
+        if paths_overlap(dir, root) {
+            return Err(BlazeError::ConfigError {
+                source: ConfigErrorSource::InvalidValue(format!(
+                    "runtime_templates.dir ({}) and {label} ({}) must be disjoint",
+                    dir.display(),
+                    root.display()
+                )),
+            });
+        }
+    }
+
+    if let Some(import_root) = import_root {
+        for (label, root) in [
+            ("runtime slot root", runtime_root),
+            ("storage.images_dir", images_dir),
+            ("storage.instances_dir", instances_dir),
+            ("template.dir", template_dir),
+        ] {
+            if paths_overlap(import_root, root) {
+                return Err(BlazeError::ConfigError {
+                    source: ConfigErrorSource::InvalidValue(format!(
+                        "runtime_templates.import_root ({}) and {label} ({}) must be disjoint",
+                        import_root.display(),
+                        root.display()
+                    )),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_absolute_root(path: &Path, label: &str) -> Result<()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(BlazeError::ConfigError {
+            source: ConfigErrorSource::InvalidValue(format!(
+                "{label} ({}) must be an absolute path without parent components",
+                path.display()
+            )),
+        });
+    }
+    Ok(())
+}
+
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
@@ -376,6 +529,21 @@ fn default_template_gc_interval() -> String {
 }
 fn default_template_idle_ttl() -> String {
     "1h".to_string()
+}
+fn default_runtime_template_dir() -> PathBuf {
+    PathBuf::from("/var/lib/blaze/runtime-templates")
+}
+fn default_runtime_template_max_files() -> usize {
+    32
+}
+fn default_runtime_template_max_bytes() -> u64 {
+    256 * 1024 * 1024 * 1024
+}
+fn default_runtime_template_max_metadata_bytes() -> u64 {
+    1024 * 1024
+}
+fn default_runtime_template_max_total_bytes() -> u64 {
+    1024 * 1024 * 1024 * 1024
 }
 fn default_prometheus_socket() -> PathBuf {
     PathBuf::from("/run/blaze/metrics.sock")
@@ -418,6 +586,7 @@ mod tests {
             cfg.storage.flush_schedule().expect("flush schedule"),
             StorageFlushSchedule::Disabled
         );
+        assert!(cfg.runtime_templates.import_root.is_none());
     }
 
     #[test]
@@ -593,5 +762,49 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_unsafe_runtime_template_boundaries() {
+        let mut relative = DaemonConfig::default();
+        relative.runtime_templates.dir = PathBuf::from("runtime-templates");
+        assert!(relative.validate().is_err());
+
+        let mut parent = DaemonConfig::default();
+        parent.runtime_templates.dir = PathBuf::from("/var/lib/blaze/../runtime-templates");
+        assert!(parent.validate().is_err());
+
+        let mut overlapping = DaemonConfig::default();
+        overlapping.runtime_templates.import_root =
+            Some(PathBuf::from("/var/lib/blaze/runtime-templates/imports"));
+        assert!(overlapping.validate().is_err());
+
+        for owned_root in [
+            "/var/lib/blaze/runtime-pool/catalog",
+            "/var/lib/blaze/images/catalog",
+            "/var/lib/blaze/instances/catalog",
+            "/var/lib/blaze/templates/catalog",
+        ] {
+            let mut config = DaemonConfig::default();
+            config.runtime_templates.dir = PathBuf::from(owned_root);
+            assert!(config.validate().is_err());
+        }
+
+        let mut source_overlap = DaemonConfig::default();
+        source_overlap.runtime_templates.import_root =
+            Some(PathBuf::from("/var/lib/blaze/images/imports"));
+        assert!(source_overlap.validate().is_err());
+
+        let mut unbounded = DaemonConfig::default();
+        unbounded.runtime_templates.max_files = 0;
+        assert!(unbounded.validate().is_err());
+
+        let mut metadata = DaemonConfig::default();
+        metadata.runtime_templates.max_metadata_bytes = metadata.runtime_templates.max_bytes + 1;
+        assert!(metadata.validate().is_err());
+
+        let mut total = DaemonConfig::default();
+        total.runtime_templates.max_total_bytes = 0;
+        assert!(total.validate().is_err());
     }
 }

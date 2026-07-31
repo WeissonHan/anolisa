@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
 use crate::metrics::Metrics;
+use crate::sandbox::template::RuntimeTemplateCatalog;
 use crate::sandbox::{SandboxManager, SandboxManagerInit};
 use crate::spawner::SpawnerRegistry;
 
@@ -63,6 +64,7 @@ impl ServerState {
     ) -> Result<Self> {
         let state_dir = config.daemon.state_dir.clone();
         let instances = scan_state_dir(&state_dir)?;
+        let runtime_templates = RuntimeTemplateCatalog::open(&config.runtime_templates)?;
         let (manager, resources) = SandboxManager::new(SandboxManagerInit {
             instances,
             pool,
@@ -76,6 +78,7 @@ impl ServerState {
             prefork: config.storage.prefork,
             default_warm_ttl: config.pool.default_warm_ttl.clone(),
             gc_interval: config.pool.gc_interval.clone(),
+            runtime_templates,
         })?;
 
         Ok(Self {

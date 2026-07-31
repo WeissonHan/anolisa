@@ -299,6 +299,7 @@ mod tests {
 
     use async_trait::async_trait;
     use blaze_core::backend::{BackendKind, SpawnRequest};
+    use blaze_core::config::RuntimeTemplateSection;
     use blaze_core::error::{BlazeError, Result as CoreResult};
     use blaze_core::lifecycle::{
         BackendOwnership, OperationKind, SandboxInstance, SandboxState, StartPath,
@@ -312,6 +313,7 @@ mod tests {
 
     use crate::file_provider::FileStorageProvider;
     use crate::sandbox::manager::{SandboxManagerInit, SandboxManagerResources};
+    use crate::sandbox::template::RuntimeTemplateCatalog;
     use crate::spawner::{BackendSpawner, MockSpawner, SpawnerRegistry};
 
     use super::*;
@@ -426,6 +428,11 @@ mod tests {
         }
         let mut spawners = SpawnerRegistry::new();
         spawners.insert(BackendKind::Mock, Arc::new(MockSpawner));
+        let runtime_templates = RuntimeTemplateCatalog::open(&RuntimeTemplateSection {
+            dir: temp.join("runtime-templates"),
+            ..RuntimeTemplateSection::default()
+        })
+        .expect("runtime template catalog");
         let (manager, resources) = SandboxManager::new(SandboxManagerInit {
             instances: HashMap::new(),
             pool: PoolManager::new(),
@@ -439,6 +446,7 @@ mod tests {
             prefork: false,
             default_warm_ttl: "30m".to_string(),
             gc_interval: "5m".to_string(),
+            runtime_templates,
         })
         .expect("manager");
         (Arc::new(manager), resources)

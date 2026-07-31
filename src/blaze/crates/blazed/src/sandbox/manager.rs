@@ -29,6 +29,7 @@ use crate::runtime_pool::{
     reconcile_runtime_slots, remove_lifecycle_tombstone, runtime_dir as derive_runtime_dir,
     tombstone_lifecycle_slot,
 };
+use crate::sandbox::template::RuntimeTemplateCatalog;
 use crate::spawner::{DynBackendInstance, DynSpawner, SpawnerRegistry};
 
 const INSTANCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -96,6 +97,7 @@ pub struct SandboxManager {
     mem_size: u64,
     metrics: Arc<Metrics>,
     cancellation: CancellationToken,
+    pub(super) runtime_templates: RuntimeTemplateCatalog,
 }
 
 /// Construction inputs grouped to keep daemon wiring explicit.
@@ -112,6 +114,7 @@ pub struct SandboxManagerInit {
     pub prefork: bool,
     pub default_warm_ttl: String,
     pub gc_interval: String,
+    pub runtime_templates: RuntimeTemplateCatalog,
 }
 
 /// Shared read-only resources retained by [`crate::state::ServerState`].
@@ -138,6 +141,7 @@ impl SandboxManager {
             prefork,
             default_warm_ttl,
             gc_interval,
+            runtime_templates,
         } = init;
         let instances = Arc::new(Mutex::new(instances));
         let backend_instances = Arc::new(Mutex::new(HashMap::new()));
@@ -190,6 +194,7 @@ impl SandboxManager {
                 mem_size,
                 metrics,
                 cancellation,
+                runtime_templates,
             },
             resources,
         ))
