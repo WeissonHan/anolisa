@@ -12,8 +12,9 @@ Prometheus 指标导出，设计为 E2B 类编排平台的单机执行代理。
 
 - **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + TCP (`:14159`)
 - **策略驱动后端选择** — workload class → 后端优先级列表
-- **生命周期状态机** — 9 种状态：Pending、Creating、Running、Paused、
-  Checkpointed、RecoveryRequired、Reset、Warm 和 Destroyed
+- **生命周期状态机** — 13 种状态：Pending、Creating、Running、Paused、
+  Checkpointed、Restoring、Hibernating、Hibernated、Resuming、
+  RecoveryRequired、Reset、Warm 和 Destroyed
 - **Guest 操作** — 对提供 guest endpoint 的运行中后端执行有界命令和文件传输
 - **Warm pool 管理** — 预热实例 + 基于 TTL 的 GC
 - **模板注册表** — 内存中模板追踪，支持空闲驱逐
@@ -137,6 +138,8 @@ images_dir = "/var/lib/blaze/images"
 | POST | `/v1/sandboxes/{id}/checkpoint` | 后端和存储 provider 支持时捕获完整 checkpoint |
 | GET | `/v1/sandboxes/{id}/checkpoints` | 列出已提交的 checkpoint 及其 HEAD 可达性 |
 | POST | `/v1/sandboxes/{id}/rollback/{checkpoint_id}` | 用经过校验的 checkpoint 替换正在运行的 sandbox |
+| POST | `/v1/sandboxes/{id}/hibernate` | 持久化 VM 状态并释放正在运行的后端 |
+| POST | `/v1/sandboxes/{id}/resume` | 恢复休眠 sandbox，并等待已启用的 guest 通信就绪 |
 | GET | `/v1/instances` | 列出 sandbox 的兼容入口 |
 | POST | `/v1/instances` | 创建 sandbox 的兼容入口 |
 | GET | `/v1/instances/{id}` | 获取 sandbox 详情的兼容入口 |
@@ -148,6 +151,8 @@ images_dir = "/var/lib/blaze/images"
 | POST | `/v1/instances/{id}/checkpoint` | 捕获完整 checkpoint 的兼容入口 |
 | GET | `/v1/instances/{id}/checkpoints` | 列出 checkpoint 的兼容入口 |
 | POST | `/v1/instances/{id}/rollback/{checkpoint_id}` | 恢复 checkpoint 的兼容入口 |
+| POST | `/v1/instances/{id}/hibernate` | 休眠 sandbox 的兼容入口 |
+| POST | `/v1/instances/{id}/resume` | 恢复休眠 sandbox 的兼容入口 |
 | POST | `/v1/instances/{id}/reset` | 预留接口；运行时重置实现前返回 `501` |
 | GET | `/v1/pools` | 列出 warm pool |
 | GET | `/v1/pools/{backend}/{class}` | 获取 pool 状态 |
@@ -167,7 +172,9 @@ images_dir = "/var/lib/blaze/images"
 `Running`，销毁成功后状态为 `Destroyed`。如果失败补偿不能释放全部已有
 资源，sandbox 会保留为可查询的 `RecoveryRequired`，后续可以再次执行销毁。
 
-daemon 启动时会逐个处理未结束的 sandbox。单个 sandbox 清理失败不会阻止
+daemon 启动时会逐个处理需要自动清理的 sandbox。已经完成休眠的 sandbox 会
+保留下来等待恢复；中断的休眠或恢复操作会以 `RecoveryRequired` 保留，等待
+显式销毁，而不会被误认为仍在运行。其余 sandbox 中的单条清理失败不会阻止
 其他记录继续处理，也不会阻止 API 启动。
 
 正常关闭时，daemon 会先停止接收新请求并等待已有连接结束，再为每条持久化
@@ -211,6 +218,26 @@ sandbox 标记为 `RecoveryRequired`，后续 destroy 仍能找到并清理这�
 
 `last_checkpoint` 始终表示最近一次成功捕获。恢复只移动 catalog HEAD，不会
 改写捕获历史。
+
+只有运行中后端支持暂停和完整快照，并且配置的 adapter 能恢复相同的后端版本
+时，休眠才可用。这些检查会在生命周期操作记录发生变化前完成。一次成功的
+休眠会：
+
+1. 记录操作意图、暂停后端，并把 VM 状态和内存写入隐藏的暂存目录；
+2. 刷新保留的存储 slot，并在 manifest 中记录文件大小和 SHA-256 摘要；
+3. 在停止后端之前同步完整的休眠镜像；
+4. 发布休眠目录，并提交 `Hibernated` 状态。
+
+恢复会在启动替换后端前校验 manifest 身份、完整文件集合和文件摘要。manager
+会先取得新后端的归属，再等待可选的 guest 通信就绪；只有最后一次存活检查
+通过后才提交 `Running`。旧后端停止前发生失败时，daemon 会恢复旧后端，并
+重新检查已经启用的 guest 通信。可以完整清理的恢复失败会回到
+`Hibernated`；如果无法确认清理结果，替换后端归属和操作记录会通过
+`RecoveryRequired` 保留下来。
+
+休眠期间，存储 slot 会继续保留。恢复成功后，最近一次休眠镜像也会保留到
+下一次休眠替换它，或显式销毁将其删除。daemon 重启后不会自动完成中断的
+休眠或恢复操作。
 
 runtime reset 仍是预留接口，会返回 `501`，且不会修改 runtime 或持久化状态。
 
