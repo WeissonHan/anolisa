@@ -204,6 +204,7 @@ pool.
 | POST | `/v1/sandboxes/{id}/rollback/{checkpoint_id}` | Replace a running sandbox from a verified checkpoint |
 | POST | `/v1/sandboxes/{id}/hibernate` | Persist VM state and release the live backend |
 | POST | `/v1/sandboxes/{id}/resume` | Resume a hibernated sandbox and wait for enabled guest transport |
+| POST | `/v1/sandboxes/{id}/checkpoints/prune` | Remove checkpoint branches outside retained lineages |
 | GET | `/v1/instances` | Alias for listing sandboxes |
 | POST | `/v1/instances` | Alias for creating a sandbox |
 | GET | `/v1/instances/{id}` | Alias for sandbox details |
@@ -217,6 +218,7 @@ pool.
 | POST | `/v1/instances/{id}/rollback/{checkpoint_id}` | Compatible checkpoint-restore action |
 | POST | `/v1/instances/{id}/hibernate` | Compatible sandbox-hibernation action |
 | POST | `/v1/instances/{id}/resume` | Compatible sandbox-resume action |
+| POST | `/v1/instances/{id}/checkpoints/prune` | Compatible checkpoint-prune action |
 | POST | `/v1/instances/{id}/reset` | Reserved; returns `501` until runtime reset is implemented |
 | GET | `/v1/pools` | List lifecycle recycling pools |
 | GET | `/v1/pools/{backend}/{class}` | Get lifecycle recycling-pool status |
@@ -322,6 +324,13 @@ The storage slot remains allocated while hibernated. A successful resume also
 retains the latest hibernation image until the next hibernate replaces it or an
 explicit destroy removes it. The daemon does not automatically complete an
 interrupted hibernate or resume after restart.
+
+Checkpoint pruning removes committed entries outside the HEAD lineage and any
+lineage still referenced by durable sandbox state. Each candidate is first
+renamed to a hidden tombstone, so a retry, sandbox destroy, or startup
+reconciliation can finish an interrupted deletion. Pruning uses the same
+per-sandbox operation lock as capture and rejects an unfinished lifecycle
+operation.
 
 Runtime reset remains reserved and returns `501` without changing runtime or
 persisted state.

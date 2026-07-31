@@ -191,6 +191,7 @@ ready 队列。该清理使用重启后当前配置的 provider 以及存储和�
 | POST | `/v1/sandboxes/{id}/rollback/{checkpoint_id}` | 用经过校验的 checkpoint 替换正在运行的 sandbox |
 | POST | `/v1/sandboxes/{id}/hibernate` | 持久化 VM 状态并释放正在运行的后端 |
 | POST | `/v1/sandboxes/{id}/resume` | 恢复休眠 sandbox，并等待已启用的 guest 通信就绪 |
+| POST | `/v1/sandboxes/{id}/checkpoints/prune` | 删除保留 lineage 之外的 checkpoint 分支 |
 | GET | `/v1/instances` | 列出 sandbox 的兼容入口 |
 | POST | `/v1/instances` | 创建 sandbox 的兼容入口 |
 | GET | `/v1/instances/{id}` | 获取 sandbox 详情的兼容入口 |
@@ -204,6 +205,7 @@ ready 队列。该清理使用重启后当前配置的 provider 以及存储和�
 | POST | `/v1/instances/{id}/rollback/{checkpoint_id}` | 恢复 checkpoint 的兼容入口 |
 | POST | `/v1/instances/{id}/hibernate` | 休眠 sandbox 的兼容入口 |
 | POST | `/v1/instances/{id}/resume` | 恢复休眠 sandbox 的兼容入口 |
+| POST | `/v1/instances/{id}/checkpoints/prune` | 删除 checkpoint 分支的兼容入口 |
 | POST | `/v1/instances/{id}/reset` | 预留接口；运行时重置实现前返回 `501` |
 | GET | `/v1/pools` | 列出生命周期回收 pool |
 | GET | `/v1/pools/{backend}/{class}` | 获取生命周期回收 pool 状态 |
@@ -290,6 +292,11 @@ sandbox 标记为 `RecoveryRequired`，后续 destroy 仍能找到并清理这�
 休眠期间，存储 slot 会继续保留。恢复成功后，最近一次休眠镜像也会保留到
 下一次休眠替换它，或显式销毁将其删除。daemon 重启后不会自动完成中断的
 休眠或恢复操作。
+
+checkpoint pruning 会删除 HEAD lineage 和持久 sandbox 状态所引用 lineage 之外
+的已提交记录。每个待删除目录会先被重命名为隐藏 tombstone，因此重试、
+sandbox 销毁或启动恢复都可以完成被中断的删除。pruning 与 capture 共用
+sandbox 操作锁，并拒绝存在未完成生命周期操作的 sandbox。
 
 runtime reset 仍是预留接口，会返回 `501`，且不会修改 runtime 或持久化状态。
 

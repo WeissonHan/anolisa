@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Durable checkpoint capture and listing.
+//! Durable checkpoint capture, listing, and pruning.
 
 use blaze_core::backend::{BackendKind, SnapshotKind, SnapshotRequest};
 use blaze_core::checkpoint::{CheckpointInfo, CheckpointMetadata, CommitCheckpoint};
@@ -300,6 +300,25 @@ impl SandboxManager {
         let _operation = self.operation_lock(id).lock_owned().await;
         self.get(id)?;
         self.checkpoints.list(id).map_err(checkpoint_store_error)
+    }
+
+    /// Remove branches not retained by HEAD or durable lifecycle references.
+    pub async fn prune_checkpoints(&self, id: Uuid) -> Result<Vec<String>> {
+        let _operation = self.operation_lock(id).lock_owned().await;
+        let instance = self.get(id)?;
+        if let Some(journal) = &instance.operation {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "instance {id} has unfinished {} operation",
+                journal.kind
+            )));
+        }
+        self.checkpoints
+            .cleanup_transaction_artifacts(id)
+            .map_err(checkpoint_store_error)?;
+        let protected = instance.last_checkpoint.into_iter().collect::<Vec<_>>();
+        self.checkpoints
+            .prune_preserving(id, &protected)
+            .map_err(checkpoint_store_error)
     }
 
     async fn finish_failed_unpublished_checkpoint<T>(
