@@ -18,6 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::checkpoint_store::CheckpointStore;
 use crate::error::{BlazeDaemonError, Result};
 use crate::guest::{GuestClient, GuestExecResult, MAX_GUEST_FILE_BYTES};
 use crate::metrics::Metrics;
@@ -28,7 +29,7 @@ use crate::runtime_pool::{
     reconcile_runtime_slots, remove_lifecycle_tombstone, runtime_dir as derive_runtime_dir,
     tombstone_lifecycle_slot,
 };
-use crate::spawner::{DynBackendInstance, SpawnerRegistry};
+use crate::spawner::{DynBackendInstance, DynSpawner, SpawnerRegistry};
 
 const INSTANCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,8 +89,9 @@ pub struct SandboxManager {
     runtime_pool: Arc<RuntimeWarmPool>,
     spawners: Arc<SpawnerRegistry>,
     active_backend: BackendKind,
-    storage: Arc<dyn StorageProvider>,
-    state_dir: PathBuf,
+    pub(super) storage: Arc<dyn StorageProvider>,
+    pub(super) state_dir: PathBuf,
+    pub(super) checkpoints: CheckpointStore,
     rootfs_size: u64,
     mem_size: u64,
     metrics: Arc<Metrics>,
@@ -165,6 +167,7 @@ impl SandboxManager {
             gc_interval,
             cancellation.clone(),
         )?;
+        let checkpoints = CheckpointStore::new(state_dir.join("checkpoints"));
         let resources = SandboxManagerResources {
             #[cfg(test)]
             instances: instances.clone(),
@@ -182,6 +185,7 @@ impl SandboxManager {
                 active_backend,
                 storage,
                 state_dir,
+                checkpoints,
                 rootfs_size,
                 mem_size,
                 metrics,
@@ -243,11 +247,25 @@ impl SandboxManager {
         Ok(operation)
     }
 
-    #[cfg(test)]
-    pub fn backend_owner(&self, id: Uuid) -> Option<DynBackendInstance> {
+    pub(crate) fn backend_owner(&self, id: Uuid) -> Option<DynBackendInstance> {
         match self.backend_instances.lock() {
             Ok(instances) => instances.get(&id).cloned(),
             Err(poisoned) => poisoned.into_inner().get(&id).cloned(),
+        }
+    }
+
+    pub(super) fn spawner(&self, backend: BackendKind) -> Option<DynSpawner> {
+        self.spawners.get(backend)
+    }
+
+    pub(super) fn runtime_dir(&self, id: Uuid) -> PathBuf {
+        self.state_dir.join(id.to_string())
+    }
+
+    pub(super) fn remove_backend_owner(&self, id: Uuid) -> Option<DynBackendInstance> {
+        match self.backend_instances.lock() {
+            Ok(mut instances) => instances.remove(&id),
+            Err(poisoned) => poisoned.into_inner().remove(&id),
         }
     }
 
@@ -291,7 +309,7 @@ impl SandboxManager {
             .lock()
             .map_err(|_| poisoned("instances"))?
             .values()
-            .filter(|instance| !is_clean_terminal(instance))
+            .filter(|instance| requires_automatic_cleanup(instance))
             .map(|instance| instance.id)
             .collect::<BTreeSet<_>>();
         ids.extend(
@@ -1261,6 +1279,28 @@ impl SandboxManager {
         }
         self.forget_backend(id);
 
+        if let Err(error) = self.checkpoints.cleanup_transaction_artifacts(id) {
+            let recovery = self.mark_recovery(id).err();
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "destroy {id}: backend stopped but checkpoint cleanup failed: {error}; \
+                 storage retained{}",
+                recovery
+                    .map(|error| format!("; recovery state persistence failed: {error}"))
+                    .unwrap_or_default()
+            )));
+        }
+
+        if let Err(error) = self.cleanup_hibernate_artifacts(id).await {
+            let recovery = self.mark_recovery(id).err();
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "destroy {id}: backend stopped but hibernation cleanup failed: {error}; \
+                 storage retained{}",
+                recovery
+                    .map(|error| format!("; recovery state persistence failed: {error}"))
+                    .unwrap_or_default()
+            )));
+        }
+
         if let Err(error) = self.storage.release_by_id(&id.to_string()).await {
             let recovery = self.mark_recovery(id).err();
             return Err(BlazeDaemonError::RecoveryRequired(format!(
@@ -1397,7 +1437,10 @@ impl SandboxManager {
     /// Reconcile every record that is not cleanly terminal without aborting
     /// on one failure.
     pub async fn reconcile_startup(&self) -> ReconcileReport {
-        self.cleanup_owned_instances().await
+        let mut classification_failures = self.classify_interrupted_hibernation();
+        let mut report = self.cleanup_owned_instances().await;
+        report.failures.append(&mut classification_failures);
+        report
     }
 
     /// Release unclaimed runtime slots before the daemon starts listening.
@@ -1447,6 +1490,50 @@ impl SandboxManager {
             .await
     }
 
+    fn classify_interrupted_hibernation(&self) -> Vec<ReconcileFailure> {
+        let interrupted = match self.instances.lock() {
+            Ok(instances) => instances
+                .values()
+                .filter(|instance| {
+                    matches!(
+                        instance.state,
+                        SandboxState::Hibernating | SandboxState::Resuming
+                    ) || matches!(
+                        instance.operation.as_ref().map(|operation| operation.kind),
+                        Some(OperationKind::Hibernate | OperationKind::Resume)
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .values()
+                .filter(|instance| {
+                    matches!(
+                        instance.state,
+                        SandboxState::Hibernating | SandboxState::Resuming
+                    ) || matches!(
+                        instance.operation.as_ref().map(|operation| operation.kind),
+                        Some(OperationKind::Hibernate | OperationKind::Resume)
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+        };
+        interrupted
+            .into_iter()
+            .filter_map(|instance| {
+                let id = instance.id;
+                self.mark_instance_recovery(instance)
+                    .err()
+                    .map(|error| ReconcileFailure {
+                        instance_id: id,
+                        error: format!("interrupted hibernation classification failed: {error}"),
+                    })
+            })
+            .collect()
+    }
+
     fn guest_client(&self, id: Uuid) -> Result<GuestClient> {
         let backend = self
             .backend_instances
@@ -1470,7 +1557,7 @@ impl SandboxManager {
         ))
     }
 
-    async fn wait_for_guest_ready(
+    pub(super) async fn wait_for_guest_ready(
         &self,
         backend: &DynBackendInstance,
         failpoint: &str,
@@ -1501,13 +1588,13 @@ impl SandboxManager {
         let mut ids = match self.instances.lock() {
             Ok(instances) => instances
                 .values()
-                .filter(|instance| !is_clean_terminal(instance))
+                .filter(|instance| requires_automatic_cleanup(instance))
                 .map(|instance| instance.id)
                 .collect::<BTreeSet<_>>(),
             Err(poisoned) => poisoned
                 .into_inner()
                 .values()
-                .filter(|instance| !is_clean_terminal(instance))
+                .filter(|instance| requires_automatic_cleanup(instance))
                 .map(|instance| instance.id)
                 .collect::<BTreeSet<_>>(),
         };
@@ -1789,7 +1876,7 @@ impl SandboxManager {
         }
     }
 
-    fn mark_recovery(&self, id: Uuid) -> Result<()> {
+    pub(super) fn mark_recovery(&self, id: Uuid) -> Result<()> {
         self.mark_instance_recovery(self.get(id)?)
     }
 
@@ -1802,7 +1889,15 @@ impl SandboxManager {
         }
     }
 
-    fn mark_instance_recovery(&self, mut instance: SandboxInstance) -> Result<()> {
+    pub(super) fn persist_and_retain(&self, instance: SandboxInstance) -> Result<()> {
+        instance.persist(&self.state_dir)?;
+        if let Some(error) = self.retain_instance(instance) {
+            return Err(BlazeDaemonError::RecoveryRequired(error));
+        }
+        Ok(())
+    }
+
+    pub(super) fn mark_instance_recovery(&self, mut instance: SandboxInstance) -> Result<()> {
         if instance.state == SandboxState::Destroyed {
             if instance.operation.as_ref().map(|operation| operation.kind)
                 != Some(OperationKind::Destroy)
@@ -1824,7 +1919,7 @@ impl SandboxManager {
         }
     }
 
-    fn retain_backend(&self, id: Uuid, backend: DynBackendInstance) -> Option<String> {
+    pub(super) fn retain_backend(&self, id: Uuid, backend: DynBackendInstance) -> Option<String> {
         match self.backend_instances.lock() {
             Ok(mut instances) => {
                 instances.insert(id, backend);
@@ -1848,7 +1943,7 @@ impl SandboxManager {
         }
     }
 
-    fn retain_instance(&self, instance: SandboxInstance) -> Option<String> {
+    pub(super) fn retain_instance(&self, instance: SandboxInstance) -> Option<String> {
         match self.instances.lock() {
             Ok(mut instances) => {
                 instances.insert(instance.id, instance);
@@ -1950,6 +2045,18 @@ fn required_runtime_owner_token(instance: &SandboxInstance) -> Result<Uuid> {
             instance.id
         ))
     })
+}
+
+fn requires_automatic_cleanup(instance: &SandboxInstance) -> bool {
+    !(is_clean_terminal(instance)
+        || (instance.state == SandboxState::Hibernated
+            && instance.operation.is_none()
+            && instance.backend_ownership == BackendOwnership::Stopped)
+        || (instance.state == SandboxState::RecoveryRequired
+            && matches!(
+                instance.operation.as_ref().map(|operation| operation.kind),
+                Some(OperationKind::Hibernate | OperationKind::Resume)
+            )))
 }
 
 fn operation_lock(

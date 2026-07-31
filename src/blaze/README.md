@@ -13,8 +13,9 @@ Designed as the per-host agent for E2B-style orchestrator platforms.
 
 - **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + TCP (`:14159`)
 - **Policy-driven backend selection** — workload class → backend priority list
-- **Lifecycle state machine** — 9 states: Pending, Creating, Running, Paused,
-  Checkpointed, RecoveryRequired, Reset, Warm, and Destroyed
+- **Lifecycle state machine** — 13 states: Pending, Creating, Running, Paused,
+  Checkpointed, Restoring, Hibernating, Hibernated, Resuming,
+  RecoveryRequired, Reset, Warm, and Destroyed
 - **Guest operations** — bounded command execution and file transfer for
   running backends that expose a guest endpoint
 - **Runtime slot capacity** — independent storage slots with optional backend
@@ -198,6 +199,11 @@ pool.
 | POST | `/v1/sandboxes/{id}/exec` | Execute a guest command |
 | POST | `/v1/sandboxes/{id}/read` | Read a guest file |
 | POST | `/v1/sandboxes/{id}/write` | Replace a guest file |
+| POST | `/v1/sandboxes/{id}/checkpoint` | Capture a full checkpoint when the backend and storage provider support it |
+| GET | `/v1/sandboxes/{id}/checkpoints` | List committed checkpoints and HEAD reachability |
+| POST | `/v1/sandboxes/{id}/rollback/{checkpoint_id}` | Replace a running sandbox from a verified checkpoint |
+| POST | `/v1/sandboxes/{id}/hibernate` | Persist VM state and release the live backend |
+| POST | `/v1/sandboxes/{id}/resume` | Resume a hibernated sandbox and wait for enabled guest transport |
 | GET | `/v1/instances` | Alias for listing sandboxes |
 | POST | `/v1/instances` | Alias for creating a sandbox |
 | GET | `/v1/instances/{id}` | Alias for sandbox details |
@@ -206,7 +212,11 @@ pool.
 | POST | `/v1/instances/{id}/exec` | Compatible guest command action |
 | POST | `/v1/instances/{id}/read` | Compatible guest file read action |
 | POST | `/v1/instances/{id}/write` | Compatible guest file write action |
-| POST | `/v1/instances/{id}/checkpoint` | Reserved; returns `501` until backend and storage capture is implemented |
+| POST | `/v1/instances/{id}/checkpoint` | Compatible full-checkpoint action |
+| GET | `/v1/instances/{id}/checkpoints` | Compatible checkpoint-list action |
+| POST | `/v1/instances/{id}/rollback/{checkpoint_id}` | Compatible checkpoint-restore action |
+| POST | `/v1/instances/{id}/hibernate` | Compatible sandbox-hibernation action |
+| POST | `/v1/instances/{id}/resume` | Compatible sandbox-resume action |
 | POST | `/v1/instances/{id}/reset` | Reserved; returns `501` until runtime reset is implemented |
 | GET | `/v1/pools` | List lifecycle recycling pools |
 | GET | `/v1/pools/{backend}/{class}` | Get lifecycle recycling-pool status |
@@ -229,22 +239,92 @@ the sandbox remains visible as `RecoveryRequired` so destroy can be retried.
 
 Runtime-slot reconciliation completes before this lifecycle pass. An
 inventory, journal, or runtime cleanup error stops startup. After it succeeds,
-the daemon reconciles each non-terminal sandbox independently. Failure to
-clean up one sandbox does not prevent the remaining records from being
-processed or the API from starting.
+the daemon reconciles each sandbox independently. A completed hibernation is
+retained for resume. An interrupted hibernate or resume is retained as
+`RecoveryRequired` for explicit destroy instead of being mistaken for a live
+runtime. Failure to clean up one of the remaining sandboxes does not prevent
+the other records from being processed or the API from starting.
 
 During graceful shutdown, the daemon first stops accepting work and drains
 accepted connections. It then attempts bounded cleanup for every persisted
 record and retained backend owner. One cleanup failure does not skip the
 remaining sandboxes, and all unresolved records are reported.
 
-The operation journal records the operation and start time, not completion of
-each resource step. An interrupted create is cleaned up rather than resumed,
-and an existing backend process is not adopted after restart. Failed recovery
-does not run in a background retry loop. Checkpoint and reset validate that the
-sandbox is running with no active lifecycle operation, then return `501`
-without changing runtime or persisted state. Their backend and storage
-operations are not implemented here.
+Create and destroy journals record the operation and start time. Checkpoint
+journals also record the generated checkpoint ID and the latest durable
+boundary the daemon confirmed. Checkpoint listing separately reports which
+catalog entries and HEAD update are actually visible after an interruption.
+An interrupted create is cleaned up rather than resumed, and an existing
+backend process is not adopted after restart. Failed recovery does not run in
+a background retry loop.
+
+Checkpoint capture is available only when both the selected backend and the
+configured storage provider report full-capture support. Otherwise the daemon
+returns `501` before creating a journal, pausing the backend, or changing the
+checkpoint catalog. A supported capture:
+
+1. pauses the backend and captures full VM and memory artifacts;
+2. flushes the live storage slot and copies the full root filesystem;
+3. publishes a verified checkpoint and advances HEAD; and
+4. resumes the backend and confirms guest readiness before returning
+   `Running`.
+
+The file storage provider copies the complete root filesystem into each
+checkpoint. This uses more capacity than a shared-base format, but each
+checkpoint remains independent of later changes to the live slot.
+
+Failures detected before calling the catalog publication step resume the
+backend and discard the incomplete stage. If publication or HEAD has an
+uncertain outcome, or the backend cannot resume, the sandbox becomes
+`RecoveryRequired` while runtime ownership and committed checkpoint data
+remain available for explicit cleanup. Listing uses the same per-sandbox
+operation lock as capture, guest operations, and destroy. Destroy removes
+transaction scratch but preserves committed checkpoint history.
+
+Checkpoint restore is available only when the current storage provider and the
+checkpoint's backend implement restore, and the current backend version exactly
+matches the version recorded at capture. The daemon verifies the selected
+checkpoint, its parent chain, and all artifact hashes before changing runtime
+state.
+
+The file provider stages a separate rootfs copy while the current backend is
+still running. After the old backend stops, the daemon selects that copy,
+starts and owns the replacement backend, moves HEAD to the selected checkpoint,
+and only then releases the previous rootfs. A failure before backend shutdown
+keeps the original runtime running. A failure after shutdown retains the
+resources that actually exist and marks the sandbox `RecoveryRequired`, so a
+later destroy can finish cleanup without losing process ownership.
+
+`last_checkpoint` continues to mean the most recent completed capture. Restore
+moves catalog HEAD but does not rewrite capture history.
+
+Hibernation is available only when the running backend supports pause and full
+snapshot capture and its configured adapter can restore the same backend
+version. These checks happen before the lifecycle journal changes. A successful
+hibernate:
+
+1. records intent, pauses the backend, and writes VM state and memory into a
+   hidden staging directory;
+2. flushes the retained storage slot and records artifact sizes and SHA-256
+   digests in a manifest;
+3. synchronizes the complete image before stopping the backend;
+4. publishes the hibernation directory and commits `Hibernated`.
+
+Resume verifies the manifest identity, exact file set, and artifact digests
+before starting a replacement backend. The manager owns that backend before
+waiting for optional guest readiness and commits `Running` only after a final
+liveness check. A failure before the original backend stops resumes it and
+rechecks enabled guest transport. A clean resume failure returns to
+`Hibernated`; if cleanup cannot be confirmed, the replacement owner and
+operation journal remain available through `RecoveryRequired`.
+
+The storage slot remains allocated while hibernated. A successful resume also
+retains the latest hibernation image until the next hibernate replaces it or an
+explicit destroy removes it. The daemon does not automatically complete an
+interrupted hibernate or resume after restart.
+
+Runtime reset remains reserved and returns `501` without changing runtime or
+persisted state.
 
 ### Guest operations
 
