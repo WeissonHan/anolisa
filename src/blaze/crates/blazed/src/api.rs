@@ -118,7 +118,10 @@ async fn dispatch(
         ("POST", ["v1", "sandboxes", id, "write"]) | ("POST", ["v1", "instances", id, "write"]) => {
             write_instance_file(state, id, &body).await
         }
-        ("POST", ["v1", "instances", id, "checkpoint"]) => checkpoint(state, id).await,
+        ("POST", ["v1", "instances", id, "checkpoint"])
+        | ("POST", ["v1", "sandboxes", id, "checkpoint"]) => checkpoint(state, id).await,
+        ("GET", ["v1", "instances", id, "checkpoints"])
+        | ("GET", ["v1", "sandboxes", id, "checkpoints"]) => list_checkpoints(state, id).await,
         ("POST", ["v1", "instances", id, "reset"]) => reset_instance(state, id).await,
         ("DELETE", ["v1", "instances", id])
         | ("DELETE", ["v1", "sandboxes", id])
@@ -302,14 +305,11 @@ async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Respon
 
 async fn checkpoint(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
     let uuid = parse_uuid(id)?;
-    let _operation = state
-        .manager
-        .lock_quiescent_state(uuid, SandboxState::Running)
-        .await?;
+    json_ok(&state.manager.checkpoint(uuid).await?)
+}
 
-    Err(BlazeDaemonError::UnsupportedOperation(format!(
-        "instance {uuid} cannot be checkpointed until its backend and storage state can be captured"
-    )))
+async fn list_checkpoints(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    json_ok(&state.manager.list_checkpoints(parse_uuid(id)?).await?)
 }
 
 async fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
@@ -848,6 +848,8 @@ mod tests {
     use blaze_core::backend::{BackendKind, SpawnRequest};
     use blaze_core::config::DaemonConfig;
     use blaze_core::kernel::HookRegistry;
+    #[cfg(feature = "test-failpoints")]
+    use blaze_core::lifecycle::OperationPhase;
     use blaze_core::lifecycle::{BackendOwnership, OperationKind};
     use blaze_core::policy::{
         BackendConfigs, FallbackOnMissingHook, PolicyEngine, PolicyFile, PolicyHooks, PolicyMatch,
@@ -951,7 +953,11 @@ mod tests {
 
     #[cfg(feature = "test-failpoints")]
     fn mock_state(temp: &tempfile::TempDir, pooled: bool) -> Arc<ServerState> {
-        let config = test_config(temp);
+        mock_state_from_config(test_config(temp), pooled)
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    fn mock_state_from_config(config: DaemonConfig, pooled: bool) -> Arc<ServerState> {
         let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
             config.storage.images_dir.clone(),
             config.storage.instances_dir.clone(),
@@ -976,6 +982,73 @@ mod tests {
                 .to_bytes(),
         )
         .expect("created json")
+    }
+
+    async fn write_checkpoint_fixture(state: &Arc<ServerState>, id: &str) -> StorageSlot {
+        let slot = state.storage.reconstruct(id).await.expect("storage slot");
+        tokio::fs::write(&slot.rootfs_path, b"checkpoint-rootfs")
+            .await
+            .expect("rootfs");
+        slot
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    async fn cancel_checkpoint_at(state: &Arc<ServerState>, id: Uuid, failpoint: &'static str) {
+        let hook = crate::failpoint::TestFailpoint::new(&[failpoint]);
+        let capture_state = state.clone();
+        let capture_hook = hook.clone();
+        let capture =
+            tokio::spawn(
+                async move { capture_hook.run(capture_state.manager.checkpoint(id)).await },
+            );
+        hook.wait_until_paused().await;
+        capture.abort();
+        let cancelled = capture
+            .await
+            .expect_err("checkpoint task must be cancelled");
+        assert!(cancelled.is_cancelled());
+    }
+
+    struct NoCheckpointStorage {
+        inner: FileStorageProvider,
+    }
+
+    #[async_trait]
+    impl StorageProvider for NoCheckpointStorage {
+        async fn probe(&self) -> blaze_core::Result<bool> {
+            self.inner.probe().await
+        }
+
+        async fn acquire(
+            &self,
+            opts: &AcquireOpts,
+        ) -> std::result::Result<StorageSlot, StorageAcquireError> {
+            self.inner.acquire(opts).await
+        }
+
+        async fn release(&self, slot: StorageSlot) -> blaze_core::Result<()> {
+            self.inner.release(slot).await
+        }
+
+        async fn release_by_id(&self, instance_id: &str) -> blaze_core::Result<()> {
+            self.inner.release_by_id(instance_id).await
+        }
+
+        async fn reconstruct(&self, instance_id: &str) -> blaze_core::Result<StorageSlot> {
+            self.inner.reconstruct(instance_id).await
+        }
+
+        async fn flush_dirty(&self, slot: &StorageSlot) -> blaze_core::Result<()> {
+            self.inner.flush_dirty(slot).await
+        }
+
+        fn pool_status(&self) -> PoolStatus {
+            self.inner.pool_status()
+        }
+
+        async fn drain_pool(&self) -> blaze_core::Result<usize> {
+            self.inner.drain_pool().await
+        }
     }
 
     async fn dispatched_json(
@@ -1795,13 +1868,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_rejects_state_only_snapshot() {
+    async fn checkpoint_rejects_unsupported_storage_without_mutation() {
         let temp = tempfile::tempdir().expect("temp");
         let config = test_config(&temp);
-        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
-            config.storage.images_dir.clone(),
-            config.storage.instances_dir.clone(),
-        ));
+        let storage: Arc<dyn StorageProvider> = Arc::new(NoCheckpointStorage {
+            inner: FileStorageProvider::with_images(
+                config.storage.images_dir.clone(),
+                config.storage.instances_dir.clone(),
+            ),
+        });
         let state = build_test_state(
             config,
             test_policy(BackendKind::Mock, false),
@@ -1826,11 +1901,648 @@ mod tests {
             state.instances.lock().expect("instances")[&uuid].state,
             SandboxState::Running
         );
+        assert!(
+            state.instances.lock().expect("instances")[&uuid]
+                .operation
+                .is_none()
+        );
         assert_eq!(
             std::fs::read(state_path).expect("persisted state"),
             persisted_before
         );
+        assert!(!state.state_dir.join("checkpoints").join(id).exists());
         assert!(state.manager.backend_owner(uuid).is_some());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_unsupported_backend_without_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let kill_count = Arc::new(AtomicUsize::new(0));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(
+                BackendKind::Mock,
+                Arc::new(CountingSpawner {
+                    kill_count: kill_count.clone(),
+                    orphan_cleanup_count: Arc::new(AtomicUsize::new(0)),
+                }),
+            ),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        let state_path = state.state_dir.join(id).join("state.json");
+        let persisted_before = std::fs::read(&state_path).expect("persisted state");
+
+        let error = checkpoint(&state, id)
+            .await
+            .expect_err("checkpoint without backend capture must fail closed");
+
+        assert!(matches!(error, BlazeDaemonError::UnsupportedOperation(_)));
+        assert_eq!(error.status_code(), 501);
+        let lifecycle = state.manager.get(uuid).expect("lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::Running);
+        assert!(lifecycle.operation.is_none());
+        assert_eq!(
+            std::fs::read(state_path).expect("persisted state"),
+            persisted_before
+        );
+        assert!(!state.state_dir.join("checkpoints").join(id).exists());
+        assert_eq!(kill_count.load(Ordering::Acquire), 0);
+        assert!(state.manager.backend_owner(uuid).is_some());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_routes_capture_and_list_live_state() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        let slot = write_checkpoint_fixture(&state, id).await;
+
+        let (status, checkpoint) = dispatched_json(
+            &state,
+            Method::POST,
+            &format!("/v1/sandboxes/{id}/checkpoint"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let checkpoint_id = checkpoint["id"].as_str().expect("checkpoint id");
+        assert_eq!(checkpoint["snapshot_kind"], "full");
+        assert_eq!(checkpoint["sandbox_id"], id);
+        let captured_rootfs = state
+            .state_dir
+            .join("checkpoints")
+            .join(id)
+            .join(checkpoint_id)
+            .join("rootfs.snap");
+        assert_eq!(
+            tokio::fs::read(&captured_rootfs)
+                .await
+                .expect("captured rootfs"),
+            b"checkpoint-rootfs"
+        );
+
+        tokio::fs::write(&slot.rootfs_path, b"changed-after-checkpoint")
+            .await
+            .expect("mutate live rootfs");
+        assert_eq!(
+            tokio::fs::read(&captured_rootfs)
+                .await
+                .expect("independent captured rootfs"),
+            b"checkpoint-rootfs"
+        );
+        let (status, checkpoints) = dispatched_json(
+            &state,
+            Method::GET,
+            &format!("/v1/instances/{id}/checkpoints"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(checkpoints.as_array().expect("checkpoint list").len(), 1);
+        assert_eq!(checkpoints[0]["id"], checkpoint_id);
+        assert_eq!(checkpoints[0]["is_head"], true);
+        assert_eq!(checkpoints[0]["on_head_chain"], true);
+
+        let lifecycle = state.manager.get(uuid).expect("lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::Running);
+        assert!(lifecycle.operation.is_none());
+        assert_eq!(lifecycle.last_checkpoint.as_deref(), Some(checkpoint_id));
+        assert!(state.manager.backend_owner(uuid).is_some());
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn checkpoint_snapshot_failure_resumes_and_clears_the_journal() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        let hook = crate::failpoint::TestFailpoint::new(&["checkpoint-snapshot"]);
+
+        let error = hook
+            .run(state.manager.checkpoint(uuid))
+            .await
+            .expect_err("snapshot failure");
+
+        assert!(matches!(
+            error,
+            BlazeDaemonError::Core(BlazeError::BackendError { .. })
+        ));
+        let lifecycle = state.manager.get(uuid).expect("lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::Running);
+        assert!(lifecycle.operation.is_none());
+        assert_eq!(
+            SandboxInstance::load(&state.state_dir, uuid)
+                .expect("persisted lifecycle")
+                .operation,
+            None
+        );
+        let checkpoint_dir = state.state_dir.join("checkpoints").join(id);
+        let staging = std::fs::read_dir(checkpoint_dir)
+            .expect("checkpoint directory")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".ckpt-"))
+            .count();
+        assert_eq!(staging, 0);
+        assert!(state.manager.backend_owner(uuid).is_some());
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn checkpoint_prepublication_failure_discards_the_stage() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        write_checkpoint_fixture(&state, id).await;
+        let hook = crate::failpoint::TestFailpoint::new(&["checkpoint-publish"]);
+
+        let error = hook
+            .run(state.manager.checkpoint(uuid))
+            .await
+            .expect_err("publication must fail before the store call");
+
+        assert!(matches!(
+            error,
+            BlazeDaemonError::Core(BlazeError::StorageError { .. })
+        ));
+        let lifecycle = state.manager.get(uuid).expect("lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::Running);
+        assert!(lifecycle.operation.is_none());
+        assert!(
+            state
+                .manager
+                .list_checkpoints(uuid)
+                .await
+                .expect("checkpoint catalog")
+                .is_empty()
+        );
+        assert!(state.manager.backend_owner(uuid).is_some());
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn checkpoint_state_failures_retain_the_reached_durable_phase() {
+        for (failpoint, expected_phase, expected_head) in [
+            (
+                "checkpoint-published-state",
+                OperationPhase::CheckpointPublished,
+                false,
+            ),
+            (
+                "checkpoint-head-state",
+                OperationPhase::CheckpointHeadUpdated,
+                true,
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let state = mock_state(&temp, false);
+            let created = created_json(&state, &test_request()).await;
+            let id = created["instance"]["id"].as_str().expect("id");
+            let uuid = Uuid::parse_str(id).expect("uuid");
+            write_checkpoint_fixture(&state, id).await;
+            let hook = crate::failpoint::TestFailpoint::new(&[failpoint]);
+
+            let error = hook
+                .run(state.manager.checkpoint(uuid))
+                .await
+                .expect_err("state commit must fail");
+
+            assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
+            let lifecycle = state.manager.get(uuid).expect("lifecycle");
+            assert_eq!(lifecycle.state, SandboxState::RecoveryRequired);
+            assert_eq!(
+                lifecycle
+                    .operation
+                    .as_ref()
+                    .and_then(|journal| journal.phase),
+                Some(expected_phase)
+            );
+            let checkpoints = state
+                .manager
+                .list_checkpoints(uuid)
+                .await
+                .expect("published checkpoint");
+            assert_eq!(checkpoints.len(), 1);
+            assert_eq!(checkpoints[0].is_head, expected_head);
+            assert!(state.manager.backend_owner(uuid).is_some());
+        }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn checkpoint_store_boundary_failures_preserve_observable_catalog_truth() {
+        for (failpoint, expected_phase, expected_head) in [
+            (
+                "checkpoint-store-publish-after-rename",
+                OperationPhase::CheckpointPaused,
+                false,
+            ),
+            (
+                "checkpoint-store-head-after-rename",
+                OperationPhase::CheckpointPublished,
+                true,
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let state = mock_state(&temp, false);
+            let created = created_json(&state, &test_request()).await;
+            let id = created["instance"]["id"].as_str().expect("id");
+            let uuid = Uuid::parse_str(id).expect("uuid");
+            write_checkpoint_fixture(&state, id).await;
+            let hook = crate::failpoint::TestFailpoint::new(&[failpoint]);
+
+            let error = hook
+                .run(state.manager.checkpoint(uuid))
+                .await
+                .expect_err("durability boundary must report an uncertain result");
+
+            assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
+            let lifecycle = state.manager.get(uuid).expect("lifecycle");
+            assert_eq!(lifecycle.state, SandboxState::RecoveryRequired);
+            assert_eq!(
+                lifecycle
+                    .operation
+                    .as_ref()
+                    .and_then(|journal| journal.phase),
+                Some(expected_phase)
+            );
+            let checkpoints = state
+                .manager
+                .list_checkpoints(uuid)
+                .await
+                .expect("observable checkpoint catalog");
+            assert_eq!(checkpoints.len(), 1);
+            assert_eq!(checkpoints[0].is_head, expected_head);
+            assert!(state.manager.backend_owner(uuid).is_some());
+        }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn checkpoint_resume_failure_keeps_head_and_runtime_ownership() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        write_checkpoint_fixture(&state, id).await;
+        let hook = crate::failpoint::TestFailpoint::new(&["checkpoint-resume"]);
+
+        let error = hook
+            .run(state.manager.checkpoint(uuid))
+            .await
+            .expect_err("resume failure");
+
+        assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
+        let lifecycle = state.manager.get(uuid).expect("lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::RecoveryRequired);
+        assert_eq!(
+            lifecycle
+                .operation
+                .as_ref()
+                .and_then(|journal| journal.phase),
+            Some(OperationPhase::CheckpointHeadUpdated)
+        );
+        assert!(state.manager.backend_owner(uuid).is_some());
+        let checkpoints = state
+            .manager
+            .list_checkpoints(uuid)
+            .await
+            .expect("committed checkpoint");
+        assert_eq!(checkpoints.len(), 1);
+        assert!(checkpoints[0].is_head);
+
+        state.manager.destroy(uuid).await.expect("destroy retry");
+        assert_eq!(
+            state.manager.get(uuid).expect("destroyed").state,
+            SandboxState::Destroyed
+        );
+        assert_eq!(
+            state
+                .manager
+                .list_checkpoints(uuid)
+                .await
+                .expect("durable checkpoint history")
+                .len(),
+            1
+        );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn published_checkpoint_holds_the_operation_lock_until_head_commit() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        write_checkpoint_fixture(&state, id).await;
+        let hook = crate::failpoint::TestFailpoint::new(&["checkpoint-after-publish-before-head"]);
+        let capture_state = state.clone();
+        let capture_hook = hook.clone();
+        let capture = tokio::spawn(async move {
+            capture_hook
+                .run(capture_state.manager.checkpoint(uuid))
+                .await
+        });
+        hook.wait_until_paused().await;
+
+        let persisted =
+            SandboxInstance::load(&state.state_dir, uuid).expect("persisted checkpoint journal");
+        assert_eq!(persisted.state, SandboxState::Paused);
+        assert_eq!(
+            persisted.operation.and_then(|journal| journal.phase),
+            Some(OperationPhase::CheckpointPublished)
+        );
+        let list_state = state.clone();
+        let mut list = tokio::spawn(async move { list_state.manager.list_checkpoints(uuid).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut list)
+                .await
+                .is_err(),
+            "checkpoint listing must wait for a consistent catalog boundary"
+        );
+        let destroy_state = state.clone();
+        let mut destroy = tokio::spawn(async move { destroy_state.manager.destroy(uuid).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut destroy)
+                .await
+                .is_err(),
+            "destroy must wait for checkpoint ownership"
+        );
+
+        hook.release();
+        capture
+            .await
+            .expect("capture task")
+            .expect("checkpoint capture");
+        let checkpoints = list.await.expect("list task").expect("checkpoint list");
+        assert_eq!(checkpoints.len(), 1);
+        assert!(checkpoints[0].is_head);
+        assert!(destroy.await.expect("destroy task").expect("destroy"));
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn cancelled_published_checkpoint_is_destroyable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+        let uuid = Uuid::parse_str(&id).expect("uuid");
+        write_checkpoint_fixture(&state, &id).await;
+        let hook = crate::failpoint::TestFailpoint::new(&["checkpoint-after-publish-before-head"]);
+        let capture_state = state.clone();
+        let capture_hook = hook.clone();
+        let capture = tokio::spawn(async move {
+            capture_hook
+                .run(capture_state.manager.checkpoint(uuid))
+                .await
+        });
+        hook.wait_until_paused().await;
+        capture.abort();
+        let _ = capture.await;
+
+        let interrupted = state.manager.get(uuid).expect("interrupted lifecycle");
+        assert_eq!(interrupted.state, SandboxState::Paused);
+        assert_eq!(
+            interrupted.operation.and_then(|journal| journal.phase),
+            Some(OperationPhase::CheckpointPublished)
+        );
+        assert!(
+            !state
+                .state_dir
+                .join("checkpoints")
+                .join(&id)
+                .join("HEAD")
+                .exists()
+        );
+
+        state
+            .manager
+            .destroy(uuid)
+            .await
+            .expect("destroy interrupted capture");
+        let checkpoints = state
+            .manager
+            .list_checkpoints(uuid)
+            .await
+            .expect("unreachable checkpoint");
+        assert_eq!(checkpoints.len(), 1);
+        assert!(!checkpoints[0].is_head);
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn cancelled_checkpoint_phases_are_destroyable_before_and_after_restart() {
+        for (failpoint, expected_state, expected_phase, checkpoint_count) in [
+            (
+                "checkpoint-after-begin",
+                SandboxState::Running,
+                OperationPhase::CheckpointPreparing,
+                0,
+            ),
+            (
+                "checkpoint-after-pause",
+                SandboxState::Paused,
+                OperationPhase::CheckpointPaused,
+                0,
+            ),
+            (
+                "checkpoint-after-head",
+                SandboxState::Paused,
+                OperationPhase::CheckpointHeadUpdated,
+                1,
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let state = mock_state(&temp, false);
+            let created = created_json(&state, &test_request()).await;
+            let id = created["instance"]["id"].as_str().expect("id").to_string();
+            let uuid = Uuid::parse_str(&id).expect("uuid");
+            write_checkpoint_fixture(&state, &id).await;
+            cancel_checkpoint_at(&state, uuid, failpoint).await;
+            let interrupted = state.manager.get(uuid).expect("interrupted lifecycle");
+            assert_eq!(interrupted.state, expected_state);
+            assert_eq!(
+                interrupted.operation.and_then(|journal| journal.phase),
+                Some(expected_phase)
+            );
+
+            state
+                .manager
+                .destroy(uuid)
+                .await
+                .expect("same-process destroy");
+            let destroyed = state.manager.get(uuid).expect("destroyed lifecycle");
+            assert_eq!(destroyed.state, SandboxState::Destroyed);
+            assert!(destroyed.operation.is_none());
+            assert_eq!(
+                state
+                    .manager
+                    .list_checkpoints(uuid)
+                    .await
+                    .expect("checkpoint history")
+                    .len(),
+                checkpoint_count
+            );
+
+            let restart_temp = tempfile::tempdir().expect("restart temp");
+            let config = test_config(&restart_temp);
+            let restart_state = mock_state_from_config(config.clone(), false);
+            let created = created_json(&restart_state, &test_request()).await;
+            let restart_id = created["instance"]["id"]
+                .as_str()
+                .expect("restart id")
+                .to_string();
+            let restart_uuid = Uuid::parse_str(&restart_id).expect("restart uuid");
+            write_checkpoint_fixture(&restart_state, &restart_id).await;
+            cancel_checkpoint_at(&restart_state, restart_uuid, failpoint).await;
+            restart_state
+                .manager
+                .backend_owner(restart_uuid)
+                .expect("backend owner")
+                .kill()
+                .await
+                .expect("simulate daemon exit");
+            drop(restart_state);
+
+            let restarted = mock_state_from_config(config, false);
+            let report = restarted.manager.reconcile_startup().await;
+            assert_eq!(report.attempted, 1);
+            assert_eq!(report.completed, 1);
+            assert!(report.failures.is_empty());
+            let destroyed = restarted
+                .manager
+                .get(restart_uuid)
+                .expect("reconciled lifecycle");
+            assert_eq!(destroyed.state, SandboxState::Destroyed);
+            assert!(destroyed.operation.is_none());
+            assert_eq!(
+                restarted
+                    .manager
+                    .list_checkpoints(restart_uuid)
+                    .await
+                    .expect("reconciled checkpoint history")
+                    .len(),
+                checkpoint_count
+            );
+            let checkpoint_dir = restarted.state_dir.join("checkpoints").join(&restart_id);
+            if checkpoint_dir.exists() {
+                assert!(
+                    !std::fs::read_dir(checkpoint_dir)
+                        .expect("checkpoint catalog")
+                        .filter_map(std::result::Result::ok)
+                        .any(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn guest_operations_wait_for_checkpoint_publication() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        write_checkpoint_fixture(&state, id).await;
+        state
+            .manager
+            .write_file(uuid, "/tmp/existing".into(), b"before")
+            .await
+            .expect("seed guest file");
+        let hook = crate::failpoint::TestFailpoint::new(&["checkpoint-after-publish-before-head"]);
+        let capture_state = state.clone();
+        let capture_hook = hook.clone();
+        let capture = tokio::spawn(async move {
+            capture_hook
+                .run(capture_state.manager.checkpoint(uuid))
+                .await
+        });
+        hook.wait_until_paused().await;
+
+        let exec_state = state.clone();
+        let mut exec = tokio::spawn(async move {
+            exec_state
+                .manager
+                .exec(uuid, "printf locked".into(), None, None, 5)
+                .await
+        });
+        let read_state = state.clone();
+        let mut read = tokio::spawn(async move {
+            read_state
+                .manager
+                .read_file(uuid, "/tmp/existing".into())
+                .await
+        });
+        let write_state = state.clone();
+        let mut write = tokio::spawn(async move {
+            write_state
+                .manager
+                .write_file(uuid, "/tmp/after".into(), b"after")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut exec)
+                .await
+                .is_err(),
+            "guest exec must wait for checkpoint ownership"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut read)
+                .await
+                .is_err(),
+            "guest read must wait for checkpoint ownership"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut write)
+                .await
+                .is_err(),
+            "guest write must wait for checkpoint ownership"
+        );
+
+        hook.release();
+        capture
+            .await
+            .expect("capture task")
+            .expect("checkpoint capture");
+        assert_eq!(
+            exec.await.expect("exec task").expect("guest exec").stdout,
+            b"printf locked"
+        );
+        assert_eq!(
+            read.await.expect("read task").expect("guest read"),
+            b"before"
+        );
+        write.await.expect("write task").expect("guest write");
     }
 
     #[tokio::test]

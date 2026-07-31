@@ -18,6 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::checkpoint_store::CheckpointStore;
 use crate::error::{BlazeDaemonError, Result};
 use crate::guest::{GuestClient, GuestExecResult, MAX_GUEST_FILE_BYTES};
 use crate::metrics::Metrics;
@@ -80,8 +81,9 @@ pub struct SandboxManager {
     pool: Arc<Mutex<PoolManager>>,
     spawners: Arc<SpawnerRegistry>,
     active_backend: BackendKind,
-    storage: Arc<dyn StorageProvider>,
+    pub(super) storage: Arc<dyn StorageProvider>,
     state_dir: PathBuf,
+    pub(super) checkpoints: CheckpointStore,
     rootfs_size: u64,
     mem_size: u64,
     metrics: Arc<Metrics>,
@@ -125,6 +127,7 @@ impl SandboxManager {
         let backend_instances = Arc::new(Mutex::new(HashMap::new()));
         let pool = Arc::new(Mutex::new(pool));
         let metrics = Arc::new(Metrics::new());
+        let checkpoints = CheckpointStore::new(state_dir.join("checkpoints"));
         let resources = SandboxManagerResources {
             #[cfg(test)]
             instances: instances.clone(),
@@ -141,6 +144,7 @@ impl SandboxManager {
                 active_backend,
                 storage,
                 state_dir,
+                checkpoints,
                 rootfs_size,
                 mem_size,
                 metrics,
@@ -185,8 +189,7 @@ impl SandboxManager {
         Ok(operation)
     }
 
-    #[cfg(test)]
-    pub fn backend_owner(&self, id: Uuid) -> Option<DynBackendInstance> {
+    pub(crate) fn backend_owner(&self, id: Uuid) -> Option<DynBackendInstance> {
         match self.backend_instances.lock() {
             Ok(instances) => instances.get(&id).cloned(),
             Err(poisoned) => poisoned.into_inner().get(&id).cloned(),
@@ -850,6 +853,17 @@ impl SandboxManager {
             )));
         }
 
+        if let Err(error) = self.checkpoints.cleanup_transaction_artifacts(id) {
+            let recovery = self.mark_recovery(id).err();
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "destroy {id}: backend stopped but checkpoint cleanup failed: {error}; \
+                 storage retained{}",
+                recovery
+                    .map(|error| format!("; recovery state persistence failed: {error}"))
+                    .unwrap_or_default()
+            )));
+        }
+
         if let Err(error) = self.storage.release_by_id(&id.to_string()).await {
             let recovery = self.mark_recovery(id).err();
             return Err(BlazeDaemonError::RecoveryRequired(format!(
@@ -937,7 +951,7 @@ impl SandboxManager {
         ))
     }
 
-    async fn wait_for_guest_ready(
+    pub(super) async fn wait_for_guest_ready(
         &self,
         backend: &DynBackendInstance,
         failpoint: &str,
@@ -1199,11 +1213,19 @@ impl SandboxManager {
         }
     }
 
-    fn mark_recovery(&self, id: Uuid) -> Result<()> {
+    pub(super) fn mark_recovery(&self, id: Uuid) -> Result<()> {
         self.mark_instance_recovery(self.get(id)?)
     }
 
-    fn mark_instance_recovery(&self, mut instance: SandboxInstance) -> Result<()> {
+    pub(super) fn persist_and_retain(&self, instance: SandboxInstance) -> Result<()> {
+        instance.persist(&self.state_dir)?;
+        if let Some(error) = self.retain_instance(instance) {
+            return Err(BlazeDaemonError::RecoveryRequired(error));
+        }
+        Ok(())
+    }
+
+    pub(super) fn mark_instance_recovery(&self, mut instance: SandboxInstance) -> Result<()> {
         if instance.state == SandboxState::Destroyed {
             if instance.operation.as_ref().map(|operation| operation.kind)
                 != Some(OperationKind::Destroy)
@@ -1238,7 +1260,7 @@ impl SandboxManager {
         }
     }
 
-    fn retain_instance(&self, instance: SandboxInstance) -> Option<String> {
+    pub(super) fn retain_instance(&self, instance: SandboxInstance) -> Option<String> {
         match self.instances.lock() {
             Ok(mut instances) => {
                 instances.insert(instance.id, instance);

@@ -5,7 +5,7 @@
 //! (warm pools, copy-on-write, content-addressable dedup) but present
 //! a uniform interface to the daemon layer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -127,6 +127,22 @@ pub trait StorageProvider: Send + Sync {
 
     /// Flush dirty data to persistent storage (implementation may be no-op).
     async fn flush_dirty(&self, slot: &StorageSlot) -> Result<()>;
+
+    /// Report whether this provider can capture a self-contained checkpoint.
+    ///
+    /// The default is conservative so existing providers do not advertise a
+    /// data path they have not implemented.
+    fn supports_checkpoint_capture(&self) -> bool {
+        false
+    }
+
+    /// Capture the slot's writable root filesystem at `target`.
+    async fn capture_checkpoint(&self, slot: &StorageSlot, target: &Path) -> Result<()> {
+        let _ = (slot, target);
+        Err(BlazeError::StorageError {
+            msg: "storage provider does not support checkpoint capture".to_string(),
+        })
+    }
 
     /// Query warm pool status.
     fn pool_status(&self) -> PoolStatus;

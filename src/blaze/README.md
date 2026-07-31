@@ -138,6 +138,8 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | POST | `/v1/sandboxes/{id}/exec` | Execute a guest command |
 | POST | `/v1/sandboxes/{id}/read` | Read a guest file |
 | POST | `/v1/sandboxes/{id}/write` | Replace a guest file |
+| POST | `/v1/sandboxes/{id}/checkpoint` | Capture a full checkpoint when the backend and storage provider support it |
+| GET | `/v1/sandboxes/{id}/checkpoints` | List committed checkpoints and HEAD reachability |
 | GET | `/v1/instances` | Alias for listing sandboxes |
 | POST | `/v1/instances` | Alias for creating a sandbox |
 | GET | `/v1/instances/{id}` | Alias for sandbox details |
@@ -146,7 +148,8 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | POST | `/v1/instances/{id}/exec` | Compatible guest command action |
 | POST | `/v1/instances/{id}/read` | Compatible guest file read action |
 | POST | `/v1/instances/{id}/write` | Compatible guest file write action |
-| POST | `/v1/instances/{id}/checkpoint` | Reserved; returns `501` until backend and storage capture is implemented |
+| POST | `/v1/instances/{id}/checkpoint` | Compatible full-checkpoint action |
+| GET | `/v1/instances/{id}/checkpoints` | Compatible checkpoint-list action |
 | POST | `/v1/instances/{id}/reset` | Reserved; returns `501` until runtime reset is implemented |
 | GET | `/v1/pools` | List warm pools |
 | GET | `/v1/pools/{backend}/{class}` | Get pool status |
@@ -176,13 +179,39 @@ accepted connections. It then attempts bounded cleanup for every persisted
 record and retained backend owner. One cleanup failure does not skip the
 remaining sandboxes, and all unresolved records are reported.
 
-The operation journal records the operation and start time, not completion of
-each resource step. An interrupted create is cleaned up rather than resumed,
-and an existing backend process is not adopted after restart. Failed recovery
-does not run in a background retry loop. Checkpoint and reset validate that the
-sandbox is running with no active lifecycle operation, then return `501`
-without changing runtime or persisted state. Their backend and storage
-operations are not implemented here.
+Create and destroy journals record the operation and start time. Checkpoint
+journals also record the generated checkpoint ID and the latest durable
+boundary the daemon confirmed. Checkpoint listing separately reports which
+catalog entries and HEAD update are actually visible after an interruption.
+An interrupted create is cleaned up rather than resumed, and an existing
+backend process is not adopted after restart. Failed recovery does not run in
+a background retry loop.
+
+Checkpoint capture is available only when both the selected backend and the
+configured storage provider report full-capture support. Otherwise the daemon
+returns `501` before creating a journal, pausing the backend, or changing the
+checkpoint catalog. A supported capture:
+
+1. pauses the backend and captures full VM and memory artifacts;
+2. flushes the live storage slot and copies the full root filesystem;
+3. publishes a verified checkpoint and advances HEAD; and
+4. resumes the backend and confirms guest readiness before returning
+   `Running`.
+
+The file storage provider copies the complete root filesystem into each
+checkpoint. This uses more capacity than a shared-base format, but each
+checkpoint remains independent of later changes to the live slot.
+
+Failures detected before calling the catalog publication step resume the
+backend and discard the incomplete stage. If publication or HEAD has an
+uncertain outcome, or the backend cannot resume, the sandbox becomes
+`RecoveryRequired` while runtime ownership and committed checkpoint data
+remain available for explicit cleanup. Listing uses the same per-sandbox
+operation lock as capture, guest operations, and destroy. Destroy removes
+transaction scratch but preserves committed checkpoint history.
+
+Runtime reset remains reserved and returns `501` without changing runtime or
+persisted state.
 
 ### Guest operations
 

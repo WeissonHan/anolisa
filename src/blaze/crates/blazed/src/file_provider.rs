@@ -3,9 +3,11 @@
 //! rootfs and memory files on a local filesystem. Base images and mutable
 //! instance slots use separate roots; runtime pooling is owned by the daemon.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use blaze_core::error::{BlazeError, Result};
 use blaze_core::storage::{
@@ -77,6 +79,50 @@ impl RequiredPathType {
         match self {
             Self::Directory => metadata.is_dir(),
             Self::File => metadata.is_file(),
+        }
+    }
+}
+
+/// Removes incomplete capture files if an error or cancellation interrupts
+/// publication before the target directory is durably synchronized.
+struct UnpublishedCheckpoint {
+    temporary: Option<PathBuf>,
+    target: Option<PathBuf>,
+}
+
+impl UnpublishedCheckpoint {
+    fn new() -> Self {
+        Self {
+            temporary: None,
+            target: None,
+        }
+    }
+
+    fn mark_temporary(&mut self, temporary: PathBuf) {
+        self.temporary = Some(temporary);
+    }
+
+    fn mark_target(&mut self, target: PathBuf) {
+        self.target = Some(target);
+    }
+
+    fn clear_temporary(&mut self) {
+        self.temporary = None;
+    }
+
+    fn commit(&mut self) {
+        self.temporary = None;
+        self.target = None;
+    }
+}
+
+impl Drop for UnpublishedCheckpoint {
+    fn drop(&mut self) {
+        if let Some(target) = self.target.take() {
+            let _ = std::fs::remove_file(target);
+        }
+        if let Some(temporary) = self.temporary.take() {
+            let _ = std::fs::remove_file(temporary);
         }
     }
 }
@@ -283,12 +329,70 @@ impl StorageProvider for FileStorageProvider {
         Ok(())
     }
 
+    fn supports_checkpoint_capture(&self) -> bool {
+        true
+    }
+
+    async fn capture_checkpoint(&self, slot: &StorageSlot, target: &Path) -> Result<()> {
+        let source = self.checkpoint_source(slot).await?;
+        let (target_parent, target) = checkpoint_target(target).await?;
+        ensure_checkpoint_target_absent(&target).await?;
+
+        let temporary = checkpoint_temporary_path(&target_parent, &target);
+        let mut cleanup = UnpublishedCheckpoint::new();
+        let result =
+            capture_rootfs(&source, &temporary, &target_parent, &target, &mut cleanup).await;
+        result.map_err(|error| BlazeError::StorageError {
+            msg: format!(
+                "capture checkpoint for '{}': copy {} to {}: {error}",
+                slot.id,
+                source.display(),
+                target.display()
+            ),
+        })
+    }
+
     fn pool_status(&self) -> PoolStatus {
         PoolStatus::default()
     }
 
     async fn drain_pool(&self) -> Result<usize> {
         Ok(0)
+    }
+}
+
+impl FileStorageProvider {
+    async fn checkpoint_source(&self, slot: &StorageSlot) -> Result<PathBuf> {
+        let canonical = self.slot_for_id(&slot.id)?;
+        let instances_dir =
+            canonical_plain_path(&self.instances_dir, RequiredPathType::Directory).await?;
+        let instance_dir =
+            canonical_plain_path(&canonical.instance_dir, RequiredPathType::Directory).await?;
+        if instance_dir.parent() != Some(instances_dir.as_path()) {
+            return Err(BlazeError::StorageError {
+                msg: format!(
+                    "capture checkpoint for '{}': slot {} is outside instances directory {}",
+                    slot.id,
+                    instance_dir.display(),
+                    instances_dir.display()
+                ),
+            });
+        }
+
+        let source = canonical_plain_path(&canonical.rootfs_path, RequiredPathType::File).await?;
+        if source.parent() != Some(instance_dir.as_path())
+            || source.file_name() != canonical.rootfs_path.file_name()
+        {
+            return Err(BlazeError::StorageError {
+                msg: format!(
+                    "capture checkpoint for '{}': rootfs {} is outside slot {}",
+                    slot.id,
+                    source.display(),
+                    instance_dir.display()
+                ),
+            });
+        }
+        Ok(source)
     }
 }
 
@@ -305,6 +409,111 @@ async fn create_or_copy(
     if size > 0 {
         file.set_len(size).await?;
     }
+    Ok(())
+}
+
+async fn canonical_plain_path(path: &Path, required_type: RequiredPathType) -> Result<PathBuf> {
+    let metadata =
+        tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(|error| BlazeError::StorageError {
+                msg: format!("inspect checkpoint path {}: {error}", path.display()),
+            })?;
+    if !required_type.matches(&metadata) || metadata.file_type().is_symlink() {
+        return Err(BlazeError::StorageError {
+            msg: format!(
+                "checkpoint path {} is not a plain {}",
+                path.display(),
+                required_type.description()
+            ),
+        });
+    }
+    tokio::fs::canonicalize(path)
+        .await
+        .map_err(|error| BlazeError::StorageError {
+            msg: format!("canonicalize checkpoint path {}: {error}", path.display()),
+        })
+}
+
+async fn checkpoint_target(target: &Path) -> Result<(PathBuf, PathBuf)> {
+    if !matches!(target.components().next_back(), Some(Component::Normal(_))) {
+        return Err(BlazeError::StorageError {
+            msg: format!(
+                "checkpoint target {} must end in a file name",
+                target.display()
+            ),
+        });
+    }
+    let parent = target.parent().ok_or_else(|| BlazeError::StorageError {
+        msg: format!(
+            "checkpoint target {} has no parent directory",
+            target.display()
+        ),
+    })?;
+    let parent = canonical_plain_path(parent, RequiredPathType::Directory).await?;
+    let file_name = target.file_name().ok_or_else(|| BlazeError::StorageError {
+        msg: format!("checkpoint target {} has no file name", target.display()),
+    })?;
+    let target = parent.join(file_name);
+    Ok((parent, target))
+}
+
+async fn ensure_checkpoint_target_absent(target: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(target).await {
+        Ok(_) => Err(BlazeError::StorageError {
+            msg: format!("checkpoint target {} already exists", target.display()),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(BlazeError::StorageError {
+            msg: format!("inspect checkpoint target {}: {error}", target.display()),
+        }),
+    }
+}
+
+fn checkpoint_temporary_path(parent: &Path, target: &Path) -> PathBuf {
+    let mut name = OsString::from(".");
+    name.push(target.file_name().expect("validated checkpoint target"));
+    name.push(format!(".capture-{}.tmp", Uuid::new_v4()));
+    parent.join(name)
+}
+
+async fn capture_rootfs(
+    source: &Path,
+    temporary: &Path,
+    parent: &Path,
+    target: &Path,
+    cleanup: &mut UnpublishedCheckpoint,
+) -> std::io::Result<()> {
+    let mut source_options = tokio::fs::OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    source_options.custom_flags(libc::O_NOFOLLOW);
+    let mut source_file = source_options.open(source).await?;
+    if !source_file.metadata().await?.is_file() {
+        return Err(std::io::Error::other(format!(
+            "checkpoint source {} is not a regular file",
+            source.display()
+        )));
+    }
+    let mut temporary_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary)
+        .await?;
+    cleanup.mark_temporary(temporary.to_path_buf());
+    tokio::io::copy(&mut source_file, &mut temporary_file).await?;
+    temporary_file.sync_all().await?;
+    drop(temporary_file);
+    drop(source_file);
+
+    tokio::fs::hard_link(temporary, target).await?;
+    cleanup.mark_target(target.to_path_buf());
+    crate::failpoint::storage("storage-capture-after-link")
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    tokio::fs::remove_file(temporary).await?;
+    cleanup.clear_temporary();
+    tokio::fs::File::open(parent).await?.sync_all().await?;
+    cleanup.commit();
     Ok(())
 }
 
@@ -326,6 +535,26 @@ fn validate_instance_id(instance_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn checkpoint_fixture(
+        instance_id: &str,
+    ) -> (tempfile::TempDir, FileStorageProvider, StorageSlot, PathBuf) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let instances = temp.path().join("instances");
+        let checkpoints = temp.path().join("checkpoints");
+        tokio::fs::create_dir(&instances).await.unwrap();
+        tokio::fs::create_dir(&checkpoints).await.unwrap();
+        let provider = FileStorageProvider::new(instances);
+        let slot = provider
+            .acquire(&AcquireOpts {
+                instance_id: instance_id.to_string(),
+                rootfs_size: 64,
+                mem_size: 32,
+            })
+            .await
+            .unwrap();
+        (temp, provider, slot, checkpoints)
+    }
 
     #[tokio::test]
     async fn probe_existing_dir_returns_true() {
@@ -726,5 +955,192 @@ mod tests {
             .await
             .expect_err("missing artifact must fail the sweep item");
         assert!(error.to_string().contains("mem.diff"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_capture_is_explicit_and_independent() {
+        let (_temp, provider, slot, checkpoints) = checkpoint_fixture("capture-independent").await;
+        tokio::fs::write(&slot.rootfs_path, b"captured-rootfs")
+            .await
+            .unwrap();
+        let target = checkpoints.join("rootfs.snap");
+
+        assert!(provider.supports_checkpoint_capture());
+        provider.capture_checkpoint(&slot, &target).await.unwrap();
+        tokio::fs::write(&slot.rootfs_path, b"changed-live-rootfs")
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"captured-rootfs");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_capture_does_not_replace_the_live_rootfs() {
+        let (_temp, provider, slot, checkpoints) = checkpoint_fixture("capture-read-only").await;
+        tokio::fs::write(&slot.rootfs_path, b"live-rootfs")
+            .await
+            .unwrap();
+
+        provider
+            .capture_checkpoint(&slot, &checkpoints.join("rootfs.snap"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read(&slot.rootfs_path).await.unwrap(),
+            b"live-rootfs"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_capture_ignores_forged_slot_paths() {
+        let (temp, provider, slot, checkpoints) = checkpoint_fixture("capture-canonical").await;
+        tokio::fs::write(&slot.rootfs_path, b"canonical-rootfs")
+            .await
+            .unwrap();
+        let forged_source = temp.path().join("forged-rootfs");
+        tokio::fs::write(&forged_source, b"forged-rootfs")
+            .await
+            .unwrap();
+        let mut forged = slot.clone();
+        forged.rootfs_path = forged_source;
+        forged.mem_path = temp.path().join("forged-memory");
+        forged.mem_diff_path = temp.path().join("forged-memory-diff");
+        forged.rootfs_diff_path = temp.path().join("forged-rootfs-diff");
+        forged.instance_dir = temp.path().to_path_buf();
+        let target = checkpoints.join("rootfs.snap");
+
+        provider.capture_checkpoint(&forged, &target).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"canonical-rootfs");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkpoint_capture_rejects_a_linked_rootfs() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, provider, slot, checkpoints) = checkpoint_fixture("capture-linked-source").await;
+        tokio::fs::remove_file(&slot.rootfs_path).await.unwrap();
+        let external = temp.path().join("external-rootfs");
+        tokio::fs::write(&external, b"external").await.unwrap();
+        symlink(&external, &slot.rootfs_path).unwrap();
+        let target = checkpoints.join("rootfs.snap");
+
+        provider
+            .capture_checkpoint(&slot, &target)
+            .await
+            .expect_err("linked rootfs must not be captured");
+
+        assert!(!target.exists());
+        assert_eq!(tokio::fs::read(external).await.unwrap(), b"external");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkpoint_capture_rejects_a_linked_slot_directory() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, provider, slot, checkpoints) = checkpoint_fixture("capture-linked-slot").await;
+        tokio::fs::remove_dir_all(&slot.instance_dir).await.unwrap();
+        let external = temp.path().join("external-slot");
+        tokio::fs::create_dir(&external).await.unwrap();
+        tokio::fs::write(external.join("rootfs.ext4"), b"external")
+            .await
+            .unwrap();
+        symlink(&external, &slot.instance_dir).unwrap();
+        let target = checkpoints.join("rootfs.snap");
+
+        provider
+            .capture_checkpoint(&slot, &target)
+            .await
+            .expect_err("linked slot directory must be rejected");
+
+        assert!(!target.exists());
+        assert_eq!(
+            tokio::fs::read(external.join("rootfs.ext4")).await.unwrap(),
+            b"external"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkpoint_capture_rejects_a_linked_target_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let instances = temp.path().join("instances");
+        let external = temp.path().join("external-checkpoints");
+        tokio::fs::create_dir(&instances).await.unwrap();
+        tokio::fs::create_dir(&external).await.unwrap();
+        let linked_parent = temp.path().join("linked-checkpoints");
+        symlink(&external, &linked_parent).unwrap();
+        let provider = FileStorageProvider::new(instances);
+        let slot = provider
+            .acquire(&AcquireOpts {
+                instance_id: "capture-linked-parent".into(),
+                rootfs_size: 64,
+                mem_size: 32,
+            })
+            .await
+            .unwrap();
+        let target = linked_parent.join("rootfs.snap");
+
+        provider
+            .capture_checkpoint(&slot, &target)
+            .await
+            .expect_err("linked target parent must be rejected");
+
+        assert!(!external.join("rootfs.snap").exists());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_capture_preserves_an_existing_target() {
+        let (_temp, provider, slot, checkpoints) =
+            checkpoint_fixture("capture-existing-target").await;
+        tokio::fs::write(&slot.rootfs_path, b"new-checkpoint")
+            .await
+            .unwrap();
+        let target = checkpoints.join("rootfs.snap");
+        tokio::fs::write(&target, b"existing-checkpoint")
+            .await
+            .unwrap();
+
+        provider
+            .capture_checkpoint(&slot, &target)
+            .await
+            .expect_err("capture must never replace an existing target");
+
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"existing-checkpoint"
+        );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn checkpoint_capture_cleans_temporary_data_after_failure() {
+        let (_temp, provider, slot, checkpoints) = checkpoint_fixture("capture-cleanup").await;
+        tokio::fs::write(&slot.rootfs_path, b"complete-temporary-copy")
+            .await
+            .unwrap();
+        let target = checkpoints.join("rootfs.snap");
+        let hook = crate::failpoint::TestFailpoint::new(&["storage-capture-after-link"]);
+
+        hook.run(provider.capture_checkpoint(&slot, &target))
+            .await
+            .expect_err("armed capture must roll back its unpublished target");
+
+        assert!(!target.exists());
+        assert!(
+            tokio::fs::read_dir(&checkpoints)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none(),
+            "capture failure must remove its temporary file"
+        );
     }
 }
