@@ -161,7 +161,8 @@ provider = "file"       # Storage provider selection. Currently supported: "file
 images_dir = "/var/lib/blaze/images"
 pool_size = 0            # Background runtime slots; zero disables construction
 prefork = false          # Start the backend before a slot becomes ready
-# flush_interval = "30s"  # [Reserved] Dirty data flush period (not yet active)
+flush_interval = "disabled" # Set a positive duration to synchronize running slots
+flush_timeout = "30s"       # Maximum duration of one provider synchronization attempt
 
 [pool]
 default_warm_ttl = "30m" # Used when an eligible policy omits warm_ttl
@@ -169,6 +170,13 @@ gc_interval = "5m"       # Expiry and capacity maintenance interval
 ```
 
 The `file` provider uses standard filesystem operations for sandbox storage. The `auto` provider probes available backends in priority order (currently equivalent to `file`). Unrecognized values will log a warning and fall back to `file`.
+When periodic synchronization is enabled, one provider failure or timeout does
+not block later sandboxes. The slot remains owned so a later sweep or destroy
+can retry it. The daemon stops and joins the synchronization worker before
+draining connections and releasing runtime resources.
+
+See [Storage Synchronization](docs/design/storage-synchronization.md) for
+selection, retry, and shutdown behavior.
 
 When `pool_size` is non-zero, the first eligible create request fixes one
 compatible build shape and starts background construction. Every slot owns

@@ -269,6 +269,17 @@ impl SandboxManager {
         }
     }
 
+    pub(super) async fn reconstruct_storage(&self, id: Uuid) -> Result<StorageSlot> {
+        self.storage
+            .reconstruct(&id.to_string())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(super) async fn flush_storage(&self, slot: &StorageSlot) -> Result<()> {
+        self.storage.flush_dirty(slot).await.map_err(Into::into)
+    }
+
     #[cfg(test)]
     pub fn insert_backend_owner(&self, id: Uuid, backend: DynBackendInstance) -> Result<()> {
         self.backend_instances

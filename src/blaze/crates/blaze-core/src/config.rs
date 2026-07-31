@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -177,10 +178,15 @@ pub struct StorageSection {
     #[serde(default)]
     pub prefork: bool,
 
-    /// Interval for flushing dirty data.
-    /// NOTE: Reserved for future use. Not yet wired into runtime.
+    /// Interval for synchronizing provider-owned runtime data.
+    ///
+    /// The literal `disabled` turns off periodic synchronization.
     #[serde(default = "default_flush_interval")]
     pub flush_interval: String,
+
+    /// Maximum duration of one provider synchronization attempt.
+    #[serde(default = "default_flush_timeout")]
+    pub flush_timeout: String,
 
     /// Logical size of file-provider root filesystem slots.
     #[serde(default = "default_rootfs_size")]
@@ -200,9 +206,37 @@ impl Default for StorageSection {
             pool_size: 0,
             prefork: false,
             flush_interval: default_flush_interval(),
+            flush_timeout: default_flush_timeout(),
             rootfs_size: default_rootfs_size(),
             mem_size: default_mem_size(),
         }
+    }
+}
+
+/// Parsed periodic storage synchronization policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFlushSchedule {
+    /// Do not run periodic synchronization.
+    Disabled,
+    /// Run one sweep after every configured interval.
+    Every(Duration),
+}
+
+impl StorageSection {
+    /// Parse the periodic synchronization setting.
+    pub fn flush_schedule(&self) -> Result<StorageFlushSchedule> {
+        if self.flush_interval == "disabled" {
+            return Ok(StorageFlushSchedule::Disabled);
+        }
+        parse_duration(&self.flush_interval)
+            .map(StorageFlushSchedule::Every)
+            .ok_or_else(|| invalid_storage_duration("flush_interval", &self.flush_interval, true))
+    }
+
+    /// Parse the maximum duration of one provider synchronization attempt.
+    pub fn flush_timeout_duration(&self) -> Result<Duration> {
+        parse_duration(&self.flush_timeout)
+            .ok_or_else(|| invalid_storage_duration("flush_timeout", &self.flush_timeout, false))
     }
 }
 
@@ -242,7 +276,23 @@ impl DaemonConfig {
             &self.daemon.state_dir.join("runtime-pool"),
             &self.storage.images_dir,
             &self.storage.instances_dir,
-        )
+        )?;
+        self.storage.flush_schedule()?;
+        self.storage.flush_timeout_duration()?;
+        Ok(())
+    }
+}
+
+fn invalid_storage_duration(name: &str, value: &str, allow_disabled: bool) -> BlazeError {
+    let expected = if allow_disabled {
+        "a positive duration or \"disabled\""
+    } else {
+        "a positive duration"
+    };
+    BlazeError::ConfigError {
+        source: ConfigErrorSource::InvalidValue(format!(
+            "storage.{name} ({value:?}) must be {expected}"
+        )),
     }
 }
 
@@ -340,6 +390,9 @@ fn default_storage_provider() -> String {
     "file".to_string()
 }
 fn default_flush_interval() -> String {
+    "disabled".to_string()
+}
+fn default_flush_timeout() -> String {
     "30s".to_string()
 }
 fn default_rootfs_size() -> u64 {
@@ -361,6 +414,10 @@ mod tests {
         assert_eq!(cfg.api.max_body_bytes, 1024 * 1024);
         assert!(cfg.backends.is_empty());
         assert_ne!(cfg.storage.images_dir, cfg.storage.instances_dir);
+        assert_eq!(
+            cfg.storage.flush_schedule().expect("flush schedule"),
+            StorageFlushSchedule::Disabled
+        );
     }
 
     #[test]
@@ -494,6 +551,47 @@ mod tests {
             .expect_err("overlapping runtime and storage roots");
             assert!(matches!(error, BlazeError::ConfigError { .. }));
             assert!(error.to_string().contains("must be disjoint"));
+        }
+    }
+
+    #[test]
+    fn storage_flush_schedule_accepts_disabled_or_positive_duration() {
+        let mut cfg = DaemonConfig::default();
+        cfg.storage.flush_interval = "disabled".into();
+        cfg.validate().expect("disabled schedule");
+        assert_eq!(
+            cfg.storage.flush_schedule().expect("schedule"),
+            StorageFlushSchedule::Disabled
+        );
+
+        cfg.storage.flush_interval = "15s".into();
+        cfg.validate().expect("positive schedule");
+        assert_eq!(
+            cfg.storage.flush_schedule().expect("schedule"),
+            StorageFlushSchedule::Every(Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn storage_flush_schedule_rejects_invalid_values() {
+        for interval in ["0s", "not-a-duration"] {
+            let mut cfg = DaemonConfig::default();
+            cfg.storage.flush_interval = interval.into();
+            let error = cfg.validate().expect_err("invalid flush interval");
+            assert!(
+                error.to_string().contains("storage.flush_interval"),
+                "{error}"
+            );
+        }
+
+        for timeout in ["0s", "disabled", "not-a-duration"] {
+            let mut cfg = DaemonConfig::default();
+            cfg.storage.flush_timeout = timeout.into();
+            let error = cfg.validate().expect_err("invalid flush timeout");
+            assert!(
+                error.to_string().contains("storage.flush_timeout"),
+                "{error}"
+            );
         }
     }
 }

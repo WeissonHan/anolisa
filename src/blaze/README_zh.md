@@ -152,7 +152,8 @@ provider = "file"       # 存储 provider 选择。当前支持："file"、"auto
 images_dir = "/var/lib/blaze/images"
 pool_size = 0            # 后台运行槽位数；0 表示不构建
 prefork = false          # 槽位就绪前是否启动后端
-# flush_interval = "30s"  # [Reserved] 脏数据刷盘周期（尚未启用）
+flush_interval = "disabled" # 设置正数 duration 后同步 running slot
+flush_timeout = "30s"       # 单次 provider 同步的最长时间
 
 [pool]
 default_warm_ttl = "30m" # 符合条件的策略未设置 warm_ttl 时使用
@@ -160,6 +161,12 @@ gc_interval = "5m"       # 过期检查和容量维护间隔
 ```
 
 `file` provider 使用标准文件系统操作管理 sandbox 存储。`auto` 按优先级探测可用 provider（当前等同于 `file`）。无法识别的值将记录告警并回退到 `file`。
+启用周期同步后，单个 provider 失败或超时不会阻塞后续 sandbox。slot 会继续
+由 daemon 持有，后续 sweep 或 destroy 可以重试。daemon 会先停止并等待同步
+任务退出，再排空连接和释放 runtime 资源。
+
+[存储同步](docs/design/storage-synchronization_zh.md)进一步说明选择、重试和
+关闭行为。
 
 `pool_size` 非零时，首个符合条件的创建请求会固定一组兼容构建参数，并启动
 后台补充。每个槽位都持有存储；只有启用 `prefork` 时，槽位才同时持有已经

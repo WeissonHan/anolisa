@@ -104,8 +104,12 @@ pool_size = 0
 # storage only and starts its backend after a request claims it. Default: false.
 prefork = false
 
-# Interval between flush-dirty sweeps.
-# flush_interval = "30s"   # [Reserved] Dirty data flush period (not yet active)
+# Periodic provider synchronization is opt-in. Set a positive duration to
+# synchronize running sandbox slots after each interval.
+flush_interval = "disabled"
+
+# Maximum duration of one provider synchronization attempt.
+flush_timeout = "30s"
 
 # ---------------------------------------------------------------------------
 # Runtime slot maintenance defaults.
