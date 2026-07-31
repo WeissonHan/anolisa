@@ -7,6 +7,7 @@
 mod api;
 mod cli;
 mod daemon;
+mod daemon_socket;
 mod error;
 #[cfg(feature = "test-failpoints")]
 mod failpoint;
@@ -15,6 +16,8 @@ mod failpoint;
 mod failpoint;
 mod file_provider;
 mod metrics;
+mod request_body;
+mod sandbox;
 mod spawner;
 mod state;
 

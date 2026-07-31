@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Daemon-wide shared state: configuration, policy engine, pool, template
-//! and hook registries, and the in-memory instance map. All API handlers
-//! receive an [`Arc<ServerState>`] and acquire the relevant `Mutex<...>`
-//! lock just long enough to read or mutate the piece they need — locks
-//! are never held across `.await` boundaries.
+//! Daemon-wide shared state: configuration, policy engine, pool, template and
+//! hook registries, plus the sandbox manager. API paths that change runtime
+//! ownership enter through the manager so its per-instance lock spans every
+//! asynchronous resource mutation.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 use blaze_core::backend::BackendKind;
 use blaze_core::config::DaemonConfig;
@@ -17,38 +19,37 @@ use blaze_core::policy::PolicyEngine;
 use blaze_core::pool::PoolManager;
 use blaze_core::storage::StorageProvider;
 use blaze_core::template::TemplateRegistry;
-use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{BlazeDaemonError, Result};
 use crate::metrics::Metrics;
-use crate::spawner::{DynBackendInstance, DynSpawner, SpawnerRegistry};
+use crate::sandbox::{SandboxManager, SandboxManagerInit};
+use crate::spawner::SpawnerRegistry;
 
 /// All daemon mutable state. Cloning is via `Arc` (see the `state.clone()`
 /// idiom in `daemon.rs`); the struct itself is never `Clone`.
 pub struct ServerState {
     pub config: Mutex<DaemonConfig>,
     pub policy: Mutex<PolicyEngine>,
-    pub pool: Mutex<PoolManager>,
+    pub pool: Arc<Mutex<PoolManager>>,
     pub template: Mutex<TemplateRegistry>,
     pub hook: Mutex<HookRegistry>,
-    pub instances: Mutex<HashMap<Uuid, SandboxInstance>>,
-    pub backend_instances: Mutex<HashMap<Uuid, DynBackendInstance>>,
-    operation_locks: Mutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>,
-    pub spawners: SpawnerRegistry,
+    #[cfg(test)]
+    pub instances: Arc<Mutex<HashMap<Uuid, SandboxInstance>>>,
+    pub manager: SandboxManager,
     /// The backend kind that `build_spawner` actually probed and selected.
     /// API handlers use this to constrain availability to the single active
     /// backend rather than reporting all configured binaries.
     pub active_backend: BackendKind,
     pub storage: Arc<dyn StorageProvider>,
+    #[cfg(test)]
     pub state_dir: PathBuf,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
 }
 
 impl ServerState {
     /// Build a server state, scanning `state_dir` to repopulate the
-    /// `instances` map from previous runs (best-effort; corrupt entries
-    /// are skipped with a warning).
+    /// `instances` map from previous runs.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         config: DaemonConfig,
@@ -59,58 +60,48 @@ impl ServerState {
         spawners: SpawnerRegistry,
         active_backend: BackendKind,
         storage: Arc<dyn StorageProvider>,
-    ) -> Self {
+    ) -> Result<Self> {
         let state_dir = config.daemon.state_dir.clone();
-        let instances = scan_state_dir(&state_dir).unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "failed to scan state_dir, starting empty");
-            HashMap::new()
-        });
-        let operation_locks = instances
-            .keys()
-            .copied()
-            .map(|id| (id, Arc::new(AsyncMutex::new(()))))
-            .collect();
-
-        Self {
-            config: Mutex::new(config),
-            policy: Mutex::new(policy),
-            pool: Mutex::new(pool),
-            template: Mutex::new(template),
-            hook: Mutex::new(hook),
-            instances: Mutex::new(instances),
-            backend_instances: Mutex::new(HashMap::new()),
-            operation_locks: Mutex::new(operation_locks),
+        let instances = scan_state_dir(&state_dir)?;
+        let (manager, resources) = SandboxManager::new(SandboxManagerInit {
+            instances,
+            pool,
             spawners,
             active_backend,
+            storage: storage.clone(),
+            state_dir: state_dir.clone(),
+            rootfs_size: config.storage.rootfs_size,
+            mem_size: config.storage.mem_size,
+        });
+
+        Ok(Self {
+            config: Mutex::new(config),
+            policy: Mutex::new(policy),
+            pool: resources.pool,
+            template: Mutex::new(template),
+            hook: Mutex::new(hook),
+            #[cfg(test)]
+            instances: resources.instances,
+            manager,
+            active_backend,
             storage,
+            #[cfg(test)]
             state_dir,
-            metrics: Metrics::new(),
-        }
+            metrics: resources.metrics,
+        })
     }
 
     /// Return the async operation lock that serializes one sandbox mutation.
-    pub fn operation_lock(&self, id: Uuid) -> Arc<AsyncMutex<()>> {
-        match self.operation_locks.lock() {
-            Ok(mut locks) => locks
-                .entry(id)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .entry(id)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone(),
-        }
-    }
-
-    /// Return the implementation responsible for a persisted backend kind.
-    pub fn spawner_for(&self, kind: BackendKind) -> Option<DynSpawner> {
-        self.spawners.get(kind)
+    #[cfg(test)]
+    pub fn operation_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        self.manager.operation_lock(id)
     }
 }
 
-/// Best-effort: walk `{state_dir}/<uuid>/state.json` and rebuild the
-/// instance map. Used both at boot and (in the future) by `daemon doctor`.
+/// Walk `{state_dir}/<uuid>/state.json` and rebuild the instance map.
+///
+/// A valid UUID directory is owned lifecycle state. If its record cannot be
+/// loaded, startup must stop rather than hide resources from later cleanup.
 fn scan_state_dir(state_dir: &Path) -> Result<HashMap<Uuid, SandboxInstance>> {
     let mut out = HashMap::new();
     if !state_dir.exists() {
@@ -128,15 +119,69 @@ fn scan_state_dir(state_dir: &Path) -> Result<HashMap<Uuid, SandboxInstance>> {
         let Ok(id) = Uuid::parse_str(name_str) else {
             continue;
         };
-        match SandboxInstance::load(state_dir, id) {
-            Ok(inst) => {
-                out.insert(id, inst);
-            }
-            Err(err) => {
-                tracing::warn!(instance = %id, error = %err, "skipping corrupt instance state");
-            }
+        let instance = SandboxInstance::load(state_dir, id).map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "cannot load persisted instance {id}: {error}"
+            ))
+        })?;
+        if instance.id != id {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "persisted instance id {} does not match owned directory {id}",
+                instance.id
+            )));
         }
+        out.insert(id, instance);
     }
     tracing::info!(instances = out.len(), "rehydrated instances from state_dir");
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_rejects_corrupt_owned_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let instance_dir = temp.path().join(id.to_string());
+        std::fs::create_dir_all(&instance_dir).expect("instance dir");
+        std::fs::write(instance_dir.join("state.json"), b"{not-json").expect("state");
+
+        let error = scan_state_dir(temp.path()).expect_err("corrupt state must stop startup");
+
+        assert!(matches!(
+            error,
+            BlazeDaemonError::RecoveryRequired(message)
+                if message.contains(&id.to_string())
+                    && message.contains("cannot load persisted instance")
+        ));
+    }
+    #[test]
+    fn scan_rejects_state_owned_by_a_different_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let instance = SandboxInstance::new(
+            BackendKind::Mock,
+            blaze_core::policy::WorkloadClass::AgentTool,
+            "sha256:mismatched-id".into(),
+            blaze_core::lifecycle::StartPath::Cold,
+            "test".into(),
+        );
+        instance.persist(temp.path()).expect("persist state");
+        let directory_id = Uuid::new_v4();
+        std::fs::rename(
+            temp.path().join(instance.id.to_string()),
+            temp.path().join(directory_id.to_string()),
+        )
+        .expect("rename directory");
+
+        let error = scan_state_dir(temp.path()).expect_err("mismatched state must stop startup");
+
+        assert!(matches!(
+            error,
+            BlazeDaemonError::RecoveryRequired(message)
+                if message.contains(&instance.id.to_string())
+                    && message.contains(&directory_id.to_string())
+        ));
+    }
 }

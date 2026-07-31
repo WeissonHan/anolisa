@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Sandbox lifecycle state machine + JSON persistence.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -21,6 +22,7 @@ pub enum SandboxState {
     Running,
     Paused,
     Checkpointed,
+    RecoveryRequired,
     Reset,
     Warm,
     Destroyed,
@@ -34,11 +36,46 @@ impl SandboxState {
             SandboxState::Running => "running",
             SandboxState::Paused => "paused",
             SandboxState::Checkpointed => "checkpointed",
+            SandboxState::RecoveryRequired => "recovery-required",
             SandboxState::Reset => "reset",
             SandboxState::Warm => "warm",
             SandboxState::Destroyed => "destroyed",
         }
     }
+}
+
+/// Persisted multi-step operation used for crash diagnosis and recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperationKind {
+    /// Sandbox creation is acquiring resources or starting a backend.
+    Create,
+    /// Runtime resources are being destroyed.
+    Destroy,
+}
+
+impl OperationKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            OperationKind::Create => "create",
+            OperationKind::Destroy => "destroy",
+        }
+    }
+}
+
+impl std::fmt::Display for OperationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Durable journal entry for one active lifecycle operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationJournal {
+    /// Operation being performed.
+    pub kind: OperationKind,
+    /// UTC time at which the operation became externally visible.
+    pub started_at: DateTime<Utc>,
 }
 
 impl std::fmt::Display for SandboxState {
@@ -85,6 +122,9 @@ pub struct SandboxInstance {
     /// Last durably known backend ownership state.
     #[serde(default)]
     pub backend_ownership: BackendOwnership,
+    /// Active multi-step operation, if any.
+    #[serde(default)]
+    pub operation: Option<OperationJournal>,
 }
 
 impl SandboxInstance {
@@ -110,7 +150,47 @@ impl SandboxInstance {
             updated_at: now,
             policy_name,
             backend_ownership: BackendOwnership::NotStarted,
+            operation: None,
         }
+    }
+
+    /// Record a new operation before starting its first owned-resource
+    /// mutation. An unfinished journal must be recovered rather than silently
+    /// replaced by a later request.
+    pub fn begin_operation(&mut self, kind: OperationKind) -> Result<()> {
+        if let Some(active) = &self.operation {
+            return Err(BlazeError::OperationInProgress {
+                active: active.kind.to_string(),
+                requested: kind.to_string(),
+            });
+        }
+        self.operation = Some(OperationJournal {
+            kind,
+            started_at: Utc::now(),
+        });
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    /// Transfer an interrupted lifecycle operation to destroy recovery.
+    ///
+    /// Cleanup is the only operation allowed to supersede an unfinished
+    /// journal because it releases, rather than acquires, owned resources.
+    pub fn begin_destroy_recovery(&mut self) {
+        if self.operation.as_ref().map(|operation| operation.kind) == Some(OperationKind::Destroy) {
+            return;
+        }
+        self.operation = Some(OperationJournal {
+            kind: OperationKind::Destroy,
+            started_at: Utc::now(),
+        });
+        self.updated_at = Utc::now();
+    }
+
+    /// Clear the marker before atomically persisting the final state.
+    pub fn finish_operation(&mut self) {
+        self.operation = None;
+        self.updated_at = Utc::now();
     }
 
     /// Apply a state transition. Returns
@@ -149,14 +229,82 @@ impl SandboxInstance {
     /// Persist this instance to `{state_dir}/{id}/state.json`. Atomic
     /// rename via `state.json.tmp` to avoid torn reads on daemon restart.
     pub fn persist(&self, state_dir: &Path) -> Result<()> {
-        let dir = state_dir.join(self.id.to_string());
-        fs::create_dir_all(&dir)?;
-        let final_path = dir.join("state.json");
-        let tmp_path = dir.join("state.json.tmp");
+        self.persist_with(state_dir, |tmp_path, final_path, json| {
+            let mut file = File::create(tmp_path)?;
+            file.write_all(json)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(tmp_path, final_path)?;
+            Ok(())
+        })
+    }
+
+    fn persist_with<F>(&self, state_dir: &Path, publish: F) -> Result<()>
+    where
+        F: FnOnce(&Path, &Path, &[u8]) -> Result<()>,
+    {
+        self.persist_with_directory_sync(state_dir, publish, |directory| {
+            File::open(directory)?.sync_all()?;
+            Ok(())
+        })
+    }
+
+    fn persist_with_directory_sync<F, S>(
+        &self,
+        state_dir: &Path,
+        publish: F,
+        mut sync_directory: S,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path, &Path, &[u8]) -> Result<()>,
+        S: FnMut(&Path) -> Result<()>,
+    {
+        let owner_dir = state_dir.join(self.id.to_string());
         let json = serde_json::to_vec_pretty(self)?;
-        fs::write(&tmp_path, &json)?;
-        fs::rename(&tmp_path, &final_path)?;
-        Ok(())
+        fs::create_dir_all(state_dir)?;
+
+        match fs::symlink_metadata(&owner_dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                let final_path = owner_dir.join("state.json");
+                let tmp_path = owner_dir.join("state.json.tmp");
+                let result = publish(&tmp_path, &final_path, &json);
+                if result.is_err() {
+                    let _ = fs::remove_file(&tmp_path);
+                }
+                result?;
+                sync_directory(&owner_dir)
+            }
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "lifecycle owner {} is not a real directory",
+                    owner_dir.display()
+                ),
+            )
+            .into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let staging_dir =
+                    state_dir.join(format!(".state-{}-{}.tmp", self.id, Uuid::new_v4()));
+                fs::create_dir(&staging_dir)?;
+                let final_path = staging_dir.join("state.json");
+                let tmp_path = staging_dir.join("state.json.tmp");
+                if let Err(error) = publish(&tmp_path, &final_path, &json) {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err(error);
+                }
+                if let Err(error) = sync_directory(&staging_dir) {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err(error);
+                }
+                if let Err(error) = fs::rename(&staging_dir, &owner_dir) {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err(error.into());
+                }
+                sync_directory(state_dir)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Reload an instance previously persisted via [`Self::persist`].
@@ -169,10 +317,15 @@ impl SandboxInstance {
 }
 
 fn is_valid_transition(from: SandboxState, to: SandboxState) -> bool {
-    use SandboxState::{Checkpointed, Creating, Destroyed, Paused, Pending, Reset, Running, Warm};
+    use SandboxState::{
+        Checkpointed, Creating, Destroyed, Paused, Pending, RecoveryRequired, Reset, Running, Warm,
+    };
     if to == Destroyed {
         // `* → destroyed` is always valid (terminal sink).
         return from != Destroyed;
+    }
+    if to == RecoveryRequired {
+        return !matches!(from, Destroyed | RecoveryRequired);
     }
     match (from, to) {
         (Pending, Creating) => true,
@@ -189,6 +342,8 @@ fn is_valid_transition(from: SandboxState, to: SandboxState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn fresh() -> SandboxInstance {
@@ -240,6 +395,29 @@ mod tests {
     }
 
     #[test]
+    fn recovery_required_can_finish_but_cannot_be_reentered() {
+        let mut inst = fresh();
+        inst.transition(SandboxState::Creating).expect("creating");
+        inst.transition(SandboxState::Running).expect("running");
+        inst.transition(SandboxState::RecoveryRequired)
+            .expect("recovery required");
+
+        let repeated = inst.transition(SandboxState::RecoveryRequired);
+        assert!(matches!(
+            repeated,
+            Err(BlazeError::InvalidStateTransition { .. })
+        ));
+
+        inst.transition(SandboxState::Destroyed)
+            .expect("destroyed from recovery");
+        let terminal = inst.transition(SandboxState::RecoveryRequired);
+        assert!(matches!(
+            terminal,
+            Err(BlazeError::InvalidStateTransition { .. })
+        ));
+    }
+
+    #[test]
     fn illegal_pending_to_running() {
         let mut inst = fresh();
         let err = inst.transition(SandboxState::Running).expect_err("illegal");
@@ -277,5 +455,165 @@ mod tests {
         assert_eq!(loaded.id, inst.id);
         assert_eq!(loaded.state, SandboxState::Creating);
         assert_eq!(loaded.policy_name, inst.policy_name);
+    }
+
+    #[test]
+    fn failed_first_persist_removes_an_empty_owner_directory() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let instance = fresh();
+
+        let error = instance
+            .persist_with(tmp.path(), |_tmp_path, _final_path, _json| {
+                Err(std::io::Error::other("injected publication failure").into())
+            })
+            .expect_err("publication must fail");
+
+        assert!(error.to_string().contains("injected publication failure"));
+        assert!(!tmp.path().join(instance.id.to_string()).exists());
+        assert_eq!(
+            std::fs::read_dir(tmp.path())
+                .expect("state directory")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn first_persist_syncs_the_staged_owner_and_state_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let instance = fresh();
+        let sync_count = Cell::new(0);
+
+        instance
+            .persist_with_directory_sync(
+                tmp.path(),
+                |tmp_path, final_path, json| {
+                    std::fs::write(tmp_path, json)?;
+                    std::fs::rename(tmp_path, final_path)?;
+                    Ok(())
+                },
+                |_| {
+                    sync_count.set(sync_count.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect("publish lifecycle");
+
+        assert_eq!(sync_count.get(), 2);
+        assert_eq!(
+            SandboxInstance::load(tmp.path(), instance.id)
+                .expect("published lifecycle")
+                .id,
+            instance.id
+        );
+    }
+
+    #[test]
+    fn parent_sync_failure_preserves_the_published_owner() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let instance = fresh();
+        let sync_count = Cell::new(0);
+
+        let error = instance
+            .persist_with_directory_sync(
+                tmp.path(),
+                |tmp_path, final_path, json| {
+                    std::fs::write(tmp_path, json)?;
+                    std::fs::rename(tmp_path, final_path)?;
+                    Ok(())
+                },
+                |_| {
+                    let next = sync_count.get() + 1;
+                    sync_count.set(next);
+                    if next == 2 {
+                        Err(std::io::Error::other("injected parent sync failure").into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("parent sync result is uncertain");
+
+        assert!(error.to_string().contains("injected parent sync failure"));
+        assert_eq!(
+            SandboxInstance::load(tmp.path(), instance.id)
+                .expect("published lifecycle remains")
+                .id,
+            instance.id
+        );
+    }
+
+    #[test]
+    fn failed_persist_preserves_a_directory_with_owned_artifacts() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let instance = fresh();
+        let owner_dir = tmp.path().join(instance.id.to_string());
+        std::fs::create_dir_all(&owner_dir).expect("owner dir");
+        std::fs::write(owner_dir.join("backend.pid"), b"owner").expect("owner marker");
+
+        instance
+            .persist_with(tmp.path(), |_tmp_path, _final_path, _json| {
+                Err(std::io::Error::other("injected publication failure").into())
+            })
+            .expect_err("publication must fail");
+
+        assert!(owner_dir.join("backend.pid").exists());
+    }
+
+    #[test]
+    fn legacy_state_without_optional_fields_deserializes() {
+        let inst = fresh();
+        let value = serde_json::json!({
+            "id": inst.id,
+            "state": "running",
+            "backend": "mock",
+            "workload_class": "agent-rl",
+            "image_digest": "sha256:old",
+            "start_path": "cold",
+            "created_at": inst.created_at,
+            "updated_at": inst.updated_at,
+            "policy_name": "legacy"
+        });
+        let loaded: SandboxInstance = serde_json::from_value(value).expect("legacy state");
+        assert!(loaded.operation.is_none());
+        assert_eq!(loaded.backend_ownership, BackendOwnership::Unknown);
+    }
+
+    #[test]
+    fn create_journal_round_trips() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut instance = fresh();
+        instance
+            .begin_operation(OperationKind::Create)
+            .expect("begin create");
+        instance.persist(tmp.path()).expect("persist");
+
+        let mut loaded = SandboxInstance::load(tmp.path(), instance.id).expect("load");
+        assert_eq!(
+            loaded.operation.as_ref().map(|operation| operation.kind),
+            Some(OperationKind::Create)
+        );
+        loaded.finish_operation();
+        assert!(loaded.operation.is_none());
+    }
+
+    #[test]
+    fn unfinished_journal_cannot_be_overwritten() {
+        let mut instance = fresh();
+        instance
+            .begin_operation(OperationKind::Create)
+            .expect("begin create");
+        let journal = instance.operation.clone().expect("journal");
+
+        let error = instance
+            .begin_operation(OperationKind::Destroy)
+            .expect_err("unfinished operation must be preserved");
+
+        assert!(matches!(
+            error,
+            BlazeError::OperationInProgress { active, requested }
+                if active == "create" && requested == "destroy"
+        ));
+        assert_eq!(instance.operation, Some(journal));
     }
 }

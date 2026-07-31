@@ -35,6 +35,14 @@ socket = "/run/blaze/api.sock"
 http_addr = ""
 
 # ---------------------------------------------------------------------------
+# HTTP API request limits.
+# ---------------------------------------------------------------------------
+[api]
+# Maximum request body collected by the daemon. Requests above this limit
+# receive HTTP 413 before the full body is buffered. Default: 1 MiB.
+max_body_bytes = 1048576
+
+# ---------------------------------------------------------------------------
 # Backend binary paths.
 # Maps backend name → absolute path to the executable.
 # The daemon probes each configured backend at startup; backends whose
