@@ -180,12 +180,22 @@ impl SandboxManager {
         Ok(operation)
     }
 
-    #[cfg(test)]
-    pub fn backend_owner(&self, id: Uuid) -> Option<DynBackendInstance> {
+    pub(crate) fn backend_owner(&self, id: Uuid) -> Option<DynBackendInstance> {
         match self.backend_instances.lock() {
             Ok(instances) => instances.get(&id).cloned(),
             Err(poisoned) => poisoned.into_inner().get(&id).cloned(),
         }
+    }
+
+    pub(super) async fn reconstruct_storage(&self, id: Uuid) -> Result<StorageSlot> {
+        self.storage
+            .reconstruct(&id.to_string())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(super) async fn flush_storage(&self, slot: &StorageSlot) -> Result<()> {
+        self.storage.flush_dirty(slot).await.map_err(Into::into)
     }
 
     #[cfg(test)]

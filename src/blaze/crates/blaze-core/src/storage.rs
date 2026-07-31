@@ -126,6 +126,10 @@ pub trait StorageProvider: Send + Sync {
     async fn reconstruct(&self, instance_id: &str) -> Result<StorageSlot>;
 
     /// Flush dirty data to persistent storage (implementation may be no-op).
+    ///
+    /// The daemon may cancel this future when its configured attempt deadline
+    /// or shutdown signal wins. Cancellation must retain slot ownership and
+    /// leave a later synchronization or cleanup attempt safe.
     async fn flush_dirty(&self, slot: &StorageSlot) -> Result<()>;
 
     /// Query warm pool status.

@@ -36,7 +36,7 @@ pub struct ServerState {
     pub hook: Mutex<HookRegistry>,
     #[cfg(test)]
     pub instances: Arc<Mutex<HashMap<Uuid, SandboxInstance>>>,
-    pub manager: SandboxManager,
+    pub manager: Arc<SandboxManager>,
     /// The backend kind that `build_spawner` actually probed and selected.
     /// API handlers use this to constrain availability to the single active
     /// backend rather than reporting all configured binaries.
@@ -82,7 +82,7 @@ impl ServerState {
             hook: Mutex::new(hook),
             #[cfg(test)]
             instances: resources.instances,
-            manager,
+            manager: Arc::new(manager),
             active_backend,
             storage,
             #[cfg(test)]

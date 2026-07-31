@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blaze_core::backend::BackendKind;
-use blaze_core::config::{DaemonConfig, PolicyLoadErrorMode};
+use blaze_core::config::{DaemonConfig, PolicyLoadErrorMode, StorageFlushSchedule};
 use blaze_core::kernel::HookRegistry;
 use blaze_core::policy::PolicyEngine;
 use blaze_core::pool::PoolManager;
@@ -24,6 +24,7 @@ use tokio::task::{JoinError, JoinSet};
 use crate::api;
 use crate::daemon_socket::{DaemonLock, DaemonSocket};
 use crate::error::{BlazeDaemonError, Result};
+use crate::sandbox::FlushLoop;
 use crate::spawner::{
     BubblewrapSpawner, DynSpawner, FirecrackerSpawner, MockSpawner, SpawnerRegistry,
 };
@@ -142,6 +143,8 @@ fn report_connection_result(result: std::result::Result<(), JoinError>) -> bool 
 /// bind the API socket, and run the accept loop until SIGTERM/SIGINT.
 pub async fn run(config_path: &Path) -> Result<()> {
     let config = DaemonConfig::load(config_path)?;
+    let flush_schedule = config.storage.flush_schedule()?;
+    let flush_timeout = config.storage.flush_timeout_duration()?;
     tracing::info!(?config_path, "loaded daemon config");
 
     ensure_dirs(&config)?;
@@ -220,7 +223,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         None
     };
 
-    serve(listener, tcp_listener, state).await
+    serve(listener, tcp_listener, state, flush_schedule, flush_timeout).await
 }
 
 fn ensure_dirs(cfg: &DaemonConfig) -> Result<()> {
@@ -341,6 +344,8 @@ async fn serve(
     mut uds: DaemonSocket,
     tcp: Option<TcpListener>,
     state: Arc<ServerState>,
+    flush_schedule: StorageFlushSchedule,
+    flush_timeout: Duration,
 ) -> Result<()> {
     let mut sighup = signal(SignalKind::hangup())
         .map_err(|e| BlazeDaemonError::Internal(format!("install SIGHUP handler: {e}")))?;
@@ -349,9 +354,23 @@ async fn serve(
     let mut sigint = signal(SignalKind::interrupt())
         .map_err(|e| BlazeDaemonError::Internal(format!("install SIGINT handler: {e}")))?;
     let mut connections = ConnectionSupervisor::new();
+    let mut flush_loop = match flush_schedule {
+        StorageFlushSchedule::Disabled => {
+            tracing::info!("periodic provider synchronization is disabled");
+            None
+        }
+        StorageFlushSchedule::Every(interval) => {
+            Some(state.manager.start_flush_loop(interval, flush_timeout))
+        }
+    };
+    let mut service_result = Ok(());
 
     loop {
         tokio::select! {
+            result = observe_flush_exit(&mut flush_loop), if flush_loop.is_some() => {
+                service_result = result;
+                break;
+            }
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(completed) = completed {
                     report_connection_result(completed);
@@ -397,11 +416,40 @@ async fn serve(
 
     uds.stop_accepting();
     drop(tcp);
+    if let Some(flush_loop) = flush_loop.as_mut() {
+        service_result = merge_stage_result(
+            service_result,
+            "provider synchronization shutdown",
+            flush_loop.shutdown().await,
+        );
+    }
     let drain = connections.shutdown(SHUTDOWN_BUDGET.connection_drain);
     let cleanup = api::shutdown_instances(&state, SHUTDOWN_BUDGET.runtime_cleanup);
-    let shutdown_result = finish_shutdown(drain, cleanup).await;
+    service_result = merge_stage_result(
+        service_result,
+        "connection drain and runtime cleanup",
+        finish_shutdown(drain, cleanup).await,
+    );
     tracing::info!("blaze daemon stopped");
-    shutdown_result
+    service_result
+}
+
+async fn observe_flush_exit(flush_loop: &mut Option<FlushLoop>) -> Result<()> {
+    flush_loop
+        .as_mut()
+        .expect("flush loop exists while its select branch is enabled")
+        .observe_exit()
+        .await
+}
+
+fn merge_stage_result(current: Result<()>, stage: &str, next: Result<()>) -> Result<()> {
+    match (current, next) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(previous), Err(next)) => Err(BlazeDaemonError::RecoveryRequired(format!(
+            "{previous}; {stage} also failed: {next}"
+        ))),
+    }
 }
 
 async fn finish_shutdown<Drain, Cleanup>(drain: Drain, cleanup: Cleanup) -> Result<()>
@@ -595,6 +643,23 @@ mod tests {
 
         assert!(error.to_string().contains("connection drain timed out"));
         assert!(cleanup_started.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn service_and_shutdown_failures_are_both_retained() {
+        let service = Err(BlazeDaemonError::Internal(
+            "synchronization worker failed".to_string(),
+        ));
+        let shutdown = Err(BlazeDaemonError::Internal(
+            "runtime cleanup failed".to_string(),
+        ));
+
+        let error = merge_stage_result(service, "coordinated shutdown", shutdown)
+            .expect_err("both failures must be reported");
+
+        assert!(error.to_string().contains("synchronization worker failed"));
+        assert!(error.to_string().contains("coordinated shutdown"));
+        assert!(error.to_string().contains("runtime cleanup failed"));
     }
 
     #[test]
