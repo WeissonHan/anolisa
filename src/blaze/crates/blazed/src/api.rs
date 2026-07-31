@@ -122,6 +122,10 @@ async fn dispatch(
         | ("POST", ["v1", "sandboxes", id, "checkpoint"]) => checkpoint(state, id).await,
         ("GET", ["v1", "instances", id, "checkpoints"])
         | ("GET", ["v1", "sandboxes", id, "checkpoints"]) => list_checkpoints(state, id).await,
+        ("POST", ["v1", "instances", id, "checkpoints", "prune"])
+        | ("POST", ["v1", "sandboxes", id, "checkpoints", "prune"]) => {
+            prune_checkpoints(state, id).await
+        }
         ("POST", ["v1", "instances", id, "reset"]) => reset_instance(state, id).await,
         ("DELETE", ["v1", "instances", id])
         | ("DELETE", ["v1", "sandboxes", id])
@@ -310,6 +314,14 @@ async fn checkpoint(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<
 
 async fn list_checkpoints(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
     json_ok(&state.manager.list_checkpoints(parse_uuid(id)?).await?)
+}
+
+async fn prune_checkpoints(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    let removed = state.manager.prune_checkpoints(parse_uuid(id)?).await?;
+    json_ok(&json!({
+        "removed": removed,
+        "count": removed.len(),
+    }))
 }
 
 async fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
@@ -2201,6 +2213,168 @@ mod tests {
             assert_eq!(checkpoints[0].is_head, expected_head);
             assert!(state.manager.backend_owner(uuid).is_some());
         }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn startup_cleans_a_terminal_checkpoint_prune_tombstone() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config.clone(),
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+        let uuid = Uuid::parse_str(&id).expect("uuid");
+        write_checkpoint_fixture(&state, &id).await;
+        let head_hook = crate::failpoint::TestFailpoint::new(&["checkpoint-head-update"]);
+        head_hook
+            .run(state.manager.checkpoint(uuid))
+            .await
+            .expect_err("checkpoint must remain published but unreachable");
+        state.manager.destroy(uuid).await.expect("destroy sandbox");
+
+        let prune_hook =
+            crate::failpoint::TestFailpoint::new(&["checkpoint-prune-after-tombstone"]);
+        prune_hook
+            .run(state.manager.prune_checkpoints(uuid))
+            .await
+            .expect_err("prune must stop after the durable tombstone");
+        let checkpoint_dir = state.state_dir.join("checkpoints").join(&id);
+        assert!(
+            std::fs::read_dir(&checkpoint_dir)
+                .expect("checkpoint catalog")
+                .filter_map(std::result::Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".prune."))
+        );
+        drop(state);
+
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let restarted = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let report = restarted.manager.reconcile_startup().await;
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.completed, 1);
+        assert!(report.failures.is_empty());
+        assert!(
+            !std::fs::read_dir(&checkpoint_dir)
+                .expect("checkpoint catalog")
+                .filter_map(std::result::Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".prune."))
+        );
+        assert!(
+            restarted
+                .manager
+                .list_checkpoints(uuid)
+                .await
+                .expect("empty checkpoint catalog")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn checkpoint_prune_removes_an_unreachable_publication() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        write_checkpoint_fixture(&state, id).await;
+        let head_hook = crate::failpoint::TestFailpoint::new(&["checkpoint-head-update"]);
+        head_hook
+            .run(state.manager.checkpoint(uuid))
+            .await
+            .expect_err("checkpoint must remain published but unreachable");
+        let checkpoint_id = state
+            .manager
+            .list_checkpoints(uuid)
+            .await
+            .expect("unreachable checkpoint")
+            .pop()
+            .expect("checkpoint")
+            .id;
+
+        let (status, pruned) = dispatched_json(
+            &state,
+            Method::POST,
+            &format!("/v1/sandboxes/{id}/checkpoints/prune"),
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(pruned["count"], 1);
+        assert_eq!(pruned["removed"], json!([checkpoint_id]));
+        assert!(
+            state
+                .manager
+                .list_checkpoints(uuid)
+                .await
+                .expect("empty checkpoint catalog")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn prune_retry_cleans_a_prior_checkpoint_tombstone() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+        let uuid = Uuid::parse_str(&id).expect("uuid");
+        write_checkpoint_fixture(&state, &id).await;
+        let head_hook = crate::failpoint::TestFailpoint::new(&["checkpoint-head-update"]);
+        head_hook
+            .run(state.manager.checkpoint(uuid))
+            .await
+            .expect_err("checkpoint must remain published but unreachable");
+        let prune_hook =
+            crate::failpoint::TestFailpoint::new(&["checkpoint-prune-after-tombstone"]);
+        prune_hook
+            .run(state.manager.prune_checkpoints(uuid))
+            .await
+            .expect_err("first prune must stop after the durable tombstone");
+
+        assert!(
+            state
+                .manager
+                .prune_checkpoints(uuid)
+                .await
+                .expect("retry prune")
+                .is_empty()
+        );
+        assert!(
+            state
+                .manager
+                .list_checkpoints(uuid)
+                .await
+                .expect("empty checkpoint catalog")
+                .is_empty()
+        );
+        assert!(
+            !std::fs::read_dir(state.state_dir.join("checkpoints").join(&id))
+                .expect("checkpoint catalog")
+                .filter_map(std::result::Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".prune."))
+        );
     }
 
     #[cfg(feature = "test-failpoints")]

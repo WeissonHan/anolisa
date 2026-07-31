@@ -61,9 +61,9 @@ pub struct ReconcileFailure {
 /// Aggregate startup cleanup outcome.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
-    /// Number of records that were not clean terminal states.
+    /// Number of records selected for runtime or transaction cleanup.
     pub attempted: usize,
-    /// Number moved to the terminal state.
+    /// Number of selected records whose cleanup completed.
     pub completed: usize,
     /// Records that remain recoverable.
     pub failures: Vec<ReconcileFailure>,
@@ -762,6 +762,16 @@ impl SandboxManager {
             .map_err(|_| poisoned("backend_instances"))?
             .contains_key(&id);
         if is_clean_terminal(&original) && !has_retained_backend {
+            if let Err(error) = self.checkpoints.cleanup_transaction_artifacts(id) {
+                original.begin_destroy_recovery();
+                let recovery = self.persist_and_retain(original).err();
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "destroy {id}: checkpoint transaction cleanup failed: {error}{}",
+                    recovery
+                        .map(|error| format!("; recovery state persistence failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
             return Ok(false);
         }
 
@@ -975,19 +985,21 @@ impl SandboxManager {
         &self,
         item_timeout: Duration,
     ) -> ReconcileReport {
-        let mut ids = match self.instances.lock() {
-            Ok(instances) => instances
-                .values()
-                .filter(|instance| !is_clean_terminal(instance))
-                .map(|instance| instance.id)
-                .collect::<BTreeSet<_>>(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .values()
-                .filter(|instance| !is_clean_terminal(instance))
-                .map(|instance| instance.id)
-                .collect::<BTreeSet<_>>(),
+        let records = match self.instances.lock() {
+            Ok(instances) => instances.values().cloned().collect::<Vec<_>>(),
+            Err(poisoned) => poisoned.into_inner().values().cloned().collect::<Vec<_>>(),
         };
+        let mut ids = records
+            .into_iter()
+            .filter(|instance| {
+                !is_clean_terminal(instance)
+                    || self
+                        .checkpoints
+                        .has_transaction_artifacts(instance.id)
+                        .unwrap_or(true)
+            })
+            .map(|instance| instance.id)
+            .collect::<BTreeSet<_>>();
         match self.backend_instances.lock() {
             Ok(instances) => ids.extend(instances.keys().copied()),
             Err(poisoned) => ids.extend(poisoned.into_inner().keys().copied()),

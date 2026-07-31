@@ -3,7 +3,7 @@
 //!
 //! Publication and HEAD updates are separate durability boundaries. A
 //! checkpoint can therefore be published but unreachable after an interrupted
-//! operation; listing exposes that state for explicit inspection.
+//! operation; listing exposes that state and pruning can remove it later.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -24,6 +24,7 @@ const METADATA_FILE: &str = "metadata.json";
 const HEAD_FILE: &str = "HEAD";
 const STAGING_SUFFIX: &str = ".tmp";
 const TOMBSTONE_SUFFIX: &str = ".tombstone";
+const PRUNE_TOMBSTONE_PREFIX: &str = ".prune.";
 const ABORT_TOMBSTONE_PREFIX: &str = ".abort.";
 
 /// Failure while reading or mutating the daemon checkpoint catalog.
@@ -274,6 +275,49 @@ impl CheckpointStore {
         Ok(checkpoints)
     }
 
+    /// Prune unreferenced branches while retaining HEAD and explicit lineages.
+    ///
+    /// Every candidate is first atomically renamed to a hidden tombstone and
+    /// the sandbox directory is synced. An interrupted delete is therefore
+    /// absent from the live catalog and can be completed by
+    /// [`Self::cleanup_transaction_artifacts`].
+    pub fn prune_preserving(&self, sandbox_id: Uuid, protected: &[String]) -> Result<Vec<String>> {
+        let catalog = self.load_catalog(sandbox_id)?;
+        let mut keep = HashSet::new();
+        if let Some(head) = self.read_head(sandbox_id)? {
+            keep.extend(lineage_from(&catalog, &head)?);
+        }
+        for checkpoint_id in protected {
+            validate_checkpoint_id(checkpoint_id)?;
+            keep.extend(lineage_from(&catalog, checkpoint_id)?);
+        }
+        let mut candidates = catalog
+            .keys()
+            .filter(|checkpoint_id| !keep.contains(*checkpoint_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sandbox_dir = self
+            .optional_sandbox_dir(sandbox_id)?
+            .ok_or_else(|| invariant(format!("checkpoint sandbox {sandbox_id} disappeared")))?;
+
+        let mut removed = Vec::with_capacity(candidates.len());
+        for checkpoint_id in candidates {
+            let checkpoint_dir = self.committed_dir(sandbox_id, &checkpoint_id)?;
+            let tombstone = tombstone_path(&sandbox_dir, PRUNE_TOMBSTONE_PREFIX, &checkpoint_id);
+            rename_path(&checkpoint_dir, &tombstone, "tombstone pruned checkpoint")?;
+            sync_directory(&sandbox_dir)?;
+            checkpoint_store_failpoint("checkpoint-prune-after-tombstone", &tombstone)?;
+            remove_directory(&tombstone, "remove pruned checkpoint tombstone")?;
+            sync_directory(&sandbox_dir)?;
+            removed.push(checkpoint_id);
+        }
+        Ok(removed)
+    }
+
     /// Atomically move HEAD to an already committed, verified checkpoint.
     pub fn set_head(&self, sandbox_id: Uuid, checkpoint_id: &str) -> Result<()> {
         self.verify(sandbox_id, checkpoint_id)?;
@@ -326,6 +370,16 @@ impl CheckpointStore {
         validate_checkpoint_id(checkpoint_id)?;
         self.committed_dir(sandbox_id, checkpoint_id)?;
         Ok(Some(checkpoint_id.to_string()))
+    }
+
+    /// Return whether a checkpoint transaction left cleanup artifacts.
+    ///
+    /// Missing sandbox directories report `false`. Recognized names with an
+    /// unexpected file type return an error instead of being silently ignored,
+    /// matching [`Self::cleanup_transaction_artifacts`] so the caller can
+    /// report the unsafe layout without deleting an unrelated entry.
+    pub(crate) fn has_transaction_artifacts(&self, sandbox_id: Uuid) -> Result<bool> {
+        Ok(!self.transaction_artifacts(sandbox_id)?.is_empty())
     }
 
     /// Remove incomplete stages, temporary HEAD files, and cleanup tombstones.
@@ -632,16 +686,18 @@ fn classify_scratch_name(name: &str) -> Result<Option<ScratchKind>> {
         parse_uuid_component(nonce, "temporary HEAD")?;
         return Ok(Some(ScratchKind::File));
     }
-    if let Some(body) = name
-        .strip_prefix(ABORT_TOMBSTONE_PREFIX)
-        .and_then(|name| name.strip_suffix(TOMBSTONE_SUFFIX))
-    {
-        let (checkpoint_id, nonce) = body
-            .rsplit_once('.')
-            .ok_or_else(|| invariant(format!("invalid checkpoint tombstone {name:?}")))?;
-        validate_checkpoint_id(checkpoint_id)?;
-        parse_uuid_component(nonce, "checkpoint tombstone")?;
-        return Ok(Some(ScratchKind::Directory));
+    for prefix in [PRUNE_TOMBSTONE_PREFIX, ABORT_TOMBSTONE_PREFIX] {
+        if let Some(body) = name
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(TOMBSTONE_SUFFIX))
+        {
+            let (checkpoint_id, nonce) = body
+                .rsplit_once('.')
+                .ok_or_else(|| invariant(format!("invalid checkpoint tombstone {name:?}")))?;
+            validate_checkpoint_id(checkpoint_id)?;
+            parse_uuid_component(nonce, "checkpoint tombstone")?;
+            return Ok(Some(ScratchKind::Directory));
+        }
     }
     Ok(None)
 }
@@ -970,6 +1026,39 @@ mod tests {
     }
 
     #[test]
+    fn prune_retains_head_and_explicit_lineages() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = CheckpointStore::new(temp.path().join("checkpoints"));
+        let sandbox_id = Uuid::new_v4();
+        let root = publish(&store, sandbox_id, None, true);
+        let protected = publish(&store, sandbox_id, Some(root.clone()), false);
+        let abandoned = publish(&store, sandbox_id, Some(root.clone()), false);
+
+        let removed = store
+            .prune_preserving(sandbox_id, std::slice::from_ref(&protected))
+            .expect("prune checkpoints");
+
+        assert_eq!(removed, vec![abandoned]);
+        assert!(store.verify(sandbox_id, &root).is_ok());
+        assert!(store.verify(sandbox_id, &protected).is_ok());
+    }
+
+    #[test]
+    fn prune_can_remove_all_unreachable_checkpoints_before_head_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = CheckpointStore::new(temp.path().join("checkpoints"));
+        let sandbox_id = Uuid::new_v4();
+        let unreachable = publish(&store, sandbox_id, None, false);
+
+        let removed = store
+            .prune_preserving(sandbox_id, &[])
+            .expect("prune unreachable checkpoint");
+
+        assert_eq!(removed, vec![unreachable]);
+        assert!(store.list(sandbox_id).expect("list checkpoints").is_empty());
+    }
+
+    #[test]
     fn cleanup_removes_transaction_scratch_but_retains_committed_history() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = CheckpointStore::new(temp.path().join("checkpoints"));
@@ -979,8 +1068,8 @@ mod tests {
         let sandbox_dir = store.root.join(sandbox_id.to_string());
         let temporary_head = sandbox_dir.join(format!(".HEAD.{}{STAGING_SUFFIX}", Uuid::new_v4()));
         fs::write(&temporary_head, b"temporary").expect("write temporary HEAD");
-        let tombstone = tombstone_path(&sandbox_dir, ABORT_TOMBSTONE_PREFIX, &committed);
-        fs::create_dir(&tombstone).expect("create abort tombstone");
+        let tombstone = tombstone_path(&sandbox_dir, PRUNE_TOMBSTONE_PREFIX, &committed);
+        fs::create_dir(&tombstone).expect("create prune tombstone");
 
         let removed = store
             .cleanup_transaction_artifacts(sandbox_id)
@@ -995,28 +1084,48 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_recognizes_every_capture_transaction_artifact() {
+    fn transaction_artifact_detection_matches_cleanup_boundaries() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = CheckpointStore::new(temp.path().join("checkpoints"));
+        let missing_sandbox = Uuid::new_v4();
+        assert!(
+            !store
+                .has_transaction_artifacts(missing_sandbox)
+                .expect("inspect missing sandbox")
+        );
+
         let sandbox_id = Uuid::new_v4();
         let stage = store.begin(sandbox_id).expect("begin checkpoint");
         let sandbox_dir = store.root.join(sandbox_id.to_string());
         let temporary_head = sandbox_dir.join(format!(".HEAD.{}{STAGING_SUFFIX}", Uuid::new_v4()));
         fs::write(&temporary_head, b"temporary").expect("write temporary HEAD");
+        let prune_tombstone = tombstone_path(&sandbox_dir, PRUNE_TOMBSTONE_PREFIX, stage.id());
+        fs::create_dir(&prune_tombstone).expect("create prune tombstone");
         let abort_tombstone = tombstone_path(&sandbox_dir, ABORT_TOMBSTONE_PREFIX, stage.id());
         fs::create_dir(&abort_tombstone).expect("create abort tombstone");
 
+        assert!(
+            store
+                .has_transaction_artifacts(sandbox_id)
+                .expect("inspect transaction artifacts")
+        );
         let removed = store
             .cleanup_transaction_artifacts(sandbox_id)
             .expect("cleanup transaction artifacts");
-        assert_eq!(removed.len(), 3);
+        assert_eq!(removed.len(), 4);
         assert!(!stage.path.exists());
         assert!(!temporary_head.exists());
+        assert!(!prune_tombstone.exists());
         assert!(!abort_tombstone.exists());
+        assert!(
+            !store
+                .has_transaction_artifacts(sandbox_id)
+                .expect("inspect cleaned sandbox")
+        );
     }
 
     #[test]
-    fn cleanup_reports_unsafe_layout_without_deleting_it() {
+    fn transaction_artifact_detection_reports_unsafe_layout_without_deleting_it() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = CheckpointStore::new(temp.path().join("checkpoints"));
         let sandbox_id = Uuid::new_v4();
@@ -1024,6 +1133,10 @@ mod tests {
         fs::remove_dir(&stage.path).expect("remove staging directory");
         fs::write(&stage.path, b"not a directory").expect("replace stage with file");
 
+        let inspect_error = store
+            .has_transaction_artifacts(sandbox_id)
+            .expect_err("unsafe layout must be reported");
+        assert!(inspect_error.to_string().contains("unexpected file type"));
         let cleanup_error = store
             .cleanup_transaction_artifacts(sandbox_id)
             .expect_err("cleanup must not delete an entry with the wrong type");
@@ -1055,6 +1168,12 @@ mod tests {
         let sandbox_id = Uuid::new_v4();
         assert_eq!(store.read_head(sandbox_id).expect("HEAD"), None);
         assert!(store.list(sandbox_id).expect("list").is_empty());
+        assert!(
+            store
+                .prune_preserving(sandbox_id, &[])
+                .expect("prune")
+                .is_empty()
+        );
         assert!(
             store
                 .cleanup_transaction_artifacts(sandbox_id)
@@ -1107,7 +1226,14 @@ mod tests {
         let store = CheckpointStore::new(temp.path().join("checkpoints"));
         let sandbox_id = Uuid::new_v4();
         let root = publish(&store, sandbox_id, None, true);
+        let unreachable = publish(&store, sandbox_id, Some(root.clone()), false);
 
+        assert_eq!(
+            store
+                .prune_preserving(sandbox_id, &[])
+                .expect("prune unreachable checkpoint"),
+            vec![unreachable]
+        );
         assert_eq!(store.read_head(sandbox_id).expect("HEAD"), Some(root));
     }
 
@@ -1140,10 +1266,9 @@ mod tests {
             .expect("renamed checkpoint remains committed");
         assert_eq!(store.read_head(sandbox_id).expect("HEAD"), None);
         assert!(
-            store
-                .cleanup_transaction_artifacts(sandbox_id)
+            !store
+                .has_transaction_artifacts(sandbox_id)
                 .expect("inspect transaction artifacts")
-                .is_empty()
         );
     }
 
@@ -1171,10 +1296,56 @@ mod tests {
             Some(checkpoint_id)
         );
         assert!(
-            store
-                .cleanup_transaction_artifacts(sandbox_id)
+            !store
+                .has_transaction_artifacts(sandbox_id)
                 .expect("inspect transaction artifacts")
-                .is_empty()
         );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn prune_boundary_error_leaves_a_cleanup_tombstone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = CheckpointStore::new(temp.path().join("checkpoints"));
+        let sandbox_id = Uuid::new_v4();
+        let root = publish(&store, sandbox_id, None, true);
+        let unreachable = publish(&store, sandbox_id, Some(root.clone()), false);
+        let hook = crate::failpoint::TestFailpoint::new(&["checkpoint-prune-after-tombstone"]);
+
+        let error = hook
+            .run(async { store.prune_preserving(sandbox_id, &[]) })
+            .await
+            .expect_err("prune boundary must return a store error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint-prune-after-tombstone")
+        );
+        assert!(store.verify(sandbox_id, &unreachable).is_err());
+        assert_eq!(
+            store
+                .list(sandbox_id)
+                .expect("list checkpoints after tombstone")
+                .into_iter()
+                .map(|checkpoint| checkpoint.id)
+                .collect::<Vec<_>>(),
+            vec![root.clone()]
+        );
+        assert!(
+            store
+                .has_transaction_artifacts(sandbox_id)
+                .expect("inspect prune tombstone")
+        );
+        let removed = store
+            .cleanup_transaction_artifacts(sandbox_id)
+            .expect("remove prune tombstone");
+        assert_eq!(removed.len(), 1);
+        assert!(
+            !store
+                .has_transaction_artifacts(sandbox_id)
+                .expect("inspect cleaned sandbox")
+        );
+        assert_eq!(store.read_head(sandbox_id).expect("HEAD"), Some(root));
     }
 }

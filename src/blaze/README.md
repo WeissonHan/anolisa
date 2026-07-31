@@ -140,6 +140,7 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | POST | `/v1/sandboxes/{id}/write` | Replace a guest file |
 | POST | `/v1/sandboxes/{id}/checkpoint` | Capture a full checkpoint when the backend and storage provider support it |
 | GET | `/v1/sandboxes/{id}/checkpoints` | List committed checkpoints and HEAD reachability |
+| POST | `/v1/sandboxes/{id}/checkpoints/prune` | Remove checkpoint branches outside retained lineages |
 | GET | `/v1/instances` | Alias for listing sandboxes |
 | POST | `/v1/instances` | Alias for creating a sandbox |
 | GET | `/v1/instances/{id}` | Alias for sandbox details |
@@ -150,6 +151,7 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | POST | `/v1/instances/{id}/write` | Compatible guest file write action |
 | POST | `/v1/instances/{id}/checkpoint` | Compatible full-checkpoint action |
 | GET | `/v1/instances/{id}/checkpoints` | Compatible checkpoint-list action |
+| POST | `/v1/instances/{id}/checkpoints/prune` | Compatible checkpoint-prune action |
 | POST | `/v1/instances/{id}/reset` | Reserved; returns `501` until runtime reset is implemented |
 | GET | `/v1/pools` | List warm pools |
 | GET | `/v1/pools/{backend}/{class}` | Get pool status |
@@ -209,6 +211,13 @@ uncertain outcome, or the backend cannot resume, the sandbox becomes
 remain available for explicit cleanup. Listing uses the same per-sandbox
 operation lock as capture, guest operations, and destroy. Destroy removes
 transaction scratch but preserves committed checkpoint history.
+
+Checkpoint pruning removes committed entries outside the HEAD lineage and any
+lineage still referenced by durable sandbox state. Each candidate is first
+renamed to a hidden tombstone, so a retry, sandbox destroy, or startup
+reconciliation can finish an interrupted deletion. Pruning uses the same
+per-sandbox operation lock as capture and rejects an unfinished lifecycle
+operation.
 
 Runtime reset remains reserved and returns `501` without changing runtime or
 persisted state.

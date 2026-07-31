@@ -136,6 +136,7 @@ images_dir = "/var/lib/blaze/images"
 | POST | `/v1/sandboxes/{id}/write` | 替换 guest 文件 |
 | POST | `/v1/sandboxes/{id}/checkpoint` | 后端和存储 provider 支持时捕获完整 checkpoint |
 | GET | `/v1/sandboxes/{id}/checkpoints` | 列出已提交的 checkpoint 及其 HEAD 可达性 |
+| POST | `/v1/sandboxes/{id}/checkpoints/prune` | 删除保留 lineage 之外的 checkpoint 分支 |
 | GET | `/v1/instances` | 列出 sandbox 的兼容入口 |
 | POST | `/v1/instances` | 创建 sandbox 的兼容入口 |
 | GET | `/v1/instances/{id}` | 获取 sandbox 详情的兼容入口 |
@@ -146,6 +147,7 @@ images_dir = "/var/lib/blaze/images"
 | POST | `/v1/instances/{id}/write` | Guest 文件写入兼容入口 |
 | POST | `/v1/instances/{id}/checkpoint` | 捕获完整 checkpoint 的兼容入口 |
 | GET | `/v1/instances/{id}/checkpoints` | 列出 checkpoint 的兼容入口 |
+| POST | `/v1/instances/{id}/checkpoints/prune` | 删除 checkpoint 分支的兼容入口 |
 | POST | `/v1/instances/{id}/reset` | 预留接口；运行时重置实现前返回 `501` |
 | GET | `/v1/pools` | 列出 warm pool |
 | GET | `/v1/pools/{backend}/{class}` | 获取 pool 状态 |
@@ -196,6 +198,11 @@ stage。如果发布或 HEAD 的结果无法确定，或者后端无法恢复，
 `RecoveryRequired`；runtime ownership 和已经提交的 checkpoint 数据仍会
 保留，供后续显式清理。列出 checkpoint 与捕获、guest 操作及销毁共用同一个
 sandbox 操作锁。销毁会删除事务临时文件，但保留已经提交的 checkpoint 历史。
+
+checkpoint pruning 会删除 HEAD lineage 和持久 sandbox 状态所引用 lineage 之外
+的已提交记录。每个待删除目录会先被重命名为隐藏 tombstone，因此重试、
+sandbox 销毁或启动恢复都可以完成被中断的删除。pruning 与 capture 共用
+sandbox 操作锁，并拒绝存在未完成生命周期操作的 sandbox。
 
 runtime reset 仍是预留接口，会返回 `501`，且不会修改 runtime 或持久化状态。
 
