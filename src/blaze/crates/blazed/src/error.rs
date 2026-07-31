@@ -54,6 +54,9 @@ pub enum BlazeDaemonError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("unsupported operation: {0}")]
     UnsupportedOperation(String),
 
@@ -100,6 +103,7 @@ impl BlazeDaemonError {
             BlazeDaemonError::BadRequest(_) | BlazeDaemonError::RequestBody(_) => 400,
             BlazeDaemonError::NotFound(_) => 404,
             BlazeDaemonError::Conflict(_) => 409,
+            BlazeDaemonError::ServiceUnavailable(_) => 503,
             BlazeDaemonError::PayloadTooLarge { .. } => 413,
             BlazeDaemonError::UnsupportedOperation(_) => 501,
             BlazeDaemonError::RecoveryRequired(_) => 500,

@@ -135,6 +135,23 @@ gc_interval = "10m"
 idle_ttl = "1h"
 
 # ---------------------------------------------------------------------------
+# Published runtime artifact catalog.
+# ---------------------------------------------------------------------------
+[runtime_templates]
+# Destination for atomically published runtime artifact sets.
+dir = "/var/lib/blaze/runtime-templates"
+
+# Optional operator-controlled source root. Imports are disabled when omitted.
+# API requests name a relative directory below this root.
+# import_root = "/srv/blaze/runtime-template-imports"
+
+# Per-import resource bounds and aggregate catalog capacity.
+max_files = 32
+max_bytes = 274877906944
+max_metadata_bytes = 1048576
+max_total_bytes = 1099511627776
+
+# ---------------------------------------------------------------------------
 # Metrics / observability.
 # ---------------------------------------------------------------------------
 [metrics]

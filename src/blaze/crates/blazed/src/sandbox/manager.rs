@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
 use crate::metrics::Metrics;
+use crate::sandbox::template::RuntimeTemplateCatalog;
 use crate::spawner::{DynBackendInstance, SpawnerRegistry};
 
 const INSTANCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -82,6 +83,7 @@ pub struct SandboxManager {
     rootfs_size: u64,
     mem_size: u64,
     metrics: Arc<Metrics>,
+    pub(super) runtime_templates: RuntimeTemplateCatalog,
 }
 
 /// Construction inputs grouped to keep daemon wiring explicit.
@@ -94,6 +96,7 @@ pub struct SandboxManagerInit {
     pub state_dir: PathBuf,
     pub rootfs_size: u64,
     pub mem_size: u64,
+    pub runtime_templates: RuntimeTemplateCatalog,
 }
 
 /// Shared read-only resources retained by [`crate::state::ServerState`].
@@ -116,6 +119,7 @@ impl SandboxManager {
             state_dir,
             rootfs_size,
             mem_size,
+            runtime_templates,
         } = init;
         let instances = Arc::new(Mutex::new(instances));
         let backend_instances = Arc::new(Mutex::new(HashMap::new()));
@@ -140,6 +144,7 @@ impl SandboxManager {
                 rootfs_size,
                 mem_size,
                 metrics,
+                runtime_templates,
             },
             resources,
         )
