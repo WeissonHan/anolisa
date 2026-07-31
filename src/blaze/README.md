@@ -103,10 +103,18 @@ provider = "file"       # Storage provider selection. Currently supported: "file
 images_dir = "/var/lib/blaze/images"
 # pool_size = 0           # [Reserved] Warm pool slots (not yet active)
 # prefork = false         # [Reserved] Pre-start VMs in pool (not yet active)
-# flush_interval = "30s"  # [Reserved] Dirty data flush period (not yet active)
+flush_interval = "disabled" # Set a positive duration to synchronize running slots.
+flush_timeout = "30s"       # Maximum duration of one provider synchronization attempt.
 ```
 
 The `file` provider uses standard filesystem operations for sandbox storage. The `auto` provider probes available backends in priority order (currently equivalent to `file`). Unrecognized values will log a warning and fall back to `file`.
+When periodic synchronization is enabled, one provider failure or timeout does
+not block later sandboxes. The slot remains owned so a later sweep or destroy
+can retry it. The daemon stops and joins the synchronization worker before
+draining connections and releasing runtime resources.
+
+See [Storage Synchronization](docs/design/storage-synchronization.md) for
+selection, retry, and shutdown behavior.
 
 ## API Endpoints
 
