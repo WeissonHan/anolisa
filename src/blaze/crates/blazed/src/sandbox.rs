@@ -2,8 +2,10 @@
 //! Managed sandbox lifecycle and runtime ownership.
 
 mod checkpoint;
+mod hibernate;
 mod manager;
 mod restore;
 
+pub use hibernate::{HibernateSandbox, ResumeSandbox};
 pub use manager::{CreateSandbox, SandboxManager, SandboxManagerInit};
 pub use restore::{RestoreSandbox, RestoreSandboxResult};
