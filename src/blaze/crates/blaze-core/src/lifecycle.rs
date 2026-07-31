@@ -50,6 +50,8 @@ impl SandboxState {
 pub enum OperationKind {
     /// Sandbox creation is acquiring resources or starting a backend.
     Create,
+    /// A point-in-time checkpoint is being captured and published.
+    Checkpoint,
     /// Runtime resources are being destroyed.
     Destroy,
 }
@@ -58,6 +60,7 @@ impl OperationKind {
     pub const fn as_str(&self) -> &'static str {
         match self {
             OperationKind::Create => "create",
+            OperationKind::Checkpoint => "checkpoint",
             OperationKind::Destroy => "destroy",
         }
     }
@@ -69,6 +72,44 @@ impl std::fmt::Display for OperationKind {
     }
 }
 
+/// Durable boundary reached by a multi-step lifecycle operation.
+///
+/// The journal keeps this separate from [`SandboxState`]: state describes
+/// externally visible runtime availability, while the phase identifies which
+/// checkpoint resources may already have been published after interruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperationPhase {
+    /// A staging directory exists, but the backend has not been paused.
+    CheckpointPreparing,
+    /// The backend is paused while snapshot artifacts are being written.
+    CheckpointPaused,
+    /// A complete checkpoint directory is visible, but HEAD is unchanged.
+    CheckpointPublished,
+    /// HEAD references the checkpoint; runtime resume is not yet committed.
+    CheckpointHeadUpdated,
+}
+
+impl OperationPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            OperationPhase::CheckpointPreparing => "checkpoint-preparing",
+            OperationPhase::CheckpointPaused => "checkpoint-paused",
+            OperationPhase::CheckpointPublished => "checkpoint-published",
+            OperationPhase::CheckpointHeadUpdated => "checkpoint-head-updated",
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            OperationPhase::CheckpointPreparing => 0,
+            OperationPhase::CheckpointPaused => 1,
+            OperationPhase::CheckpointPublished => 2,
+            OperationPhase::CheckpointHeadUpdated => 3,
+        }
+    }
+}
+
 /// Durable journal entry for one active lifecycle operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationJournal {
@@ -76,6 +117,12 @@ pub struct OperationJournal {
     pub kind: OperationKind,
     /// UTC time at which the operation became externally visible.
     pub started_at: DateTime<Utc>,
+    /// Checkpoint selected by this operation, when applicable.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    /// Last durably committed operation boundary.
+    #[serde(default)]
+    pub phase: Option<OperationPhase>,
 }
 
 impl std::fmt::Display for SandboxState {
@@ -125,6 +172,9 @@ pub struct SandboxInstance {
     /// Active multi-step operation, if any.
     #[serde(default)]
     pub operation: Option<OperationJournal>,
+    /// Last checkpoint whose capture completed and returned the sandbox to running.
+    #[serde(default)]
+    pub last_checkpoint: Option<String>,
 }
 
 impl SandboxInstance {
@@ -151,6 +201,7 @@ impl SandboxInstance {
             policy_name,
             backend_ownership: BackendOwnership::NotStarted,
             operation: None,
+            last_checkpoint: None,
         }
     }
 
@@ -167,7 +218,50 @@ impl SandboxInstance {
         self.operation = Some(OperationJournal {
             kind,
             started_at: Utc::now(),
+            checkpoint_id: None,
+            phase: None,
         });
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    /// Record checkpoint intent before pausing the backend.
+    pub fn begin_checkpoint_operation(&mut self, checkpoint_id: String) -> Result<()> {
+        self.begin_operation(OperationKind::Checkpoint)?;
+        let operation = self
+            .operation
+            .as_mut()
+            .expect("begin_operation installs a journal");
+        operation.checkpoint_id = Some(checkpoint_id);
+        operation.phase = Some(OperationPhase::CheckpointPreparing);
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    /// Advance the active checkpoint journal without replacing its identity.
+    pub fn advance_checkpoint_phase(&mut self, phase: OperationPhase) -> Result<()> {
+        let operation = self
+            .operation
+            .as_mut()
+            .ok_or_else(|| BlazeError::OperationInProgress {
+                active: "none".to_string(),
+                requested: OperationKind::Checkpoint.to_string(),
+            })?;
+        if operation.kind != OperationKind::Checkpoint {
+            return Err(BlazeError::OperationInProgress {
+                active: operation.kind.to_string(),
+                requested: OperationKind::Checkpoint.to_string(),
+            });
+        }
+        if let Some(current) = operation.phase
+            && phase.rank() < current.rank()
+        {
+            return Err(BlazeError::InvalidStateTransition {
+                from: current.as_str().to_string(),
+                to: phase.as_str().to_string(),
+            });
+        }
+        operation.phase = Some(phase);
         self.updated_at = Utc::now();
         Ok(())
     }
@@ -183,6 +277,8 @@ impl SandboxInstance {
         self.operation = Some(OperationJournal {
             kind: OperationKind::Destroy,
             started_at: Utc::now(),
+            checkpoint_id: None,
+            phase: None,
         });
         self.updated_at = Utc::now();
     }
@@ -334,6 +430,7 @@ fn is_valid_transition(from: SandboxState, to: SandboxState) -> bool {
         (Running, Reset) => true,
         (Paused, Checkpointed) => true,
         (Paused, Running) => true, // resume
+        (Checkpointed, Running) => true,
         (Reset, Warm) => true,
         (Warm, Creating) => true, // pool reuse / warm path
         _ => false,
@@ -364,6 +461,7 @@ mod tests {
             SandboxState::Running,
             SandboxState::Paused,
             SandboxState::Checkpointed,
+            SandboxState::Running,
             SandboxState::Destroyed,
         ] {
             inst.transition(target).expect("legal transition");
@@ -576,6 +674,7 @@ mod tests {
         });
         let loaded: SandboxInstance = serde_json::from_value(value).expect("legacy state");
         assert!(loaded.operation.is_none());
+        assert!(loaded.last_checkpoint.is_none());
         assert_eq!(loaded.backend_ownership, BackendOwnership::Unknown);
     }
 
@@ -615,5 +714,71 @@ mod tests {
                 if active == "create" && requested == "destroy"
         ));
         assert_eq!(instance.operation, Some(journal));
+    }
+
+    #[test]
+    fn checkpoint_journal_preserves_identity_and_phase() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut instance = fresh();
+        instance
+            .begin_checkpoint_operation("ckpt-00000000-0000-0000-0000-000000000001".into())
+            .expect("begin checkpoint");
+        instance
+            .advance_checkpoint_phase(OperationPhase::CheckpointPublished)
+            .expect("advance checkpoint");
+        instance.persist(tmp.path()).expect("persist");
+
+        let loaded = SandboxInstance::load(tmp.path(), instance.id).expect("load");
+        let journal = loaded.operation.expect("checkpoint journal");
+        assert_eq!(journal.kind, OperationKind::Checkpoint);
+        assert_eq!(
+            journal.checkpoint_id.as_deref(),
+            Some("ckpt-00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(journal.phase, Some(OperationPhase::CheckpointPublished));
+    }
+
+    #[test]
+    fn checkpoint_journal_rejects_phase_regression() {
+        let mut instance = fresh();
+        instance
+            .begin_checkpoint_operation("ckpt-00000000-0000-0000-0000-000000000001".into())
+            .expect("begin checkpoint");
+        instance
+            .advance_checkpoint_phase(OperationPhase::CheckpointPublished)
+            .expect("advance checkpoint");
+
+        let error = instance
+            .advance_checkpoint_phase(OperationPhase::CheckpointPaused)
+            .expect_err("checkpoint phase must remain a durable lower bound");
+
+        assert!(matches!(error, BlazeError::InvalidStateTransition { .. }));
+        assert_eq!(
+            instance
+                .operation
+                .as_ref()
+                .and_then(|journal| journal.phase),
+            Some(OperationPhase::CheckpointPublished)
+        );
+    }
+
+    #[test]
+    fn checkpoint_journal_cannot_replace_an_active_operation() {
+        let mut instance = fresh();
+        instance
+            .begin_operation(OperationKind::Create)
+            .expect("begin create");
+        let journal = instance.operation.clone();
+
+        let error = instance
+            .begin_checkpoint_operation("ckpt-00000000-0000-0000-0000-000000000001".into())
+            .expect_err("checkpoint must not replace create");
+
+        assert!(matches!(
+            error,
+            BlazeError::OperationInProgress { active, requested }
+                if active == "create" && requested == "checkpoint"
+        ));
+        assert_eq!(instance.operation, journal);
     }
 }
