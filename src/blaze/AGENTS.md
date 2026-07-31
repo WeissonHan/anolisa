@@ -29,7 +29,7 @@ Platform: Linux (x86_64 + aarch64) for production. macOS builds succeed but spaw
 - **Daemon-only API model**: No CLI client for sandbox operations. All instance/pool/template management is done via HTTP endpoints on UDS (`/run/blaze/api.sock`) or TCP (`:14159`). The CLI subcommands (`daemon start`, `daemon reload`, `daemon doctor`) only manage daemon lifecycle.
 - **BackendSpawner trait**: All backend-specific process management is behind `BackendSpawner`. Adding a new backend means implementing `spawn()`, `wait()`, `kill()`, `probe()` and registering it in `daemon::build_spawner()`.
 - **Policy-driven backend selection**: Workload class → policy file → prioritized backend list. The daemon probes backends at startup and selects the first available. Never hardcode backend preference in application logic.
-- **Lifecycle state machine**: The persisted model contains 9 states. Current
+- **Lifecycle state machine**: The persisted model contains 10 states. Current
   managed routes implement create, destroy, checkpoint capture/list, and
   RecoveryRequired cleanup. Checkpoint capture returns `501` without advancing
   state when either the backend or storage provider lacks capture support.
