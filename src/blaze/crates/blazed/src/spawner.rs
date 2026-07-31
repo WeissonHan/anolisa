@@ -2,6 +2,7 @@
 //! Backend process ownership and runtime lifecycle abstraction.
 
 pub mod firecracker;
+mod netns;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,6 +26,8 @@ use uuid::Uuid;
 pub use firecracker::FirecrackerSpawner;
 
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const PID_HANDOFF_GRACE: Duration = Duration::from_secs(1);
 const STOPPED_MARKER: &str = "backend.stopped";
 
 /// Result reported when a backend process exits.
@@ -135,6 +138,11 @@ impl From<std::io::Error> for SpawnFailure {
 /// Factory for owned backend runtime instances.
 #[async_trait]
 pub trait BackendSpawner: Send + Sync {
+    /// Persist backend-specific pre-spawn ownership metadata.
+    async fn prepare_spawn(&self, _run_dir: &Path) -> Result<()> {
+        Ok(())
+    }
+
     /// Start a new sandbox.
     async fn spawn(
         &self,
@@ -180,13 +188,20 @@ pub struct BubblewrapSpawner;
 
 #[async_trait]
 impl BackendSpawner for BubblewrapSpawner {
+    async fn prepare_spawn(&self, run_dir: &Path) -> Result<()> {
+        tokio::fs::create_dir_all(run_dir).await?;
+        prepare_pid_handoff(&run_dir.join("backend.pid"))
+    }
+
     async fn spawn(
         &self,
         request: SpawnRequest,
     ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
         tokio::fs::create_dir_all(&request.run_dir).await?;
         remove_file_if_exists(&request.run_dir.join(STOPPED_MARKER)).await?;
-        let child = Command::new(&request.binary_path)
+        let pid_file = request.run_dir.join("backend.pid");
+        let mut command = Command::new(&request.binary_path);
+        command
             .args([
                 "--ro-bind",
                 "/",
@@ -206,22 +221,12 @@ impl BackendSpawner for BubblewrapSpawner {
             ])
             .env("BLAZE_INSTANCE_ID", request.instance_id.to_string())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let pid_file = request.run_dir.join("backend.pid");
+            .stderr(Stdio::null());
+        let pid_handoff = configure_pid_handoff(&mut command, &pid_file)?;
+        let child = command.spawn();
+        drop(pid_handoff);
+        let child = child?;
         let stopped_marker = request.run_dir.join(STOPPED_MARKER);
-        if let Some(pid) = child.id()
-            && let Err(error) = tokio::fs::write(&pid_file, format!("{pid}\n")).await
-        {
-            let owner: DynBackendInstance = Arc::new(ProcessInstance::new(
-                request.instance_id,
-                BackendKind::Bubblewrap,
-                child,
-                pid_file,
-                stopped_marker,
-            ));
-            return Err(SpawnFailure::compensate_started(error.into(), owner).await);
-        }
         let instance = ProcessInstance::new(
             request.instance_id,
             BackendKind::Bubblewrap,
@@ -446,6 +451,147 @@ pub(super) fn stopped_marker(run_dir: &Path) -> PathBuf {
     run_dir.join(STOPPED_MARKER)
 }
 
+#[cfg(unix)]
+pub(super) struct PidHandoff {
+    _file: std::fs::File,
+}
+
+#[cfg(not(unix))]
+pub(super) struct PidHandoff;
+
+#[cfg(unix)]
+pub(super) fn prepare_pid_handoff(pid_file: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let pid_path =
+        CString::new(pid_file.as_os_str().as_bytes()).map_err(|_| BlazeError::BackendError {
+            msg: format!("PID file path contains a NUL byte: {}", pid_file.display()),
+        })?;
+    let fd = unsafe {
+        libc::open(
+            pid_path.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.sync_all()?;
+    if let Some(parent) = pid_file.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(super) fn prepare_pid_handoff(pid_file: &Path) -> Result<()> {
+    let file = std::fs::File::create(pid_file)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn configure_pid_handoff(command: &mut Command, pid_file: &Path) -> Result<PidHandoff> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+
+    let pid_path =
+        CString::new(pid_file.as_os_str().as_bytes()).map_err(|_| BlazeError::BackendError {
+            msg: format!("PID file path contains a NUL byte: {}", pid_file.display()),
+        })?;
+    let fd = unsafe {
+        libc::open(
+            pid_path.as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let child_fd = file.as_raw_fd();
+    // SAFETY: the closure calls only async-signal-safe libc functions and does
+    // not allocate after fork. The returned guard keeps `child_fd` open and
+    // locked until `Command::spawn` completes.
+    unsafe {
+        command
+            .as_std_mut()
+            .pre_exec(move || write_current_pid(child_fd));
+    }
+    Ok(PidHandoff { _file: file })
+}
+
+#[cfg(not(unix))]
+pub(super) fn configure_pid_handoff(
+    _command: &mut Command,
+    _pid_file: &Path,
+) -> Result<PidHandoff> {
+    Ok(PidHandoff)
+}
+
+#[cfg(unix)]
+fn write_current_pid(fd: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::ftruncate(fd, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    write_pid_and_sync(fd)
+}
+
+#[cfg(unix)]
+fn write_pid_and_sync(fd: libc::c_int) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 16];
+    let mut cursor = buffer.len();
+    cursor -= 1;
+    buffer[cursor] = b'\n';
+    let mut pid = unsafe { libc::getpid() } as u32;
+    loop {
+        cursor -= 1;
+        buffer[cursor] = b'0' + (pid % 10) as u8;
+        pid /= 10;
+        if pid == 0 {
+            break;
+        }
+    }
+
+    let mut remaining = &buffer[cursor..];
+    while !remaining.is_empty() {
+        let written = unsafe {
+            libc::write(
+                fd,
+                remaining.as_ptr().cast::<libc::c_void>(),
+                remaining.len(),
+            )
+        };
+        if written < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        remaining = &remaining[written as usize..];
+    }
+    if unsafe { libc::fsync(fd) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 async fn cleanup_process_run_dir(instance_id: Uuid, run_dir: &Path, backend: &str) -> Result<()> {
     let stopped_marker = stopped_marker(run_dir);
     if stopped_marker.is_file() {
@@ -477,17 +623,9 @@ pub(super) async fn terminate_recorded_process(
     pid_file: &Path,
     backend: &str,
 ) -> Result<()> {
-    let raw = match tokio::fs::read_to_string(pid_file).await {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BlazeError::BackendError {
-                msg: format!(
-                    "cannot confirm {backend} instance {instance_id} stopped: missing PID metadata {}",
-                    pid_file.display()
-                ),
-            });
-        }
-        Err(error) => return Err(error.into()),
+    let raw = match wait_for_pid_handoff(pid_file).await? {
+        Some(raw) => raw,
+        None => return Ok(()),
     };
     let pid: u32 = raw
         .trim()
@@ -535,6 +673,74 @@ pub(super) async fn terminate_recorded_process(
         });
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_pid_handoff(pid_file: &Path) -> Result<Option<String>> {
+    let deadline = Instant::now() + PID_HANDOFF_GRACE;
+    loop {
+        match read_pid_handoff(pid_file)? {
+            PidHandoffState::NotStarted => return Ok(None),
+            PidHandoffState::Missing => {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "cannot confirm backend process ownership: missing PID handoff {}",
+                        pid_file.display()
+                    ),
+                });
+            }
+            PidHandoffState::Ready(raw) => return Ok(Some(raw)),
+            PidHandoffState::InProgress => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "cannot confirm backend process ownership: PID handoff is still in progress at {}",
+                    pid_file.display()
+                ),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum PidHandoffState {
+    Missing,
+    NotStarted,
+    InProgress,
+    Ready(String),
+}
+
+#[cfg(target_os = "linux")]
+fn read_pid_handoff(pid_file: &Path) -> Result<PidHandoffState> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+
+    let mut file = match std::fs::OpenOptions::new().read(true).open(pid_file) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PidHandoffState::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EAGAIN)
+            || error.raw_os_error() == Some(libc::EWOULDBLOCK)
+        {
+            return Ok(PidHandoffState::InProgress);
+        }
+        return Err(error.into());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    if raw.trim().is_empty() {
+        Ok(PidHandoffState::NotStarted)
+    } else {
+        Ok(PidHandoffState::Ready(raw))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -720,19 +926,90 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn orphan_cleanup_rejects_missing_pid_without_stop_record() {
+    async fn orphan_cleanup_accepts_pre_spawn_handoff_without_pid() {
+        let temp = tempfile::tempdir().expect("temp");
+        prepare_pid_handoff(&temp.path().join("backend.pid")).expect("prepare handoff");
+        cleanup_process_run_dir(Uuid::new_v4(), temp.path(), "test")
+            .await
+            .expect("an unlocked empty handoff proves the backend was not started");
+        assert!(stopped_marker(temp.path()).is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn orphan_cleanup_rejects_missing_pid_handoff() {
         let temp = tempfile::tempdir().expect("temp");
         let error = cleanup_process_run_dir(Uuid::new_v4(), temp.path(), "test")
             .await
-            .expect_err("missing metadata cannot prove termination");
-        assert!(error.to_string().contains("missing PID metadata"));
+            .expect_err("missing handoff cannot prove backend ownership");
 
-        record_backend_stopped(&stopped_marker(temp.path()))
+        assert!(error.to_string().contains("missing PID handoff"));
+        assert!(!stopped_marker(temp.path()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn orphan_cleanup_retains_an_active_pid_handoff() {
+        let temp = tempfile::tempdir().expect("temp");
+        let pid_file = temp.path().join("backend.pid");
+        prepare_pid_handoff(&pid_file).expect("prepare handoff");
+        let mut command = Command::new("sleep");
+        let handoff = configure_pid_handoff(&mut command, &pid_file).expect("configure handoff");
+
+        let error = cleanup_process_run_dir(Uuid::new_v4(), temp.path(), "test")
             .await
-            .expect("record stopped");
-        cleanup_process_run_dir(Uuid::new_v4(), temp.path(), "test")
+            .expect_err("an active handoff cannot prove the backend absent");
+
+        assert!(
+            error
+                .to_string()
+                .contains("PID handoff is still in progress")
+        );
+        assert!(!stopped_marker(temp.path()).exists());
+        drop(handoff);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pid_handoff_is_visible_when_spawn_returns() {
+        let temp = tempfile::tempdir().expect("temp");
+        let instance_id = Uuid::new_v4();
+        let pid_file = temp.path().join("backend.pid");
+        prepare_pid_handoff(&pid_file).expect("prepare handoff");
+        let mut command = Command::new("sleep");
+        command
+            .arg("60")
+            .env("BLAZE_INSTANCE_ID", instance_id.to_string());
+        let handoff = configure_pid_handoff(&mut command, &pid_file).expect("configure handoff");
+        let mut child = command.spawn().expect("spawn child");
+        drop(handoff);
+        wait_for_instance_marker(&child, instance_id).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&pid_file)
+                .expect("pid handoff")
+                .trim(),
+            child.id().expect("child pid").to_string()
+        );
+        terminate_recorded_process(instance_id, &pid_file, "test")
             .await
-            .expect("durable stop record proves termination");
+            .expect("terminate handed-off process");
+        child.wait().await.expect("reap child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_pid_handoff_preparation_does_not_start_backend() {
+        let temp = tempfile::tempdir().expect("temp");
+        let instance_id = Uuid::new_v4();
+        let pid_file = temp.path().join("missing").join("backend.pid");
+        let mut command = Command::new("sleep");
+        command
+            .arg("60")
+            .env("BLAZE_INSTANCE_ID", instance_id.to_string());
+
+        assert!(configure_pid_handoff(&mut command, &pid_file).is_err());
+        assert!(!pid_file.exists());
     }
 
     #[cfg(target_os = "linux")]

@@ -333,6 +333,36 @@ async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Respon
     };
     crate::failpoint::pause("create-after-storage-acquire").await;
 
+    let work_dir = state.state_dir.join(instance.id.to_string());
+    let spawner = match state.spawner_for(state.active_backend) {
+        Some(spawner) => spawner,
+        None => {
+            return Err(cleanup_failed_create(
+                state,
+                &mut instance,
+                storage,
+                None,
+                false,
+                BlazeDaemonError::Internal(format!(
+                    "active backend {} has no registered spawner",
+                    state.active_backend
+                )),
+            )
+            .await);
+        }
+    };
+    if let Err(error) = spawner.prepare_spawn(&work_dir).await {
+        return Err(cleanup_failed_create(
+            state,
+            &mut instance,
+            storage,
+            None,
+            false,
+            error.into(),
+        )
+        .await);
+    }
+
     instance.backend_ownership = BackendOwnership::Starting;
     if let Err(error) = instance.persist(&state.state_dir) {
         instance.backend_ownership = BackendOwnership::NotStarted;
@@ -359,25 +389,6 @@ async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Respon
         .await);
     }
 
-    let work_dir = state.state_dir.join(instance.id.to_string());
-    let spawner = match state.spawner_for(state.active_backend) {
-        Some(spawner) => spawner,
-        None => {
-            instance.backend_ownership = BackendOwnership::NotStarted;
-            return Err(cleanup_failed_create(
-                state,
-                &mut instance,
-                storage,
-                None,
-                false,
-                BlazeDaemonError::Internal(format!(
-                    "active backend {} has no registered spawner",
-                    state.active_backend
-                )),
-            )
-            .await);
-        }
-    };
     let spawn = match crate::failpoint::backend("create-spawn") {
         Ok(()) => {
             spawner
