@@ -147,9 +147,9 @@ const BUNDLE_SPEC_FILE: &str = "config.json";
 /// Checkpointing a large sandbox writes its whole memory image, so this is
 /// far more generous than the short state operations.
 const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long a restored sandbox may take to report itself running.
-const RESTORE_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const RESTORE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long a starting or restored sandbox may take to report itself running.
+const START_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Bytes stored under `dir`, used for snapshot accounting.
 fn dir_size(dir: &Path) -> u64 {
@@ -215,28 +215,45 @@ async fn spawn_restore(
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file))
         .spawn()?;
+    wait_until_running(&mut child, binary_path, root_dir, container_id, "restore").await?;
+    Ok(child)
+}
 
-    let deadline = tokio::time::Instant::now() + RESTORE_READY_TIMEOUT;
+/// Block until runsc reports `container_id` as running.
+///
+/// The foreground `runsc run` / `runsc restore` child lives for the sandbox's
+/// lifetime, so completion cannot be awaited. Callers must not report a
+/// sandbox as running before this returns: runsc rejects operations on a
+/// container whose state file is not yet written, which would otherwise
+/// surface as a spurious failure on the very next request.
+async fn wait_until_running(
+    child: &mut Child,
+    binary_path: &Path,
+    root_dir: &Path,
+    container_id: &str,
+    what: &str,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + START_READY_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait()? {
             return Err(BlazeError::BackendError {
                 msg: format!(
-                    "runsc restore for {container_id} exited early with {status}; see runsc.log"
+                    "runsc {what} for {container_id} exited early with {status}; see runsc.log"
                 ),
             });
         }
         if container_status(binary_path, root_dir, container_id).await
             == Some("running".to_string())
         {
-            return Ok(child);
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            let _ = terminate_child(&mut child, BackendKind::Gvisor.as_str()).await;
+            let _ = terminate_child(child, BackendKind::Gvisor.as_str()).await;
             return Err(BlazeError::BackendError {
-                msg: format!("runsc restore for {container_id} did not become ready"),
+                msg: format!("runsc {what} for {container_id} did not become ready"),
             });
         }
-        tokio::time::sleep(RESTORE_POLL_INTERVAL).await;
+        tokio::time::sleep(START_POLL_INTERVAL).await;
     }
 }
 
@@ -378,7 +395,7 @@ impl BackendSpawner for GvisorSpawner {
         let container_id = format!("blaze-{}", request.instance_id);
         let log_file =
             std::fs::File::create(request.run_dir.join("runsc.log")).map_err(BlazeError::from)?;
-        let child = Command::new(&request.binary_path)
+        let mut child = Command::new(&request.binary_path)
             .args(run_argv(&self.root_dir, &bundle, &container_id))
             .env("BLAZE_INSTANCE_ID", request.instance_id.to_string())
             .stdout(Stdio::null())
@@ -401,6 +418,26 @@ impl BackendSpawner for GvisorSpawner {
                 child,
             ));
             return Err(SpawnFailure::compensate_started(error.into(), owner).await);
+        }
+        // Do not report a sandbox as running before runsc agrees: it rejects
+        // operations on a container whose state file is not yet written, which
+        // would otherwise fail the caller's very next request.
+        if let Err(error) = wait_until_running(
+            &mut child,
+            &paths.binary_path,
+            &paths.root_dir,
+            &container_id,
+            "run",
+        )
+        .await
+        {
+            let owner: DynBackendInstance = Arc::new(GvisorInstance::new(
+                request.instance_id,
+                container_id,
+                paths,
+                child,
+            ));
+            return Err(SpawnFailure::compensate_started(error, owner).await);
         }
         Ok(Arc::new(GvisorInstance::new(
             request.instance_id,
