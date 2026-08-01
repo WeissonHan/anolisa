@@ -101,6 +101,61 @@ pub struct SpawnRequest {
     pub vm: Option<VmConfig>,
 }
 
+/// Compression applied to a checkpoint payload. Values map onto
+/// `runsc checkpoint --compression`; backends that cannot compress
+/// ignore anything other than [`SnapshotCompression::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotCompression {
+    #[default]
+    None,
+    FlateBestSpeed,
+}
+
+/// Complete input for capturing a checkpoint of a running sandbox.
+#[derive(Debug, Clone)]
+pub struct SnapshotRequest {
+    /// Sandbox being captured.
+    pub instance_id: Uuid,
+    /// Payload root. The backend owns this entire subtree and chooses its
+    /// internal layout; the daemon only supplies the directory.
+    pub snapshot_dir: PathBuf,
+    /// Keep the sandbox running after the payload is written.
+    pub leave_running: bool,
+    pub compression: SnapshotCompression,
+}
+
+/// Backend-reported outcome of a completed checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotArtifacts {
+    /// Backend that wrote the payload. Only the same kind can restore it.
+    pub backend: BackendKind,
+    /// Bytes written under the payload root, for store accounting.
+    pub size_bytes: u64,
+    /// Whether the sandbox is still running. Authoritative over
+    /// [`SnapshotRequest::leave_running`]: a backend may be forced to
+    /// hibernate even when a live snapshot was requested.
+    pub left_running: bool,
+}
+
+/// Complete input for re-establishing a sandbox from a checkpoint.
+#[derive(Debug, Clone)]
+pub struct RestoreRequest {
+    /// Instance that will own the restored sandbox. Differs from the
+    /// snapshot's source instance when hatching a new sandbox.
+    pub instance_id: Uuid,
+    /// Backend kind recorded in the snapshot; must match the spawner.
+    pub kind: BackendKind,
+    /// Provider-owned runtime directory.
+    pub run_dir: PathBuf,
+    pub binary_path: PathBuf,
+    /// Payload root previously handed to [`SnapshotRequest::snapshot_dir`].
+    pub snapshot_dir: PathBuf,
+    pub storage: StorageSlot,
+    pub backend: BackendConfigs,
+    pub vm: Option<VmConfig>,
+}
+
 /// Probed availability of a single backend on this host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendStatus {
