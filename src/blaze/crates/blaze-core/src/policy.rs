@@ -614,6 +614,7 @@ impl PolicyEngine {
             let policy = load_one(&path)?;
             policy.validate()?;
             warn_vm_config(&policy);
+            warn_checkpoint_config(&policy);
             tracing::info!(
                 policy_name = %policy.policy_name,
                 priority = policy.priority,
@@ -751,6 +752,41 @@ fn warn_vm_config(policy: &PolicyFile) {
             );
         }
     }
+}
+
+/// Warn about a `[checkpoint]` block that cannot take effect.
+///
+/// These are warnings rather than validation errors because the daemon
+/// defaults to `on_load_error = "fail"`: rejecting them would refuse to boot
+/// on policies that work today.
+fn warn_checkpoint_config(policy: &PolicyFile) {
+    let Some(checkpoint) = policy.checkpoint.as_ref() else {
+        return;
+    };
+    if checkpoint.enabled
+        && !policy
+            .select
+            .backend_priority
+            .iter()
+            .any(|kind| backend_supports_snapshots(*kind))
+    {
+        tracing::warn!(
+            policy = %policy.policy_name,
+            "[checkpoint] enabled but backend_priority contains no snapshot-capable backend"
+        );
+    }
+    if checkpoint.strategy == CheckpointStrategy::Criu {
+        tracing::warn!(
+            policy = %policy.policy_name,
+            "[checkpoint].strategy = \"criu\" is parsed but not implemented; the backend's own \
+             checkpoint mechanism is used instead"
+        );
+    }
+}
+
+/// Whether a backend kind can capture checkpoints today.
+fn backend_supports_snapshots(kind: BackendKind) -> bool {
+    matches!(kind, BackendKind::Gvisor | BackendKind::Mock)
 }
 
 fn build_decision(policy: &PolicyFile) -> RuntimeDecision {

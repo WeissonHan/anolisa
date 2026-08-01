@@ -1051,6 +1051,14 @@ async fn snapshot_instance(
             instance.state
         )));
     }
+    // Only an explicit opt-out denies. An absent [checkpoint] section means
+    // unconstrained, which is the value every shipped policy carries.
+    if snapshots_denied_by_policy(state, &instance.policy_name)? {
+        return Err(BlazeDaemonError::Conflict(format!(
+            "policy {} disables checkpointing",
+            instance.policy_name
+        )));
+    }
 
     // Reserve before invoking the backend, so a crash mid-checkpoint leaves a
     // reapable directory instead of an unowned payload.
@@ -1134,6 +1142,22 @@ async fn snapshot_instance(
         "snapshot": committed,
         "instance": instance,
     }))
+}
+
+/// Whether the instance's policy explicitly disables checkpointing.
+///
+/// Absent policy or absent `[checkpoint]` section means unconstrained.
+fn snapshots_denied_by_policy(state: &Arc<ServerState>, policy_name: &str) -> Result<bool> {
+    let engine = state
+        .policy
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("policy lock poisoned".into()))?;
+    Ok(engine
+        .policies()
+        .iter()
+        .find(|policy| policy.policy_name == policy_name)
+        .and_then(|policy| policy.checkpoint.as_ref())
+        .is_some_and(|checkpoint| !checkpoint.enabled))
 }
 
 /// Drop a reservation whose payload never completed. Best-effort: the
@@ -2540,6 +2564,36 @@ mod tests {
                 .get(Uuid::parse_str(&sid).expect("uuid"))
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_refused_when_policy_disables_checkpointing() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let mut policy = test_policy(BackendKind::Mock, false);
+        policy.checkpoint = Some(blaze_core::policy::PolicyCheckpoint {
+            enabled: false,
+            strategy: blaze_core::policy::CheckpointStrategy::UffdWpAsync,
+        });
+        let state = build_test_state(
+            config,
+            policy,
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+
+        let error = snapshot_instance(&state, &id, b"", SnapshotRoute::Snapshot)
+            .await
+            .expect_err("policy opts out");
+        assert_eq!(error.status_code(), 409);
+        assert!(error.to_string().contains("disables checkpointing"));
     }
 
     #[tokio::test]
