@@ -26,6 +26,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::{BlazeDaemonError, Result};
+use crate::spawner::DynBackendInstance;
 use crate::state::ServerState;
 
 /// Top-level request handler. Always returns `Ok(Response)`; internal
@@ -76,6 +77,8 @@ async fn dispatch(
         ("GET", ["v1", "instances"]) => list_instances(state),
         ("POST", ["v1", "instances"]) => create_instance(state, &body).await,
         ("GET", ["v1", "instances", id]) => get_instance(state, id),
+        ("POST", ["v1", "instances", id, "pause"]) => pause_instance(state, id).await,
+        ("POST", ["v1", "instances", id, "resume"]) => resume_instance(state, id).await,
         ("POST", ["v1", "instances", id, "checkpoint"]) => checkpoint(state, id).await,
         ("POST", ["v1", "instances", id, "reset"]) => reset_instance(state, id).await,
         ("POST", ["v1", "instances", id, "destroy"]) => destroy_instance(state, id).await,
@@ -884,6 +887,102 @@ fn retain_instance_state(state: &Arc<ServerState>, instance: SandboxInstance) ->
             Some("instance state retained in poisoned lifecycle map".to_string())
         }
     }
+}
+
+/// Clone an instance and its live backend owner out of the daemon maps.
+///
+/// Returns [`BlazeDaemonError::Conflict`] when the owner is absent: backend
+/// owners are in-process only and are not rehydrated across a daemon
+/// restart, so operations on a live sandbox cannot be served afterwards.
+fn live_owner(
+    state: &Arc<ServerState>,
+    uuid: Uuid,
+    operation: &str,
+) -> Result<(SandboxInstance, DynBackendInstance)> {
+    let instance = state
+        .instances
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?
+        .get(&uuid)
+        .cloned()
+        .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {uuid}")))?;
+    let owner = state
+        .backend_instances
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("backend map lock poisoned".into()))?
+        .get(&uuid)
+        .cloned()
+        .ok_or_else(|| {
+            BlazeDaemonError::Conflict(format!(
+                "cannot {operation} instance {uuid}: this daemon process holds no backend owner \
+                 for it (owners are not rehydrated across restart)"
+            ))
+        })?;
+    Ok((instance, owner))
+}
+
+/// Commit a lifecycle move that the backend has already performed.
+///
+/// The backend acts first, so a persist failure must be compensated by
+/// undoing the backend change; `undo` restores the state the record still
+/// claims. A successful undo returns the original error, a failed one
+/// escalates to [`BlazeDaemonError::RecoveryRequired`].
+async fn commit_backend_move(
+    state: &Arc<ServerState>,
+    instance: SandboxInstance,
+    owner: &DynBackendInstance,
+    undo: BackendUndo,
+) -> Result<SandboxInstance> {
+    let error = match instance.persist(&state.state_dir) {
+        Ok(()) => match retain_instance_state(state, instance.clone()) {
+            None => return Ok(instance),
+            Some(details) => BlazeDaemonError::RecoveryRequired(details),
+        },
+        Err(error) => error.into(),
+    };
+    let undone = match undo {
+        BackendUndo::Pause => owner.pause().await,
+        BackendUndo::Resume => owner.resume().await,
+    };
+    match undone {
+        Ok(()) => Err(error),
+        Err(cleanup) => Err(BlazeDaemonError::RecoveryRequired(format!(
+            "{error}; backend rollback failed: {cleanup}"
+        ))),
+    }
+}
+
+/// Backend operation that restores what the persisted record still claims.
+enum BackendUndo {
+    Pause,
+    Resume,
+}
+
+async fn pause_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    let uuid = parse_uuid(id)?;
+    let operation_lock = state.operation_lock(uuid);
+    let _operation = operation_lock.lock().await;
+    let (mut instance, owner) = live_owner(state, uuid, "pause")?;
+    // Reject an illegal move (422) before touching the sandbox.
+    instance.transition(SandboxState::Paused)?;
+
+    owner.pause().await?;
+    let instance = commit_backend_move(state, instance, &owner, BackendUndo::Resume).await?;
+    state.metrics.inc(&state.metrics.instances_paused);
+    json_ok(&instance)
+}
+
+async fn resume_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    let uuid = parse_uuid(id)?;
+    let operation_lock = state.operation_lock(uuid);
+    let _operation = operation_lock.lock().await;
+    let (mut instance, owner) = live_owner(state, uuid, "resume")?;
+    instance.transition(SandboxState::Running)?;
+
+    owner.resume().await?;
+    let instance = commit_backend_move(state, instance, &owner, BackendUndo::Pause).await?;
+    state.metrics.inc(&state.metrics.instances_resumed);
+    json_ok(&instance)
 }
 
 async fn checkpoint(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
@@ -1713,6 +1812,120 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_round_trip() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+
+        let paused = pause_instance(&state, &id).await.expect("pause");
+        assert_eq!(paused.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .instances
+                .lock()
+                .expect("instances")
+                .values()
+                .next()
+                .expect("instance")
+                .state,
+            SandboxState::Paused
+        );
+
+        resume_instance(&state, &id).await.expect("resume");
+        assert_eq!(
+            state
+                .instances
+                .lock()
+                .expect("instances")
+                .values()
+                .next()
+                .expect("instance")
+                .state,
+            SandboxState::Running
+        );
+        let rendered = state.metrics.render();
+        assert!(rendered.contains("blaze_instances_paused_total 1"));
+        assert!(rendered.contains("blaze_instances_resumed_total 1"));
+    }
+
+    #[tokio::test]
+    async fn pause_rejects_an_instance_without_a_live_owner() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let id = {
+            let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+                config.storage.images_dir.clone(),
+                config.storage.instances_dir.clone(),
+            ));
+            let state = build_test_state(
+                config.clone(),
+                test_policy(BackendKind::Mock, false),
+                spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+                BackendKind::Mock,
+                storage,
+            );
+            let created = created_json(&state, &test_request()).await;
+            created["instance"]["id"].as_str().expect("id").to_string()
+        };
+
+        // Rebuilding the state rehydrates lifecycle records but not backend
+        // owners, which is exactly the restart limitation being asserted.
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let restarted = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+
+        let error = pause_instance(&restarted, &id)
+            .await
+            .expect_err("no live owner");
+        assert_eq!(error.status_code(), 409);
+        assert!(error.to_string().contains("no backend owner"));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_a_running_instance() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+
+        let error = resume_instance(&state, &id)
+            .await
+            .expect_err("running cannot resume");
+        assert_eq!(error.status_code(), 422);
     }
 
     #[tokio::test]

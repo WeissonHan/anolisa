@@ -11,6 +11,8 @@ pub struct Metrics {
     pub instances_created: AtomicU64,
     pub instances_destroyed: AtomicU64,
     pub instances_resets: AtomicU64,
+    pub instances_paused: AtomicU64,
+    pub instances_resumed: AtomicU64,
     pub pool_hits: AtomicU64,
     pub pool_misses: AtomicU64,
     pub policy_eval_failures: AtomicU64,
@@ -48,6 +50,16 @@ impl Metrics {
                 "blaze_instances_resets_total",
                 "Total sandbox instances reset",
                 self.instances_resets.load(Ordering::Relaxed),
+            ),
+            (
+                "blaze_instances_paused_total",
+                "Total sandbox instances paused",
+                self.instances_paused.load(Ordering::Relaxed),
+            ),
+            (
+                "blaze_instances_resumed_total",
+                "Total sandbox instances resumed",
+                self.instances_resumed.load(Ordering::Relaxed),
             ),
             (
                 "blaze_pool_hits_total",

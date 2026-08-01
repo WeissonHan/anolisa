@@ -53,6 +53,30 @@ pub trait BackendInstance: Send + Sync {
     async fn try_wait(&self) -> Result<Option<SpawnResult>>;
     /// Terminate the process and release all backend-owned resources.
     async fn kill(&self) -> Result<()>;
+
+    /// Freeze every task in the sandbox without releasing resources.
+    ///
+    /// # Errors
+    /// Returns [`BlazeError::UnsupportedOperation`] unless the backend
+    /// overrides this, or a backend error when the sandbox is not running.
+    async fn pause(&self) -> Result<()> {
+        Err(BlazeError::UnsupportedOperation {
+            backend: self.backend().to_string(),
+            operation: "pause",
+        })
+    }
+
+    /// Resume a sandbox previously frozen by [`Self::pause`].
+    ///
+    /// # Errors
+    /// Returns [`BlazeError::UnsupportedOperation`] unless the backend
+    /// overrides this, or a backend error when the sandbox is not paused.
+    async fn resume(&self) -> Result<()> {
+        Err(BlazeError::UnsupportedOperation {
+            backend: self.backend().to_string(),
+            operation: "resume",
+        })
+    }
 }
 
 /// Shared backend instance handle stored in the daemon runtime map.
@@ -342,6 +366,7 @@ struct MockInstance {
     cancellation: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
     killed: AtomicBool,
+    paused: AtomicBool,
 }
 
 async fn spawn_mock_instance(instance_id: Uuid, run_dir: PathBuf) -> Result<DynBackendInstance> {
@@ -354,6 +379,7 @@ async fn spawn_mock_instance(instance_id: Uuid, run_dir: PathBuf) -> Result<DynB
         cancellation,
         task: Mutex::new(Some(task)),
         killed: AtomicBool::new(false),
+        paused: AtomicBool::new(false),
     }))
 }
 
@@ -401,6 +427,30 @@ impl BackendInstance for MockInstance {
             let _ = task.await;
         }
         self.killed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn pause(&self) -> Result<()> {
+        if self.paused.swap(true, Ordering::AcqRel) {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "cannot pause container {} in state paused",
+                    self.instance_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn resume(&self) -> Result<()> {
+        if !self.paused.swap(false, Ordering::AcqRel) {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "cannot resume container {} in state running",
+                    self.instance_id
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -672,6 +722,43 @@ mod tests {
         instance.kill().await.expect("kill");
         assert!(instance.try_wait().await.expect("try wait").is_some());
         instance.kill().await.expect("idempotent kill");
+    }
+
+    #[tokio::test]
+    async fn mock_pause_rejects_a_sandbox_that_is_already_paused() {
+        let temp = tempfile::tempdir().expect("temp");
+        let instance = MockSpawner
+            .spawn(request(temp.path()))
+            .await
+            .expect("spawn");
+
+        instance.pause().await.expect("pause");
+        let error = instance.pause().await.expect_err("double pause");
+        assert!(error.to_string().contains("in state paused"));
+        instance.resume().await.expect("resume");
+        assert!(instance.resume().await.is_err(), "double resume fails");
+    }
+
+    #[tokio::test]
+    async fn backends_without_overrides_report_unsupported_operations() {
+        let temp = tempfile::tempdir().expect("temp");
+        let spawn = request(temp.path());
+        let instance = BubblewrapSpawner
+            .spawn(SpawnRequest {
+                binary_path: PathBuf::from("/bin/true"),
+                ..spawn
+            })
+            .await
+            .expect("spawn");
+
+        for error in [
+            instance.pause().await.expect_err("pause"),
+            instance.resume().await.expect_err("resume"),
+        ] {
+            assert!(matches!(error, BlazeError::UnsupportedOperation { .. }));
+            assert!(error.to_string().contains("bubblewrap"));
+        }
+        instance.kill().await.expect("kill");
     }
 
     #[cfg(target_os = "linux")]

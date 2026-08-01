@@ -8,6 +8,8 @@
 //! Status-code discipline for rejected operations:
 //! - state-machine violations map to 422 via
 //!   [`blaze_core::BlazeError::InvalidStateTransition`],
+//! - preconditions the state machine does not model map to 409 via
+//!   [`BlazeDaemonError::Conflict`],
 //! - operations a backend cannot perform at all map to 501 via
 //!   [`blaze_core::BlazeError::UnsupportedOperation`].
 
@@ -57,6 +59,12 @@ pub enum BlazeDaemonError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// An operation precondition the lifecycle state machine does not model,
+    /// such as acting on an instance whose backend owner this daemon process
+    /// no longer holds.
+    #[error("conflicting instance state: {0}")]
+    Conflict(String),
+
     #[error("operation requires recovery: {0}")]
     RecoveryRequired(String),
 
@@ -70,6 +78,7 @@ impl BlazeDaemonError {
         match self {
             BlazeDaemonError::BadRequest(_) => 400,
             BlazeDaemonError::NotFound(_) => 404,
+            BlazeDaemonError::Conflict(_) => 409,
             BlazeDaemonError::RecoveryRequired(_) => 500,
             BlazeDaemonError::HttpStatus { status, .. } => *status,
             BlazeDaemonError::Core(blaze_core::BlazeError::PolicyEvalError { .. })
@@ -94,6 +103,14 @@ mod tests {
             })
             .status_code(),
             501
+        );
+    }
+
+    #[test]
+    fn conflict_maps_to_conflict_status() {
+        assert_eq!(
+            BlazeDaemonError::Conflict("no live owner".into()).status_code(),
+            409
         );
     }
 

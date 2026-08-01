@@ -28,6 +28,8 @@ use super::{
 const ROOTFS_DIR_NAME: &str = "gvisor-rootfs";
 const RUNSC_ROOT_DIR_NAME: &str = "runsc";
 const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for short runsc state operations (pause, resume, state).
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// gVisor backend factory.
 ///
@@ -98,6 +100,50 @@ fn delete_force_argv(root_dir: &Path, container_id: &str) -> Vec<OsString> {
         "delete",
         &[OsStr::new("--force"), OsStr::new(container_id)],
     )
+}
+
+/// Argv for freezing a running sandbox.
+fn pause_argv(root_dir: &Path, container_id: &str) -> Vec<OsString> {
+    state_argv(root_dir, "pause", &[OsStr::new(container_id)])
+}
+
+/// Argv for thawing a paused sandbox.
+fn resume_argv(root_dir: &Path, container_id: &str) -> Vec<OsString> {
+    state_argv(root_dir, "resume", &[OsStr::new(container_id)])
+}
+
+/// Run a runsc subcommand that only addresses existing container state.
+///
+/// runsc reports precondition failures on stderr (for example "cannot pause
+/// container X in state paused"), so it is captured and surfaced instead of
+/// being discarded — that message is the whole diagnostic.
+async fn runsc_state_command(
+    binary_path: &Path,
+    argv: Vec<OsString>,
+    what: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let output = tokio::time::timeout(
+        timeout,
+        Command::new(binary_path)
+            .args(argv)
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| BlazeError::BackendError {
+        msg: format!("runsc {what} timed out"),
+    })??;
+    if !output.status.success() {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "runsc {what} failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    Ok(output.stdout)
 }
 
 fn oci_spec(rootfs: &Path) -> serde_json::Value {
@@ -290,6 +336,21 @@ impl GvisorInstance {
             killed: AtomicBool::new(false),
         }
     }
+
+    /// Reject a lifecycle operation on an owner that has already been torn
+    /// down, so the caller sees why rather than runsc's missing-container
+    /// error.
+    fn ensure_live(&self, operation: &str) -> Result<()> {
+        if self.killed.load(Ordering::Acquire) {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "cannot {operation} container {}: the sandbox has been torn down",
+                    self.container_id
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -337,6 +398,30 @@ impl BackendInstance for GvisorInstance {
         *guard = None;
         remove_file_if_exists(&self.pid_file).await?;
         self.killed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn pause(&self) -> Result<()> {
+        self.ensure_live("pause")?;
+        runsc_state_command(
+            &self.binary_path,
+            pause_argv(&self.root_dir, &self.container_id),
+            "pause",
+            LIFECYCLE_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn resume(&self) -> Result<()> {
+        self.ensure_live("resume")?;
+        runsc_state_command(
+            &self.binary_path,
+            resume_argv(&self.root_dir, &self.container_id),
+            "resume",
+            LIFECYCLE_TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
 }
