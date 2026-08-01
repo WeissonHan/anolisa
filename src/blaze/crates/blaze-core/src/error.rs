@@ -60,6 +60,13 @@ pub enum BlazeError {
         path: PathBuf,
         expected: &'static str,
     },
+
+    /// A backend does not implement an optional lifecycle operation.
+    #[error("{operation} is not supported by the {backend} backend")]
+    UnsupportedOperation {
+        backend: String,
+        operation: &'static str,
+    },
 }
 
 /// Internal wrapper that lets [`BlazeError::ConfigError`] carry either a

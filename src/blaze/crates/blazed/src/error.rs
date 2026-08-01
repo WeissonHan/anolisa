@@ -4,6 +4,12 @@
 //! Wraps [`blaze_core::BlazeError`] so the daemon can additionally
 //! surface I/O, hyper, and CLI-side failures without expanding the
 //! public core error enum.
+//!
+//! Status-code discipline for rejected operations:
+//! - state-machine violations map to 422 via
+//!   [`blaze_core::BlazeError::InvalidStateTransition`],
+//! - operations a backend cannot perform at all map to 501 via
+//!   [`blaze_core::BlazeError::UnsupportedOperation`].
 
 use std::path::PathBuf;
 
@@ -69,7 +75,37 @@ impl BlazeDaemonError {
             BlazeDaemonError::Core(blaze_core::BlazeError::PolicyEvalError { .. })
             | BlazeDaemonError::Core(blaze_core::BlazeError::InvalidStateTransition { .. }) => 422,
             BlazeDaemonError::Core(blaze_core::BlazeError::BackendUnavailable { .. }) => 503,
+            BlazeDaemonError::Core(blaze_core::BlazeError::UnsupportedOperation { .. }) => 501,
             _ => 500,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_operation_maps_to_not_implemented() {
+        assert_eq!(
+            BlazeDaemonError::Core(blaze_core::BlazeError::UnsupportedOperation {
+                backend: "firecracker".into(),
+                operation: "snapshot",
+            })
+            .status_code(),
+            501
+        );
+    }
+
+    #[test]
+    fn state_machine_violations_remain_unprocessable() {
+        assert_eq!(
+            BlazeDaemonError::Core(blaze_core::BlazeError::InvalidStateTransition {
+                from: "checkpointed".into(),
+                to: "paused".into(),
+            })
+            .status_code(),
+            422
+        );
     }
 }
