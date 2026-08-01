@@ -15,7 +15,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use blaze_core::backend::{BackendKind, SnapshotArtifacts, SnapshotRequest, SpawnRequest};
+use blaze_core::backend::{
+    BackendKind, RestoreRequest, SnapshotArtifacts, SnapshotRequest, SpawnRequest,
+};
 use blaze_core::{BlazeError, Result};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -192,6 +194,23 @@ pub trait BackendSpawner: Send + Sync {
     /// Clean up a backend process and resources whose in-memory handle was
     /// lost across daemon restart.
     async fn cleanup_orphan(&self, instance_id: Uuid, run_dir: &Path) -> Result<()>;
+
+    /// Re-establish a sandbox from a payload written by
+    /// [`BackendInstance::snapshot`], taking ownership of the new process.
+    ///
+    /// # Errors
+    /// Returns [`BlazeError::UnsupportedOperation`] unless the backend
+    /// overrides this. A failure that leaves a process behind must transfer
+    /// it via [`SpawnFailure::with_owner`] so the daemon can retry cleanup.
+    async fn restore(
+        &self,
+        request: RestoreRequest,
+    ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
+        Err(SpawnFailure::clean(BlazeError::UnsupportedOperation {
+            backend: request.kind.to_string(),
+            operation: "restore",
+        }))
+    }
 }
 
 /// Shared backend spawner selected during daemon startup.
@@ -377,6 +396,40 @@ impl BackendSpawner for MockSpawner {
     async fn cleanup_orphan(&self, _instance_id: Uuid, _run_dir: &Path) -> Result<()> {
         // Mock owners are in-process tasks and cannot survive daemon exit.
         Ok(())
+    }
+
+    async fn restore(
+        &self,
+        request: RestoreRequest,
+    ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
+        let marker = request.snapshot_dir.join(MOCK_SNAPSHOT_IMAGE);
+        let raw = tokio::fs::read(&marker).await.map_err(|source| {
+            SpawnFailure::clean(BlazeError::BackendError {
+                msg: format!(
+                    "mock snapshot payload {} unreadable: {source}",
+                    marker.display()
+                ),
+            })
+        })?;
+        let payload: MockSnapshotPayload = serde_json::from_slice(&raw).map_err(|source| {
+            SpawnFailure::clean(BlazeError::BackendError {
+                msg: format!(
+                    "mock snapshot payload {} is corrupt: {source}",
+                    marker.display()
+                ),
+            })
+        })?;
+        if payload.backend != BackendKind::Mock {
+            return Err(SpawnFailure::clean(BlazeError::BackendError {
+                msg: format!(
+                    "mock cannot restore a payload written by {}",
+                    payload.backend
+                ),
+            }));
+        }
+        spawn_mock_instance(request.instance_id, request.run_dir)
+            .await
+            .map_err(SpawnFailure::from)
     }
 }
 

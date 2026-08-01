@@ -13,6 +13,8 @@ pub struct Metrics {
     pub instances_resets: AtomicU64,
     pub instances_paused: AtomicU64,
     pub instances_resumed: AtomicU64,
+    pub instances_restored: AtomicU64,
+    pub instances_hatched: AtomicU64,
     pub snapshots_created: AtomicU64,
     pub snapshots_failed: AtomicU64,
     pub snapshots_deleted: AtomicU64,
@@ -63,6 +65,16 @@ impl Metrics {
                 "blaze_instances_resumed_total",
                 "Total sandbox instances resumed",
                 self.instances_resumed.load(Ordering::Relaxed),
+            ),
+            (
+                "blaze_instances_restored_total",
+                "Total checkpointed instances restored in place",
+                self.instances_restored.load(Ordering::Relaxed),
+            ),
+            (
+                "blaze_instances_hatched_total",
+                "Total instances hatched from a snapshot",
+                self.instances_hatched.load(Ordering::Relaxed),
             ),
             (
                 "blaze_snapshots_created_total",

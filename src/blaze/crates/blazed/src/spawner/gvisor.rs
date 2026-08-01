@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use blaze_core::backend::{
-    BackendKind, SnapshotArtifacts, SnapshotCompression, SnapshotRequest, SpawnRequest,
+    BackendKind, RestoreRequest, SnapshotArtifacts, SnapshotCompression, SnapshotRequest,
+    SpawnRequest,
 };
 use blaze_core::{BlazeError, Result};
 use tokio::process::{Child, Command};
@@ -450,6 +451,83 @@ impl BackendSpawner for GvisorSpawner {
         record_backend_stopped(&marker).await?;
         remove_file_if_exists(&pid_file).await?;
         Ok(())
+    }
+
+    async fn restore(
+        &self,
+        request: RestoreRequest,
+    ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
+        let image_dir = request.snapshot_dir.join(SNAPSHOT_IMAGE_DIR);
+        let stored_spec = request
+            .snapshot_dir
+            .join(SNAPSHOT_BUNDLE_DIR)
+            .join(BUNDLE_SPEC_FILE);
+        if !image_dir.is_dir() || !stored_spec.is_file() {
+            return Err(SpawnFailure::clean(BlazeError::BackendError {
+                msg: format!(
+                    "snapshot payload at {} is incomplete",
+                    request.snapshot_dir.display()
+                ),
+            }));
+        }
+
+        // Copy the spec instead of pointing --bundle at the snapshot: the
+        // restored instance then owns its bundle, can be snapshotted again,
+        // and cannot corrupt a payload other instances may still restore from.
+        let bundle_dir = request.run_dir.join("bundle");
+        tokio::fs::create_dir_all(&bundle_dir).await?;
+        tokio::fs::copy(&stored_spec, bundle_dir.join(BUNDLE_SPEC_FILE)).await?;
+        let stopped_marker = stopped_marker(&request.run_dir);
+        remove_file_if_exists(&stopped_marker).await?;
+
+        let container_id = format!("blaze-{}", request.instance_id);
+        // Clear any stale record so in-place restore and hatching take the
+        // same path, and so a retry after a crash is safe.
+        if let Err(error) =
+            runsc_delete_force(&request.binary_path, &self.root_dir, &container_id).await
+        {
+            tracing::debug!(%error, container_id, "pre-restore delete found no container");
+        }
+
+        let child = spawn_restore(
+            &request.binary_path,
+            &self.root_dir,
+            &bundle_dir,
+            &image_dir,
+            &container_id,
+            request.instance_id,
+        )
+        .await
+        .map_err(SpawnFailure::clean)?;
+
+        let pid_file = request.run_dir.join("backend.pid");
+        let paths = GvisorPaths {
+            binary_path: request.binary_path,
+            root_dir: self.root_dir.clone(),
+            bundle_dir,
+            pid_file: pid_file.clone(),
+            stopped_marker,
+        };
+        // Record our own child's pid: orphan reclamation authenticates it via
+        // BLAZE_INSTANCE_ID in the process environment, which only holds for a
+        // process we launched.
+        if let Some(pid) = child.id()
+            && let Err(error) = tokio::fs::write(&pid_file, format!("{pid}\n")).await
+        {
+            let owner: DynBackendInstance = Arc::new(GvisorInstance::new(
+                request.instance_id,
+                container_id,
+                paths,
+                child,
+            ));
+            return Err(SpawnFailure::compensate_started(error.into(), owner).await);
+        }
+        Ok(Arc::new(GvisorInstance::new(
+            request.instance_id,
+            container_id,
+            paths,
+            child,
+        )))
     }
 }
 
