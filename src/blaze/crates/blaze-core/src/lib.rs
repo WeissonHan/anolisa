@@ -12,6 +12,7 @@
 //! - [`lifecycle`]: sandbox state machine + JSON persistence
 //! - [`pool`]: warm-pool key/stat/manager
 //! - [`template`]: template registry + refcnt + GC
+//! - [`snapshot`]: durable checkpoint payload store
 //! - [`kernel`]: kernel hook registry, per-hook mutex
 //! - [`error`]: unified [`BlazeError`] error enum
 
@@ -22,6 +23,7 @@ pub mod kernel;
 pub mod lifecycle;
 pub mod policy;
 pub mod pool;
+pub mod snapshot;
 pub mod storage;
 pub mod template;
 
