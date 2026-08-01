@@ -47,13 +47,15 @@ impl std::fmt::Display for SandboxState {
     }
 }
 
-/// Whether a request entered `creating` from cold boot or via a warm
-/// pool reuse — used as the primary latency / capacity SLO dimension.
+/// Whether a request entered `creating` from cold boot, a warm pool
+/// reuse, or a checkpoint restore — used as the primary latency /
+/// capacity SLO dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StartPath {
     Cold,
     Warm,
+    Restored,
 }
 
 /// Durable knowledge about whether a backend may still own a live process.
@@ -85,12 +87,19 @@ pub struct SandboxInstance {
     /// Last durably known backend ownership state.
     #[serde(default)]
     pub backend_ownership: BackendOwnership,
+    /// Snapshot this instance was last restored or hatched from.
+    #[serde(default)]
+    pub restored_from: Option<Uuid>,
+    /// Most recent snapshot taken of this instance. While `checkpointed`
+    /// this is the image a restore defaults to.
+    #[serde(default)]
+    pub last_snapshot: Option<Uuid>,
 }
 
 impl SandboxInstance {
     /// Create a new instance in [`SandboxState::Pending`] with `start_path`
     /// pre-classified by the caller (cold for fresh boots, warm for
-    /// pool reuses).
+    /// pool reuses, restored when hatching from a snapshot).
     pub fn new(
         backend: BackendKind,
         workload_class: WorkloadClass,
@@ -110,6 +119,8 @@ impl SandboxInstance {
             updated_at: now,
             policy_name,
             backend_ownership: BackendOwnership::NotStarted,
+            restored_from: None,
+            last_snapshot: None,
         }
     }
 
@@ -127,12 +138,19 @@ impl SandboxInstance {
         self.state = target;
         self.updated_at = Utc::now();
         // entering `creating` re-classifies the start path: warm-pool
-        // reuse goes warm → creating, fresh boots go pending → creating.
+        // reuse goes warm → creating, restores come from checkpointed or
+        // declare themselves at construction, fresh boots go
+        // pending → creating.
         if target == SandboxState::Creating {
-            self.start_path = if prev == SandboxState::Warm {
-                StartPath::Warm
-            } else {
-                StartPath::Cold
+            self.start_path = match prev {
+                SandboxState::Warm => StartPath::Warm,
+                SandboxState::Checkpointed => StartPath::Restored,
+                // A hatch-from-snapshot request declares `Restored` before
+                // its first transition; do not downgrade it here.
+                SandboxState::Pending if self.start_path == StartPath::Restored => {
+                    StartPath::Restored
+                }
+                _ => StartPath::Cold,
             };
         }
         tracing::info!(
@@ -144,6 +162,12 @@ impl SandboxInstance {
             "sandbox state transition"
         );
         Ok(())
+    }
+
+    /// Refresh `updated_at` after a metadata-only change, such as recording
+    /// a live snapshot, that does not move the state machine.
+    pub fn touch(&mut self) {
+        self.updated_at = Utc::now();
     }
 
     /// Persist this instance to `{state_dir}/{id}/state.json`. Atomic
@@ -180,7 +204,8 @@ fn is_valid_transition(from: SandboxState, to: SandboxState) -> bool {
         (Running, Paused) => true,
         (Running, Reset) => true,
         (Paused, Checkpointed) => true,
-        (Paused, Running) => true, // resume
+        (Paused, Running) => true,        // resume
+        (Checkpointed, Creating) => true, // restore in place
         (Reset, Warm) => true,
         (Warm, Creating) => true, // pool reuse / warm path
         _ => false,
@@ -277,5 +302,94 @@ mod tests {
         assert_eq!(loaded.id, inst.id);
         assert_eq!(loaded.state, SandboxState::Creating);
         assert_eq!(loaded.policy_name, inst.policy_name);
+    }
+
+    #[test]
+    fn checkpointed_restores_into_creating_with_restored_path() {
+        let mut inst = fresh();
+        for target in [
+            SandboxState::Creating,
+            SandboxState::Running,
+            SandboxState::Paused,
+            SandboxState::Checkpointed,
+        ] {
+            inst.transition(target).expect("legal transition");
+        }
+
+        inst.transition(SandboxState::Creating).expect("restore");
+        assert_eq!(inst.start_path, StartPath::Restored);
+        inst.transition(SandboxState::Running).expect("restored");
+        assert_eq!(inst.state, SandboxState::Running);
+    }
+
+    #[test]
+    fn pending_to_creating_preserves_declared_restored_path() {
+        let mut inst = SandboxInstance::new(
+            BackendKind::Gvisor,
+            WorkloadClass::AgentTool,
+            "sha256:deadbeef".into(),
+            StartPath::Restored,
+            "agent-tool-default".into(),
+        );
+        inst.transition(SandboxState::Creating).expect("hatch");
+        assert_eq!(inst.start_path, StartPath::Restored);
+    }
+
+    #[test]
+    fn checkpointed_remains_a_dead_end_apart_from_restore_and_destroy() {
+        for target in [
+            SandboxState::Running,
+            SandboxState::Paused,
+            SandboxState::Warm,
+            SandboxState::Reset,
+        ] {
+            let mut inst = fresh();
+            for hop in [
+                SandboxState::Creating,
+                SandboxState::Running,
+                SandboxState::Paused,
+                SandboxState::Checkpointed,
+            ] {
+                inst.transition(hop).expect("legal transition");
+            }
+            let err = inst.transition(target).expect_err("illegal");
+            assert!(matches!(err, BlazeError::InvalidStateTransition { .. }));
+        }
+    }
+
+    #[test]
+    fn snapshot_linkage_survives_persist_round_trip() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut inst = fresh();
+        let snapshot = Uuid::new_v4();
+        inst.last_snapshot = Some(snapshot);
+        inst.restored_from = Some(snapshot);
+        inst.persist(tmp.path()).expect("persist");
+
+        let loaded = SandboxInstance::load(tmp.path(), inst.id).expect("load");
+        assert_eq!(loaded.last_snapshot, Some(snapshot));
+        assert_eq!(loaded.restored_from, Some(snapshot));
+    }
+
+    #[test]
+    fn legacy_state_json_without_snapshot_fields_loads() {
+        let raw = r#"{
+            "id": "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+            "state": "running",
+            "backend": "gvisor",
+            "workload_class": "agent-tool",
+            "image_digest": "sha256:deadbeef",
+            "start_path": "cold",
+            "created_at": "2026-07-31T09:31:10.280195680Z",
+            "updated_at": "2026-07-31T09:31:10.282515945Z",
+            "policy_name": "agent-tool-default"
+        }"#;
+
+        let loaded: SandboxInstance = serde_json::from_str(raw).expect("legacy state loads");
+        assert_eq!(loaded.state, SandboxState::Running);
+        assert_eq!(loaded.start_path, StartPath::Cold);
+        assert_eq!(loaded.backend_ownership, BackendOwnership::Unknown);
+        assert_eq!(loaded.last_snapshot, None);
+        assert_eq!(loaded.restored_from, None);
     }
 }
