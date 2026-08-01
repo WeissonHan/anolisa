@@ -9,6 +9,38 @@
 
 ## [未发布]
 
+### 新增
+
+- 暂停与恢复运行中的 sandbox：`POST /v1/instances/{id}/pause` 与 `/resume`。
+- 将 sandbox 快照写入持久化快照库：`POST /v1/instances/{id}/snapshot` 默认保持 sandbox
+  继续运行，传 `{"leave_running": false}` 则休眠。
+- 用 `POST /v1/instances/{id}/restore` 原地恢复已休眠的 sandbox；用
+  `POST /v1/snapshots/{id}/restore` 从任意快照孵化全新实例。快照的生命周期长于产生它的
+  实例，因此同一镜像可反复恢复，源实例销毁后依然可用。
+- 通过 `GET /v1/snapshots`、`GET /v1/snapshots/{id}` 与 `DELETE /v1/snapshots/{id}`
+  查看和回收快照。若某镜像是休眠 sandbox 唯一的恢复途径，删除会被拒绝而不会将其搁死。
+- gVisor 后端实现上述四个操作；策略中的 `[checkpoint].enabled = false` 现在会真正拒绝快照。
+- 新增计数器：`blaze_instances_paused_total`、`blaze_instances_resumed_total`、
+  `blaze_instances_restored_total`、`blaze_instances_hatched_total`、
+  `blaze_snapshots_created_total`、`blaze_snapshots_failed_total`、
+  `blaze_snapshots_deleted_total`。
+
+### 变更
+
+- **不兼容变更** `POST /v1/instances/{id}/checkpoint` 不再只是移动状态机，而会真正执行
+  快照。它仍然会休眠实例，但现在可能失败（后端不支持快照返回 501、守护进程不持有后端
+  所有者返回 409、保存失败返回 500），且 `checkpoint_id` 由 `ckpt-<uuid>-<ts>` 变为可在
+  `/v1/snapshots` 中查询的快照 uuid。
+- `start_path` 新增第三种取值 `restored`，用于从快照启动的实例。恢复后写入的实例状态
+  无法被 0.3.x 读取。
+
+### 修复
+
+- gVisor sandbox 现在通过 `state_dir` 下显式的 runsc 状态根目录寻址，因此守护进程即使在
+  不同环境下重启，仍能管理和回收自己启动的 sandbox。
+- 创建 gVisor 实例时不再在 sandbox 就绪前就报告为 running，此前会导致紧随其后的操作出现
+  假失败。
+
 ## [0.3.0] - 2026-07-22
 
 ### 新增
@@ -17,7 +49,6 @@
 - `FileStorageProvider`：默认文件存储后端，适用于开发和标准部署。
 - `[storage]` 配置段：`provider`、`pool_size`、`prefork`、`flush_interval` 字段，均有向后兼容的默认值。
 - `GET /v1/health` 现返回 `storage_pool` 状态（ready/capacity/pending）。
-- `BackendSpawner` trait 扩展 `restore`、`pause`、`resume`、`create_snapshot` 方法（默认返回不支持，为后续快照工作流预留接口）。
 
 ## [0.2.1] - 2026-07-21
 

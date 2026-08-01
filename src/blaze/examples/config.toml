@@ -46,8 +46,10 @@ http_addr = ""
 #   kata-qemu, runc, bubblewrap.
 firecracker = "/usr/bin/firecracker"
 bubblewrap = "/usr/bin/bwrap"
+# gVisor supports the full lifecycle (pause, resume, snapshot, restore).
+# Its runsc state root is created under [daemon].state_dir.
+gvisor = "/usr/local/bin/runsc"
 # Phase 2+ backends (uncomment when spawner implementations land):
-# gvisor = "/usr/bin/runsc"
 # rund = "/usr/bin/rund"
 # kata-fc = "/usr/bin/containerd-shim-kata-v2"
 # kata-clh = "/usr/bin/containerd-shim-kata-v2"

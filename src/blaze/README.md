@@ -103,9 +103,17 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 | GET | `/v1/instances` | List all instances |
 | POST | `/v1/instances` | Create a new sandbox instance |
 | GET | `/v1/instances/{id}` | Get instance details |
-| POST | `/v1/instances/{id}/checkpoint` | Checkpoint an instance |
-| POST | `/v1/instances/{id}/reset` | Reset instance to checkpoint |
+| POST | `/v1/instances/{id}/pause` | Freeze a running instance |
+| POST | `/v1/instances/{id}/resume` | Resume a paused instance |
+| POST | `/v1/instances/{id}/snapshot` | Snapshot an instance (keeps running by default) |
+| POST | `/v1/instances/{id}/checkpoint` | Snapshot and hibernate an instance |
+| POST | `/v1/instances/{id}/restore` | Restore a checkpointed instance in place |
+| POST | `/v1/instances/{id}/reset` | Return instance to the warm pool |
 | POST | `/v1/instances/{id}/destroy` | Destroy an instance |
+| GET | `/v1/snapshots` | List snapshots |
+| GET | `/v1/snapshots/{id}` | Get snapshot details |
+| DELETE | `/v1/snapshots/{id}` | Delete a snapshot |
+| POST | `/v1/snapshots/{id}/restore` | Hatch a new instance from a snapshot |
 | GET | `/v1/pools` | List warm pools |
 | GET | `/v1/pools/{backend}/{class}` | Get pool status |
 | POST | `/v1/pools/{backend}/{class}/drain` | Drain a pool |

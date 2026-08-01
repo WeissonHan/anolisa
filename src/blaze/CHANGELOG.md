@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Pause and resume a running sandbox: `POST /v1/instances/{id}/pause` and `/resume`.
+- Snapshot a sandbox into a durable store: `POST /v1/instances/{id}/snapshot` keeps
+  the sandbox running by default, or hibernates it with `{"leave_running": false}`.
+- Restore a hibernated sandbox in place with `POST /v1/instances/{id}/restore`, and
+  hatch a brand-new instance from any snapshot with `POST /v1/snapshots/{id}/restore`.
+  Snapshots outlive the instance that produced them, so one image can be restored
+  repeatedly and still used after the source is destroyed.
+- Browse and reclaim snapshots via `GET /v1/snapshots`, `GET /v1/snapshots/{id}` and
+  `DELETE /v1/snapshots/{id}`. Deleting an image a hibernated sandbox still needs is
+  refused instead of stranding it.
+- gVisor backend implements all four operations; `[checkpoint].enabled = false` in a
+  policy now actually refuses snapshots.
+- New counters: `blaze_instances_paused_total`, `blaze_instances_resumed_total`,
+  `blaze_instances_restored_total`, `blaze_instances_hatched_total`,
+  `blaze_snapshots_created_total`, `blaze_snapshots_failed_total`,
+  `blaze_snapshots_deleted_total`.
+
+### Changed
+
+- **BREAKING** `POST /v1/instances/{id}/checkpoint` now performs real work instead of
+  only moving the state machine. It still hibernates the instance, but can now fail
+  (501 when the backend cannot snapshot, 409 when the daemon holds no backend owner,
+  500 when the save fails), and its `checkpoint_id` changes from `ckpt-<uuid>-<ts>` to
+  a snapshot uuid resolvable through `/v1/snapshots`.
+- `start_path` gains a third value, `restored`, for instances brought up from a
+  snapshot. Instance state written after a restore cannot be read by 0.3.x.
+
+### Fixed
+
+- gVisor sandboxes are now addressed through an explicit runsc state root under
+  `state_dir`, so a daemon restarted with a different environment can still manage
+  and reclaim the sandboxes it started.
+- Creating a gVisor instance no longer reports it as running before the sandbox is
+  ready, which made an immediately following operation fail spuriously.
+
 ## [0.3.0] - 2026-07-22
 
 ### Added
@@ -17,7 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FileStorageProvider`: default file-based storage backend for development and standard deployments.
 - `[storage]` config section: `provider`, `pool_size`, `prefork`, `flush_interval` fields with backward-compatible defaults.
 - `GET /v1/health` now includes `storage_pool` status (ready/capacity/pending).
-- `BackendSpawner` trait extended with `restore`, `pause`, `resume`, `create_snapshot` methods (default unsupported, enabling future snapshot workflows).
 
 ## [0.2.1] - 2026-07-21
 

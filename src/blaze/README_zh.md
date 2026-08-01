@@ -102,9 +102,17 @@ images_dir = "/var/lib/blaze/images"
 | GET | `/v1/instances` | 列出所有实例 |
 | POST | `/v1/instances` | 创建新 sandbox 实例 |
 | GET | `/v1/instances/{id}` | 获取实例详情 |
-| POST | `/v1/instances/{id}/checkpoint` | 对实例做 checkpoint |
-| POST | `/v1/instances/{id}/reset` | 将实例重置到 checkpoint |
+| POST | `/v1/instances/{id}/pause` | 冻结运行中的实例 |
+| POST | `/v1/instances/{id}/resume` | 恢复已暂停的实例 |
+| POST | `/v1/instances/{id}/snapshot` | 对实例做快照（默认保持运行） |
+| POST | `/v1/instances/{id}/checkpoint` | 对实例做快照并休眠 |
+| POST | `/v1/instances/{id}/restore` | 原地恢复已 checkpoint 的实例 |
+| POST | `/v1/instances/{id}/reset` | 将实例归还 warm pool |
 | POST | `/v1/instances/{id}/destroy` | 销毁实例 |
+| GET | `/v1/snapshots` | 列出快照 |
+| GET | `/v1/snapshots/{id}` | 获取快照详情 |
+| DELETE | `/v1/snapshots/{id}` | 删除快照 |
+| POST | `/v1/snapshots/{id}/restore` | 从快照孵化新实例 |
 | GET | `/v1/pools` | 列出 warm pool |
 | GET | `/v1/pools/{backend}/{class}` | 获取 pool 状态 |
 | POST | `/v1/pools/{backend}/{class}/drain` | 排空 pool |
