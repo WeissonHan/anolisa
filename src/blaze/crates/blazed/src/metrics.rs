@@ -13,6 +13,9 @@ pub struct Metrics {
     pub instances_resets: AtomicU64,
     pub instances_paused: AtomicU64,
     pub instances_resumed: AtomicU64,
+    pub snapshots_created: AtomicU64,
+    pub snapshots_failed: AtomicU64,
+    pub snapshots_deleted: AtomicU64,
     pub pool_hits: AtomicU64,
     pub pool_misses: AtomicU64,
     pub policy_eval_failures: AtomicU64,
@@ -60,6 +63,21 @@ impl Metrics {
                 "blaze_instances_resumed_total",
                 "Total sandbox instances resumed",
                 self.instances_resumed.load(Ordering::Relaxed),
+            ),
+            (
+                "blaze_snapshots_created_total",
+                "Total checkpoint payloads written",
+                self.snapshots_created.load(Ordering::Relaxed),
+            ),
+            (
+                "blaze_snapshots_failed_total",
+                "Total checkpoint attempts that failed",
+                self.snapshots_failed.load(Ordering::Relaxed),
+            ),
+            (
+                "blaze_snapshots_deleted_total",
+                "Total checkpoint payloads deleted",
+                self.snapshots_deleted.load(Ordering::Relaxed),
             ),
             (
                 "blaze_pool_hits_total",

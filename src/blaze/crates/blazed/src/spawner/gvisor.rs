@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use blaze_core::backend::{BackendKind, SpawnRequest};
+use blaze_core::backend::{
+    BackendKind, SnapshotArtifacts, SnapshotCompression, SnapshotRequest, SpawnRequest,
+};
 use blaze_core::{BlazeError, Result};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -110,6 +112,152 @@ fn pause_argv(root_dir: &Path, container_id: &str) -> Vec<OsString> {
 /// Argv for thawing a paused sandbox.
 fn resume_argv(root_dir: &Path, container_id: &str) -> Vec<OsString> {
     state_argv(root_dir, "resume", &[OsStr::new(container_id)])
+}
+
+/// Argv for writing a checkpoint payload.
+fn checkpoint_argv(
+    root_dir: &Path,
+    image_dir: &Path,
+    leave_running: bool,
+    compression: SnapshotCompression,
+    container_id: &str,
+) -> Vec<OsString> {
+    let mut root = OsString::from("--root=");
+    root.push(root_dir);
+    let mut image = OsString::from("--image-path=");
+    image.push(image_dir);
+    let mut argv = vec![root, OsString::from("checkpoint"), image];
+    if leave_running {
+        argv.push(OsString::from("--leave-running"));
+    }
+    argv.push(OsString::from(match compression {
+        SnapshotCompression::None => "--compression=none",
+        SnapshotCompression::FlateBestSpeed => "--compression=flate-best-speed",
+    }));
+    argv.push(OsString::from(container_id));
+    argv
+}
+
+/// Layout inside a snapshot payload. The daemon only supplies the payload
+/// root; these names are private to the gVisor backend.
+const SNAPSHOT_IMAGE_DIR: &str = "image";
+const SNAPSHOT_BUNDLE_DIR: &str = "bundle";
+const BUNDLE_SPEC_FILE: &str = "config.json";
+/// Checkpointing a large sandbox writes its whole memory image, so this is
+/// far more generous than the short state operations.
+const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a restored sandbox may take to report itself running.
+const RESTORE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const RESTORE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Bytes stored under `dir`, used for snapshot accounting.
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => dir_size(&entry.path()),
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// Argv for re-establishing a sandbox from a checkpoint payload.
+///
+/// The top-level flag set must match [`run_argv`]: those flags configure the
+/// sandbox itself, and a mismatch between save and restore is a classic
+/// restore failure.
+fn restore_argv(
+    root_dir: &Path,
+    bundle: &Path,
+    image_dir: &Path,
+    container_id: &str,
+) -> Vec<OsString> {
+    let mut argv = base_argv(root_dir);
+    argv.push(OsString::from("restore"));
+    argv.push(OsString::from("--bundle"));
+    argv.push(bundle.as_os_str().to_owned());
+    let mut image = OsString::from("--image-path=");
+    image.push(image_dir);
+    argv.push(image);
+    argv.push(OsString::from(container_id));
+    argv
+}
+
+/// Launch a foreground `runsc restore` and wait until the sandbox is live.
+///
+/// Foreground rather than `--detach`: detaching would leave no child to own,
+/// force trusting a pid runsc created (which defeats the
+/// `BLAZE_INSTANCE_ID` authentication used to reclaim orphans), and lose the
+/// crash detection `try_wait` provides. Because it blocks for the sandbox's
+/// lifetime, readiness is polled instead of awaited.
+async fn spawn_restore(
+    binary_path: &Path,
+    root_dir: &Path,
+    bundle_dir: &Path,
+    image_dir: &Path,
+    container_id: &str,
+    instance_id: Uuid,
+) -> Result<Child> {
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(bundle_dir.with_file_name("runsc.log"))
+        .map_err(BlazeError::from)?;
+    let mut child = Command::new(binary_path)
+        .args(restore_argv(root_dir, bundle_dir, image_dir, container_id))
+        .env("BLAZE_INSTANCE_ID", instance_id.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log_file))
+        .spawn()?;
+
+    let deadline = tokio::time::Instant::now() + RESTORE_READY_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "runsc restore for {container_id} exited early with {status}; see runsc.log"
+                ),
+            });
+        }
+        if container_status(binary_path, root_dir, container_id).await
+            == Some("running".to_string())
+        {
+            return Ok(child);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = terminate_child(&mut child, BackendKind::Gvisor.as_str()).await;
+            return Err(BlazeError::BackendError {
+                msg: format!("runsc restore for {container_id} did not become ready"),
+            });
+        }
+        tokio::time::sleep(RESTORE_POLL_INTERVAL).await;
+    }
+}
+
+/// Container status reported by `runsc state`, or `None` when unavailable.
+async fn container_status(
+    binary_path: &Path,
+    root_dir: &Path,
+    container_id: &str,
+) -> Option<String> {
+    let stdout = runsc_state_command(
+        binary_path,
+        state_argv(root_dir, "state", &[OsStr::new(container_id)]),
+        "state",
+        LIFECYCLE_TIMEOUT,
+    )
+    .await
+    .ok()?;
+    serde_json::from_slice::<serde_json::Value>(&stdout)
+        .ok()?
+        .get("status")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Run a runsc subcommand that only addresses existing container state.
@@ -235,28 +383,29 @@ impl BackendSpawner for GvisorSpawner {
             .stdout(Stdio::null())
             .stderr(Stdio::from(log_file))
             .spawn()?;
+        let paths = GvisorPaths {
+            binary_path: request.binary_path,
+            root_dir: self.root_dir.clone(),
+            bundle_dir: bundle,
+            pid_file: pid_file.clone(),
+            stopped_marker,
+        };
         if let Some(pid) = child.id()
             && let Err(error) = tokio::fs::write(&pid_file, format!("{pid}\n")).await
         {
             let owner: DynBackendInstance = Arc::new(GvisorInstance::new(
                 request.instance_id,
                 container_id,
-                request.binary_path.clone(),
-                self.root_dir.clone(),
+                paths,
                 child,
-                pid_file,
-                stopped_marker,
             ));
             return Err(SpawnFailure::compensate_started(error.into(), owner).await);
         }
         Ok(Arc::new(GvisorInstance::new(
             request.instance_id,
             container_id,
-            request.binary_path,
-            self.root_dir.clone(),
+            paths,
             child,
-            pid_file,
-            stopped_marker,
         )))
     }
 
@@ -304,36 +453,37 @@ impl BackendSpawner for GvisorSpawner {
     }
 }
 
+/// Filesystem and runsc locations one sandbox owner needs.
+struct GvisorPaths {
+    binary_path: PathBuf,
+    root_dir: PathBuf,
+    /// Instance-owned OCI bundle. Snapshots copy its spec so a restore can
+    /// satisfy runsc's spec validation.
+    bundle_dir: PathBuf,
+    pid_file: PathBuf,
+    stopped_marker: PathBuf,
+}
+
 struct GvisorInstance {
     instance_id: Uuid,
     container_id: String,
-    binary_path: PathBuf,
-    root_dir: PathBuf,
+    paths: GvisorPaths,
     child: Mutex<Option<Child>>,
-    pid_file: PathBuf,
-    stopped_marker: PathBuf,
     killed: AtomicBool,
+    /// Set when a hibernating checkpoint intentionally stopped the sandbox,
+    /// so an observed exit is not reported as a sandbox crash.
+    expected_exit: AtomicBool,
 }
 
 impl GvisorInstance {
-    fn new(
-        instance_id: Uuid,
-        container_id: String,
-        binary_path: PathBuf,
-        root_dir: PathBuf,
-        child: Child,
-        pid_file: PathBuf,
-        stopped_marker: PathBuf,
-    ) -> Self {
+    fn new(instance_id: Uuid, container_id: String, paths: GvisorPaths, child: Child) -> Self {
         Self {
             instance_id,
             container_id,
-            binary_path,
-            root_dir,
+            paths,
             child: Mutex::new(Some(child)),
-            pid_file,
-            stopped_marker,
             killed: AtomicBool::new(false),
+            expected_exit: AtomicBool::new(false),
         }
     }
 
@@ -351,6 +501,93 @@ impl GvisorInstance {
         }
         Ok(())
     }
+
+    /// Whether runsc still reports this container as running.
+    async fn container_is_running(&self) -> bool {
+        container_status(
+            &self.paths.binary_path,
+            &self.paths.root_dir,
+            &self.container_id,
+        )
+        .await
+            == Some("running".to_string())
+    }
+
+    /// Reap the foreground child that a hibernating checkpoint stopped and
+    /// record the termination durably.
+    ///
+    /// A non-zero exit means the save may be partial, so it is reported as an
+    /// error and the caller discards the payload.
+    async fn finish_hibernation(&self, guard: &mut Option<Child>) -> Result<()> {
+        self.expected_exit.store(true, Ordering::Release);
+        if let Some(child) = guard.as_mut() {
+            let status = tokio::time::timeout(LIFECYCLE_TIMEOUT, child.wait())
+                .await
+                .map_err(|_| BlazeError::BackendError {
+                    msg: format!(
+                        "runsc run for {} did not exit after checkpoint",
+                        self.container_id
+                    ),
+                })??;
+            if !status.success() {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "runsc run for {} exited with {status} during checkpoint; the payload may be partial",
+                        self.container_id
+                    ),
+                });
+            }
+        }
+        *guard = None;
+        record_backend_stopped(&self.paths.stopped_marker).await?;
+        remove_file_if_exists(&self.paths.pid_file).await?;
+        // Everything `kill` would release has been released, so a later
+        // destroy is a cheap no-op.
+        self.killed.store(true, Ordering::Release);
+        // Drop the stale container record so the same id can be restored.
+        if let Err(error) = runsc_delete_force(
+            &self.paths.binary_path,
+            &self.paths.root_dir,
+            &self.container_id,
+        )
+        .await
+        {
+            tracing::debug!(%error, container_id = %self.container_id, "post-checkpoint delete failed");
+        }
+        Ok(())
+    }
+
+    /// Re-establish ownership from a payload this owner just wrote, keeping
+    /// the same owner object so the daemon's backend map stays valid.
+    async fn reattach_from(&self, guard: &mut Option<Child>, image_dir: &Path) -> Result<()> {
+        if let Some(child) = guard.as_mut() {
+            let _ = tokio::time::timeout(LIFECYCLE_TIMEOUT, child.wait()).await;
+        }
+        *guard = None;
+        if let Err(error) = runsc_delete_force(
+            &self.paths.binary_path,
+            &self.paths.root_dir,
+            &self.container_id,
+        )
+        .await
+        {
+            tracing::debug!(%error, container_id = %self.container_id, "pre-reattach delete failed");
+        }
+        let child = spawn_restore(
+            &self.paths.binary_path,
+            &self.paths.root_dir,
+            &self.paths.bundle_dir,
+            image_dir,
+            &self.container_id,
+            self.instance_id,
+        )
+        .await?;
+        if let Some(pid) = child.id() {
+            tokio::fs::write(&self.paths.pid_file, format!("{pid}\n")).await?;
+        }
+        *guard = Some(child);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -364,14 +601,16 @@ impl BackendInstance for GvisorInstance {
         let Some(child) = guard.as_mut() else {
             return Ok(Some(SpawnResult {
                 instance_id: self.instance_id,
-                exit_code: None,
+                // A hibernating checkpoint stops the sandbox on purpose;
+                // report that as a clean exit, not an unknown one.
+                exit_code: self.expected_exit.load(Ordering::Acquire).then_some(0),
                 signal: None,
             }));
         };
         let Some(status) = child.try_wait()? else {
             return Ok(None);
         };
-        record_backend_stopped(&self.stopped_marker).await?;
+        record_backend_stopped(&self.paths.stopped_marker).await?;
         *guard = None;
         Ok(Some(spawn_result(self.instance_id, status)))
     }
@@ -386,17 +625,21 @@ impl BackendInstance for GvisorInstance {
         }
         // Tear down the sandbox first so the foreground `runsc run` child
         // exits on its own; fall back to signalling the child directly.
-        if let Err(error) =
-            runsc_delete_force(&self.binary_path, &self.root_dir, &self.container_id).await
+        if let Err(error) = runsc_delete_force(
+            &self.paths.binary_path,
+            &self.paths.root_dir,
+            &self.container_id,
+        )
+        .await
         {
             tracing::warn!(%error, container_id = %self.container_id, "runsc delete failed; terminating child");
         }
         if let Some(child) = guard.as_mut() {
             terminate_child(child, BackendKind::Gvisor.as_str()).await?;
         }
-        record_backend_stopped(&self.stopped_marker).await?;
+        record_backend_stopped(&self.paths.stopped_marker).await?;
         *guard = None;
-        remove_file_if_exists(&self.pid_file).await?;
+        remove_file_if_exists(&self.paths.pid_file).await?;
         self.killed.store(true, Ordering::Release);
         Ok(())
     }
@@ -404,8 +647,8 @@ impl BackendInstance for GvisorInstance {
     async fn pause(&self) -> Result<()> {
         self.ensure_live("pause")?;
         runsc_state_command(
-            &self.binary_path,
-            pause_argv(&self.root_dir, &self.container_id),
+            &self.paths.binary_path,
+            pause_argv(&self.paths.root_dir, &self.container_id),
             "pause",
             LIFECYCLE_TIMEOUT,
         )
@@ -416,13 +659,96 @@ impl BackendInstance for GvisorInstance {
     async fn resume(&self) -> Result<()> {
         self.ensure_live("resume")?;
         runsc_state_command(
-            &self.binary_path,
-            resume_argv(&self.root_dir, &self.container_id),
+            &self.paths.binary_path,
+            resume_argv(&self.paths.root_dir, &self.container_id),
             "resume",
             LIFECYCLE_TIMEOUT,
         )
         .await?;
         Ok(())
+    }
+
+    async fn snapshot(&self, request: &SnapshotRequest) -> Result<SnapshotArtifacts> {
+        self.ensure_live("snapshot")?;
+        // Held for the whole operation: `try_wait` and `kill` take the same
+        // mutex, so no observer can misread a deliberate checkpoint exit as
+        // a sandbox crash.
+        let mut guard = self.child.lock().await;
+
+        let image_dir = request.snapshot_dir.join(SNAPSHOT_IMAGE_DIR);
+        tokio::fs::create_dir_all(&image_dir).await?;
+        // Restore validates the supplied spec against the one embedded in the
+        // payload, so the spec must travel with the image byte-for-byte.
+        let bundle_dir = request.snapshot_dir.join(SNAPSHOT_BUNDLE_DIR);
+        tokio::fs::create_dir_all(&bundle_dir).await?;
+        tokio::fs::copy(
+            self.paths.bundle_dir.join(BUNDLE_SPEC_FILE),
+            bundle_dir.join(BUNDLE_SPEC_FILE),
+        )
+        .await?;
+
+        runsc_state_command(
+            &self.paths.binary_path,
+            checkpoint_argv(
+                &self.paths.root_dir,
+                &image_dir,
+                request.leave_running,
+                request.compression,
+                &self.container_id,
+            ),
+            "checkpoint",
+            CHECKPOINT_TIMEOUT,
+        )
+        .await?;
+
+        let size_bytes = dir_size(&request.snapshot_dir);
+        if !request.leave_running {
+            self.finish_hibernation(&mut guard).await?;
+            return Ok(SnapshotArtifacts {
+                backend: BackendKind::Gvisor,
+                size_bytes,
+                left_running: false,
+            });
+        }
+
+        // Verify rather than assume: `--leave-running` is documented only as
+        // "restart the container after checkpointing", and a build that tears
+        // the sandbox down would invalidate our owned child.
+        let child_alive = guard
+            .as_mut()
+            .map(|child| child.try_wait().map(|status| status.is_none()))
+            .transpose()?
+            .unwrap_or(false);
+        if child_alive && self.container_is_running().await {
+            return Ok(SnapshotArtifacts {
+                backend: BackendKind::Gvisor,
+                size_bytes,
+                left_running: true,
+            });
+        }
+
+        // The payload on disk is valid, so re-establish ownership from it and
+        // keep this owner's identity: the daemon's backend map stays correct.
+        match self.reattach_from(&mut guard, &image_dir).await {
+            Ok(()) => Ok(SnapshotArtifacts {
+                backend: BackendKind::Gvisor,
+                size_bytes,
+                left_running: true,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    container_id = %self.container_id,
+                    "live snapshot could not keep the sandbox running; reporting it as hibernated"
+                );
+                self.finish_hibernation(&mut guard).await?;
+                Ok(SnapshotArtifacts {
+                    backend: BackendKind::Gvisor,
+                    size_bytes,
+                    left_running: false,
+                })
+            }
+        }
     }
 }
 

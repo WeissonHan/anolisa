@@ -15,6 +15,7 @@ use blaze_core::kernel::HookRegistry;
 use blaze_core::lifecycle::SandboxInstance;
 use blaze_core::policy::PolicyEngine;
 use blaze_core::pool::PoolManager;
+use blaze_core::snapshot::SnapshotStore;
 use blaze_core::storage::StorageProvider;
 use blaze_core::template::TemplateRegistry;
 use tokio::sync::Mutex as AsyncMutex;
@@ -35,6 +36,9 @@ pub struct ServerState {
     pub instances: Mutex<HashMap<Uuid, SandboxInstance>>,
     pub backend_instances: Mutex<HashMap<Uuid, DynBackendInstance>>,
     operation_locks: Mutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>,
+    /// Durable checkpoint payloads. Entries outlive the instances that
+    /// produced them, so this is not derived from `instances`.
+    pub snapshots: Mutex<SnapshotStore>,
     pub spawners: SpawnerRegistry,
     /// The backend kind that `build_spawner` actually probed and selected.
     /// API handlers use this to constrain availability to the single active
@@ -70,6 +74,12 @@ impl ServerState {
             .copied()
             .map(|id| (id, Arc::new(AsyncMutex::new(()))))
             .collect();
+        // Best-effort like instance rehydration: an unreadable snapshot
+        // directory must not stop the daemon from booting.
+        let snapshots = SnapshotStore::open(&state_dir).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to open snapshot store, starting empty");
+            SnapshotStore::empty(&state_dir)
+        });
 
         Self {
             config: Mutex::new(config),
@@ -80,6 +90,7 @@ impl ServerState {
             instances: Mutex::new(instances),
             backend_instances: Mutex::new(HashMap::new()),
             operation_locks: Mutex::new(operation_locks),
+            snapshots: Mutex::new(snapshots),
             spawners,
             active_backend,
             storage,

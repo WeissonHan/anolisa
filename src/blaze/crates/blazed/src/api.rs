@@ -7,15 +7,19 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use blaze_core::BlazeError;
-use blaze_core::backend::{BackendKind, BackendStatus, SpawnRequest, select_backend};
+use blaze_core::backend::{
+    BackendKind, BackendStatus, SnapshotCompression, SnapshotRequest, SpawnRequest, select_backend,
+};
 use blaze_core::kernel::HookKind;
 use blaze_core::lifecycle::{BackendOwnership, SandboxInstance, SandboxState, StartPath};
 use blaze_core::policy::{ImageMetadata, RuntimeDecision, WorkloadClass, parse_duration};
 use blaze_core::pool::{PoolConfig, PoolKey};
+use blaze_core::snapshot::SnapshotMeta;
 use blaze_core::storage::AcquireOpts;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -79,9 +83,17 @@ async fn dispatch(
         ("GET", ["v1", "instances", id]) => get_instance(state, id),
         ("POST", ["v1", "instances", id, "pause"]) => pause_instance(state, id).await,
         ("POST", ["v1", "instances", id, "resume"]) => resume_instance(state, id).await,
-        ("POST", ["v1", "instances", id, "checkpoint"]) => checkpoint(state, id).await,
+        ("POST", ["v1", "instances", id, "snapshot"]) => {
+            snapshot_instance(state, id, &body, SnapshotRoute::Snapshot).await
+        }
+        ("POST", ["v1", "instances", id, "checkpoint"]) => {
+            snapshot_instance(state, id, &body, SnapshotRoute::CheckpointAlias).await
+        }
         ("POST", ["v1", "instances", id, "reset"]) => reset_instance(state, id).await,
         ("POST", ["v1", "instances", id, "destroy"]) => destroy_instance(state, id).await,
+        ("GET", ["v1", "snapshots"]) => list_snapshots(state),
+        ("GET", ["v1", "snapshots", sid]) => get_snapshot(state, sid),
+        ("DELETE", ["v1", "snapshots", sid]) => delete_snapshot(state, sid).await,
         ("GET", ["v1", "pools"]) => list_pools(state),
         ("GET", ["v1", "pools", backend, class]) => pool_status(state, backend, class),
         ("POST", ["v1", "pools", backend, class, "drain"]) => drain_pool(state, backend, class),
@@ -985,29 +997,214 @@ async fn resume_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<
     json_ok(&instance)
 }
 
-async fn checkpoint(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+/// Which route invoked [`snapshot_instance`].
+///
+/// `/snapshot` defaults to a live snapshot; the older `/checkpoint` route
+/// keeps its hibernating default so existing callers still end up
+/// `checkpointed` rather than silently staying `running`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotRoute {
+    Snapshot,
+    CheckpointAlias,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SnapshotReq {
+    #[serde(default)]
+    leave_running: Option<bool>,
+    #[serde(default)]
+    compression: SnapshotCompression,
+    #[serde(default)]
+    labels: HashMap<String, String>,
+}
+
+async fn snapshot_instance(
+    state: &Arc<ServerState>,
+    id: &str,
+    body: &[u8],
+    route: SnapshotRoute,
+) -> Result<Response<Full<Bytes>>> {
     let uuid = parse_uuid(id)?;
+    // An empty body is a valid "use the defaults" request, and
+    // `from_slice` rejects zero bytes.
+    let req: SnapshotReq = if body.is_empty() {
+        SnapshotReq::default()
+    } else {
+        serde_json::from_slice(body)
+            .map_err(|e| BlazeDaemonError::BadRequest(format!("invalid snapshot request: {e}")))?
+    };
+    let leave_running = req
+        .leave_running
+        .unwrap_or(route == SnapshotRoute::Snapshot);
+
     let operation_lock = state.operation_lock(uuid);
     let _operation = operation_lock.lock().await;
-    let mut map = state
+    let (mut instance, owner) = live_owner(state, uuid, "snapshot")?;
+    if instance.state != SandboxState::Running {
+        return Err(BlazeDaemonError::Conflict(format!(
+            "snapshot requires state running, instance {uuid} is {}",
+            instance.state
+        )));
+    }
+
+    // Reserve before invoking the backend, so a crash mid-checkpoint leaves a
+    // reapable directory instead of an unowned payload.
+    let meta = SnapshotMeta::reserving(
+        instance.backend,
+        instance.id,
+        instance.workload_class,
+        instance.image_digest.clone(),
+        instance.policy_name.clone(),
+        req.compression,
+        req.labels,
+    );
+    let snapshot_id = meta.id;
+    let snapshot_dir = state
+        .snapshots
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("snapshot store lock poisoned".into()))?
+        .reserve(meta.clone())?;
+
+    let artifacts = match owner
+        .snapshot(&SnapshotRequest {
+            instance_id: instance.id,
+            snapshot_dir: snapshot_dir.clone(),
+            leave_running,
+            compression: req.compression,
+        })
+        .await
+    {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            // A failed snapshot must not disturb a live sandbox, so the
+            // instance record is left exactly as it was.
+            discard_reservation(state, snapshot_id, &snapshot_dir);
+            state.metrics.inc(&state.metrics.snapshots_failed);
+            return Err(error.into());
+        }
+    };
+
+    let committed = state
+        .snapshots
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("snapshot store lock poisoned".into()))?
+        .commit(SnapshotMeta {
+            left_running: artifacts.left_running,
+            size_bytes: artifacts.size_bytes,
+            ..meta
+        })
+        .map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "snapshot {snapshot_id} payload written but index commit failed: {error}"
+            ))
+        })?;
+
+    instance.last_snapshot = Some(snapshot_id);
+    // The backend is authoritative: it may have had to hibernate even when a
+    // live snapshot was requested.
+    if artifacts.left_running {
+        instance.touch();
+    } else {
+        instance.transition(SandboxState::Paused)?;
+        instance.transition(SandboxState::Checkpointed)?;
+        instance.backend_ownership = BackendOwnership::Stopped;
+        release_backend_owner(state, uuid);
+    }
+    instance.persist(&state.state_dir).map_err(|error| {
+        BlazeDaemonError::RecoveryRequired(format!(
+            "snapshot {snapshot_id} is committed but instance {uuid} could not be persisted: \
+             {error}"
+        ))
+    })?;
+    if let Some(details) = retain_instance_state(state, instance.clone()) {
+        return Err(BlazeDaemonError::RecoveryRequired(details));
+    }
+    state.metrics.inc(&state.metrics.snapshots_created);
+
+    json_created(&json!({
+        // Retained for compatibility with the previous /checkpoint response;
+        // it now carries the real stored snapshot id.
+        "checkpoint_id": snapshot_id,
+        "instance_id": uuid,
+        "snapshot": committed,
+        "instance": instance,
+    }))
+}
+
+/// Drop a reservation whose payload never completed. Best-effort: the
+/// leftover directory is reaped when the store is next opened.
+fn discard_reservation(state: &Arc<ServerState>, snapshot_id: Uuid, snapshot_dir: &Path) {
+    if let Ok(mut store) = state.snapshots.lock()
+        && let Err(error) = store.forget(snapshot_id)
+    {
+        tracing::warn!(%error, %snapshot_id, "failed to drop snapshot reservation");
+    }
+    if let Err(error) = std::fs::remove_dir_all(snapshot_dir) {
+        tracing::warn!(%error, dir = %snapshot_dir.display(), "failed to remove snapshot payload");
+    }
+}
+
+/// Forget a backend owner the daemon no longer holds responsibility for.
+fn release_backend_owner(state: &Arc<ServerState>, uuid: Uuid) {
+    match state.backend_instances.lock() {
+        Ok(mut owners) => {
+            owners.remove(&uuid);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().remove(&uuid);
+        }
+    }
+}
+
+fn list_snapshots(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    let store = state
+        .snapshots
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("snapshot store lock poisoned".into()))?;
+    json_ok(&store.list())
+}
+
+fn get_snapshot(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    let sid = parse_uuid(id)?;
+    let store = state
+        .snapshots
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("snapshot store lock poisoned".into()))?;
+    let meta = store
+        .get(sid)
+        .ok_or_else(|| BlazeDaemonError::NotFound(format!("snapshot {sid}")))?;
+    json_ok(&meta)
+}
+
+async fn delete_snapshot(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
+    let sid = parse_uuid(id)?;
+    // Deleting the image a hibernated sandbox needs would strand it with no
+    // way back, so that is refused rather than allowed to lose data.
+    let stranded = state
         .instances
         .lock()
-        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?;
-    let inst = map
-        .get_mut(&uuid)
-        .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {uuid}")))?;
-
-    if inst.state == SandboxState::Running {
-        inst.transition(SandboxState::Paused)?;
+        .map_err(|_| BlazeDaemonError::Internal("instances lock poisoned".into()))?
+        .values()
+        .find(|inst| inst.state == SandboxState::Checkpointed && inst.last_snapshot == Some(sid))
+        .map(|inst| inst.id);
+    if let Some(instance_id) = stranded {
+        return Err(BlazeDaemonError::Conflict(format!(
+            "snapshot {sid} is the only way to restore checkpointed instance {instance_id}"
+        )));
     }
-    inst.transition(SandboxState::Checkpointed)?;
-    inst.persist(&state.state_dir)?;
 
-    let checkpoint_id = format!("ckpt-{}-{}", inst.id, chrono::Utc::now().timestamp());
-    json_ok(&json!({
-        "checkpoint_id": checkpoint_id,
-        "instance_id": inst.id,
-    }))
+    let dir = state
+        .snapshots
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("snapshot store lock poisoned".into()))?
+        .forget(sid)
+        .map_err(|_| BlazeDaemonError::NotFound(format!("snapshot {sid}")))?;
+    // Payloads can be gigabytes, so unlink outside the store lock.
+    if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+        tracing::warn!(%error, dir = %dir.display(), "snapshot payload removal failed");
+    }
+    state.metrics.inc(&state.metrics.snapshots_deleted);
+    json_ok(&json!({ "deleted": true, "snapshot_id": sid }))
 }
 
 async fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
@@ -1812,6 +2009,173 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Mock-backed state plus its config, so a test can rebuild the state to
+    /// simulate a daemon restart.
+    fn mock_backed_state(temp: &tempfile::TempDir) -> (Arc<ServerState>, DaemonConfig) {
+        let config = test_config(temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config.clone(),
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        (state, config)
+    }
+
+    async fn body_json(response: Response<Full<Bytes>>) -> serde_json::Value {
+        serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+        )
+        .expect("json")
+    }
+
+    fn instance_state(state: &Arc<ServerState>, id: &str) -> SandboxState {
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        state
+            .instances
+            .lock()
+            .expect("instances")
+            .get(&uuid)
+            .expect("instance")
+            .state
+    }
+
+    #[tokio::test]
+    async fn live_snapshot_keeps_the_instance_running_and_indexes_the_payload() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, _config) = mock_backed_state(&temp);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+
+        let response = snapshot_instance(&state, &id, b"", SnapshotRoute::Snapshot)
+            .await
+            .expect("snapshot");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = body_json(response).await;
+        let sid = body["snapshot"]["id"].as_str().expect("snapshot id");
+
+        assert_eq!(body["snapshot"]["status"], "ready");
+        assert_eq!(body["snapshot"]["left_running"], true);
+        assert_eq!(body["instance"]["last_snapshot"], sid);
+        assert_eq!(instance_state(&state, &id), SandboxState::Running);
+        assert_eq!(
+            state.snapshots.lock().expect("snapshots").list().len(),
+            1,
+            "a committed payload is listable"
+        );
+        assert!(
+            state
+                .metrics
+                .render()
+                .contains("blaze_snapshots_created_total 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn hibernating_snapshot_checkpoints_and_unregisters_the_owner() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, _config) = mock_backed_state(&temp);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+
+        let response = snapshot_instance(
+            &state,
+            &id,
+            br#"{"leave_running": false}"#,
+            SnapshotRoute::Snapshot,
+        )
+        .await
+        .expect("snapshot");
+        let body = body_json(response).await;
+
+        assert_eq!(body["snapshot"]["left_running"], false);
+        assert_eq!(instance_state(&state, &id), SandboxState::Checkpointed);
+        assert_eq!(body["instance"]["backend_ownership"], "stopped");
+        assert!(
+            state.backend_instances.lock().expect("owners").is_empty(),
+            "a hibernated sandbox has no live owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_route_still_hibernates_by_default() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, _config) = mock_backed_state(&temp);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+
+        let response = snapshot_instance(&state, &id, b"", SnapshotRoute::CheckpointAlias)
+            .await
+            .expect("checkpoint");
+        let body = body_json(response).await;
+
+        assert_eq!(instance_state(&state, &id), SandboxState::Checkpointed);
+        // The legacy key is retained but now carries a real stored id.
+        assert_eq!(body["checkpoint_id"], body["snapshot"]["id"]);
+        assert!(Uuid::parse_str(body["checkpoint_id"].as_str().expect("id")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_snapshot_is_refused_while_a_checkpointed_instance_needs_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, _config) = mock_backed_state(&temp);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+        let body = body_json(
+            snapshot_instance(
+                &state,
+                &id,
+                br#"{"leave_running": false}"#,
+                SnapshotRoute::Snapshot,
+            )
+            .await
+            .expect("snapshot"),
+        )
+        .await;
+        let sid = body["snapshot"]["id"].as_str().expect("sid").to_string();
+
+        let error = delete_snapshot(&state, &sid)
+            .await
+            .expect_err("still needed");
+        assert_eq!(error.status_code(), 409);
+        assert!(
+            state
+                .snapshots
+                .lock()
+                .expect("snapshots")
+                .get(Uuid::parse_str(&sid).expect("uuid"))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_requires_a_running_instance() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, _config) = mock_backed_state(&temp);
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+        pause_instance(&state, &id).await.expect("pause");
+
+        let error = snapshot_instance(&state, &id, b"", SnapshotRoute::Snapshot)
+            .await
+            .expect_err("paused cannot be snapshotted");
+        assert_eq!(error.status_code(), 409);
+        assert!(
+            state.snapshots.lock().expect("snapshots").list().is_empty(),
+            "a refused snapshot leaves no reservation"
+        );
     }
 
     #[tokio::test]

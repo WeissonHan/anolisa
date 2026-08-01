@@ -177,16 +177,18 @@ impl SnapshotStore {
         Ok(dir)
     }
 
-    /// Publish a completed payload. The caller supplies the metadata it
-    /// reserved, updated with what the backend reported.
+    /// Publish a completed payload and return the stored metadata.
+    ///
+    /// Returning it keeps callers from reporting their pre-commit copy, whose
+    /// status still says [`SnapshotStatus::Writing`].
     ///
     /// # Errors
     /// Returns an error when the metadata cannot be persisted.
-    pub fn commit(&mut self, mut meta: SnapshotMeta) -> Result<()> {
+    pub fn commit(&mut self, mut meta: SnapshotMeta) -> Result<SnapshotMeta> {
         meta.status = SnapshotStatus::Ready;
         write_meta(&self.dir(meta.id), &meta)?;
-        self.index.insert(meta.id, meta);
-        Ok(())
+        self.index.insert(meta.id, meta.clone());
+        Ok(meta)
     }
 
     /// Metadata for one snapshot, regardless of status.

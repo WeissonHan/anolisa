@@ -15,7 +15,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use blaze_core::backend::{BackendKind, SpawnRequest};
+use blaze_core::backend::{BackendKind, SnapshotArtifacts, SnapshotRequest, SpawnRequest};
 use blaze_core::{BlazeError, Result};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -75,6 +75,25 @@ pub trait BackendInstance: Send + Sync {
         Err(BlazeError::UnsupportedOperation {
             backend: self.backend().to_string(),
             operation: "resume",
+        })
+    }
+
+    /// Write a checkpoint payload into [`SnapshotRequest::snapshot_dir`].
+    ///
+    /// Implementations own that whole subtree. When
+    /// [`SnapshotRequest::leave_running`] is false the sandbox is stopped and
+    /// this owner is left in the same terminal condition as after
+    /// [`Self::kill`]. The returned [`SnapshotArtifacts::left_running`] is
+    /// authoritative over the request: a backend may be forced to hibernate.
+    ///
+    /// # Errors
+    /// Returns [`BlazeError::UnsupportedOperation`] unless the backend
+    /// overrides this, or a backend error when the payload is unusable.
+    async fn snapshot(&self, request: &SnapshotRequest) -> Result<SnapshotArtifacts> {
+        let _ = request;
+        Err(BlazeError::UnsupportedOperation {
+            backend: self.backend().to_string(),
+            operation: "snapshot",
         })
     }
 }
@@ -361,6 +380,17 @@ impl BackendSpawner for MockSpawner {
     }
 }
 
+/// Payload marker written by [`MockInstance::snapshot`]. It mirrors the
+/// on-disk shape real backends produce so API tests exercise real files.
+pub(super) const MOCK_SNAPSHOT_IMAGE: &str = "image/mock.snapshot";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct MockSnapshotPayload {
+    pub backend: BackendKind,
+    pub instance_id: Uuid,
+    pub leave_running: bool,
+}
+
 struct MockInstance {
     instance_id: Uuid,
     cancellation: CancellationToken,
@@ -452,6 +482,31 @@ impl BackendInstance for MockInstance {
             });
         }
         Ok(())
+    }
+
+    async fn snapshot(&self, request: &SnapshotRequest) -> Result<SnapshotArtifacts> {
+        let image = request.snapshot_dir.join(MOCK_SNAPSHOT_IMAGE);
+        if let Some(parent) = image.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let payload = serde_json::to_vec_pretty(&MockSnapshotPayload {
+            backend: BackendKind::Mock,
+            instance_id: self.instance_id,
+            leave_running: request.leave_running,
+        })?;
+        tokio::fs::write(&image, &payload).await?;
+        let bundle = request.snapshot_dir.join("bundle");
+        tokio::fs::create_dir_all(&bundle).await?;
+        tokio::fs::write(bundle.join("config.json"), b"{}\n").await?;
+
+        if !request.leave_running {
+            self.kill().await?;
+        }
+        Ok(SnapshotArtifacts {
+            backend: BackendKind::Mock,
+            size_bytes: payload.len() as u64,
+            left_running: request.leave_running,
+        })
     }
 }
 
