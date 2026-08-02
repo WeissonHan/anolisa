@@ -50,6 +50,10 @@ pub struct SnapshotMeta {
     pub source_instance: Uuid,
     pub workload_class: WorkloadClass,
     pub image_digest: String,
+    /// Image reference the source rootfs came from. Hatching needs it because
+    /// the new instance's run directory has no filesystem yet.
+    #[serde(default)]
+    pub image: Option<String>,
     pub policy_name: String,
     /// False when the source was hibernated into this image.
     pub left_running: bool,
@@ -83,6 +87,7 @@ impl SnapshotMeta {
             source_instance,
             workload_class,
             image_digest,
+            image: None,
             policy_name,
             left_running: false,
             compression,
@@ -285,6 +290,7 @@ mod tests {
 
         pending.size_bytes = 4096;
         pending.left_running = true;
+        pending.image = Some("docker.io/library/alpine:latest".to_string());
         store.commit(pending).expect("commit");
 
         let listed = store.list();
@@ -292,6 +298,14 @@ mod tests {
         assert_eq!(listed[0].id, id);
         assert_eq!(listed[0].status, SnapshotStatus::Ready);
         assert_eq!(listed[0].size_bytes, 4096);
+
+        // Hatching reads the image reference back from disk, so it has to
+        // survive a reopen rather than only living in the in-memory index.
+        let reopened = SnapshotStore::open(temp.path()).expect("reopen");
+        assert_eq!(
+            reopened.list()[0].image.as_deref(),
+            Some("docker.io/library/alpine:latest")
+        );
     }
 
     #[test]

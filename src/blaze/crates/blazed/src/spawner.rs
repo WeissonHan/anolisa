@@ -784,6 +784,7 @@ mod tests {
             instance_id: id,
             run_dir: root.join("run"),
             binary_path: PathBuf::new(),
+            image: None,
             storage: StorageSlot {
                 id: id.to_string(),
                 rootfs_path: slot_dir.join("rootfs.ext4"),

@@ -619,6 +619,7 @@ mod tests {
             instance_id,
             run_dir,
             binary_path: root.join("firecracker"),
+            image: None,
             storage: StorageSlot {
                 id: instance_id.to_string(),
                 rootfs_path: slot_dir.join("rootfs.ext4"),

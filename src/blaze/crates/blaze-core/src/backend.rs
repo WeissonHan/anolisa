@@ -93,6 +93,10 @@ pub struct SpawnRequest {
     pub run_dir: PathBuf,
     /// Backend executable selected during daemon startup.
     pub binary_path: PathBuf,
+    /// Container image reference to provision the rootfs from, e.g.
+    /// `docker.io/library/alpine:latest`. `None` leaves the backend to use
+    /// whatever static base image it was configured with.
+    pub image: Option<String>,
     /// Storage resources owned by this sandbox.
     pub storage: StorageSlot,
     /// Backend-specific policy configuration.
@@ -149,6 +153,9 @@ pub struct RestoreRequest {
     /// Provider-owned runtime directory.
     pub run_dir: PathBuf,
     pub binary_path: PathBuf,
+    /// Image reference recorded when the snapshot was taken. A hatched
+    /// sandbox needs it because its run directory has no rootfs yet.
+    pub image: Option<String>,
     /// Payload root previously handed to [`SnapshotRequest::snapshot_dir`].
     pub snapshot_dir: PathBuf,
     pub storage: StorageSlot,

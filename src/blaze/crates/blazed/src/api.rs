@@ -166,6 +166,10 @@ fn admin_reload(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
 struct CreateInstanceReq {
     workload_class: WorkloadClass,
     image_digest: String,
+    /// Image reference to provision the rootfs from. Absent leaves the
+    /// selected backend on whatever static base image it was configured with.
+    #[serde(default)]
+    image: Option<String>,
     #[serde(default)]
     labels: HashMap<String, String>,
     #[serde(default)]
@@ -304,6 +308,7 @@ async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Respon
         start_path,
         decision.policy_name.clone(),
     );
+    instance.image = req.image.clone();
     instance.transition(SandboxState::Creating)?;
     let operation_lock = state.operation_lock(instance.id);
     let _operation = operation_lock.lock().await;
@@ -405,6 +410,7 @@ async fn create_instance(state: &Arc<ServerState>, body: &[u8]) -> Result<Respon
                     instance_id: instance.id,
                     run_dir: work_dir,
                     binary_path,
+                    image: instance.image.clone(),
                     storage: storage.clone(),
                     backend: decision.backend.clone(),
                     vm: decision.vm.clone(),
@@ -1062,7 +1068,7 @@ async fn snapshot_instance(
 
     // Reserve before invoking the backend, so a crash mid-checkpoint leaves a
     // reapable directory instead of an unowned payload.
-    let meta = SnapshotMeta::reserving(
+    let mut meta = SnapshotMeta::reserving(
         instance.backend,
         instance.id,
         instance.workload_class,
@@ -1071,6 +1077,7 @@ async fn snapshot_instance(
         req.compression,
         req.labels,
     );
+    meta.image = instance.image.clone();
     let snapshot_id = meta.id;
     let snapshot_dir = state
         .snapshots
@@ -1374,6 +1381,7 @@ async fn restore_instance(
             kind: instance.backend,
             run_dir: state.state_dir.join(uuid.to_string()),
             binary_path,
+            image: instance.image.clone(),
             snapshot_dir,
             storage,
             backend: meta_backend_configs(state, &meta)?,
@@ -1459,6 +1467,7 @@ async fn hatch_from_snapshot(
         StartPath::Restored,
         decision.policy_name.clone(),
     );
+    instance.image = meta.image.clone();
     instance.transition(SandboxState::Creating)?;
     let operation_lock = state.operation_lock(instance.id);
     let _operation = operation_lock.lock().await;
@@ -1536,6 +1545,7 @@ async fn hatch_from_snapshot(
             kind: meta.backend,
             run_dir: state.state_dir.join(instance.id.to_string()),
             binary_path,
+            image: instance.image.clone(),
             snapshot_dir,
             storage: storage.clone(),
             backend: decision.backend.clone(),
@@ -2772,6 +2782,42 @@ mod tests {
                 .metrics
                 .render()
                 .contains("blaze_instances_hatched_total 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn image_reference_reaches_the_hatched_instance() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, _config) = mock_backed_state(&temp);
+        let request = serde_json::to_vec(&json!({
+            "workload_class": "agent-tool",
+            "image_digest": "sha256:ownership-test",
+            "image": "docker.io/library/alpine:latest"
+        }))
+        .expect("request");
+        let created = created_json(&state, &request).await;
+        assert_eq!(
+            created["instance"]["image"], "docker.io/library/alpine:latest",
+            "create records the requested image reference"
+        );
+        let source_id = created["instance"]["id"].as_str().expect("id").to_string();
+
+        let body = body_json(
+            snapshot_instance(&state, &source_id, b"", SnapshotRoute::Snapshot)
+                .await
+                .expect("snapshot"),
+        )
+        .await;
+        assert_eq!(
+            body["snapshot"]["image"], "docker.io/library/alpine:latest",
+            "the payload records what to provision a hatched rootfs from"
+        );
+        let sid = body["snapshot"]["id"].as_str().expect("sid").to_string();
+
+        let hatched = body_json(hatch_from_snapshot(&state, &sid, b"").await.expect("hatch")).await;
+        assert_eq!(
+            hatched["instance"]["image"], "docker.io/library/alpine:latest",
+            "a hatched instance inherits the image so it can build its own rootfs"
         );
     }
 

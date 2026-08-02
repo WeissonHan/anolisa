@@ -80,6 +80,12 @@ pub struct SandboxInstance {
     pub backend: BackendKind,
     pub workload_class: WorkloadClass,
     pub image_digest: String,
+    /// Image reference the rootfs was provisioned from, e.g.
+    /// `docker.io/library/alpine:latest`. `image_digest` stays the identity
+    /// used for policy matching and warm-pool keying; this is the locator a
+    /// backend needs to materialise the filesystem again.
+    #[serde(default)]
+    pub image: Option<String>,
     pub start_path: StartPath,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -114,6 +120,7 @@ impl SandboxInstance {
             backend,
             workload_class,
             image_digest,
+            image: None,
             start_path,
             created_at: now,
             updated_at: now,
@@ -364,15 +371,20 @@ mod tests {
         let snapshot = Uuid::new_v4();
         inst.last_snapshot = Some(snapshot);
         inst.restored_from = Some(snapshot);
+        inst.image = Some("docker.io/library/alpine:latest".to_string());
         inst.persist(tmp.path()).expect("persist");
 
         let loaded = SandboxInstance::load(tmp.path(), inst.id).expect("load");
         assert_eq!(loaded.last_snapshot, Some(snapshot));
         assert_eq!(loaded.restored_from, Some(snapshot));
+        assert_eq!(
+            loaded.image.as_deref(),
+            Some("docker.io/library/alpine:latest")
+        );
     }
 
     #[test]
-    fn legacy_state_json_without_snapshot_fields_loads() {
+    fn legacy_state_json_without_optional_fields_loads() {
         let raw = r#"{
             "id": "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
             "state": "running",
@@ -391,5 +403,6 @@ mod tests {
         assert_eq!(loaded.backend_ownership, BackendOwnership::Unknown);
         assert_eq!(loaded.last_snapshot, None);
         assert_eq!(loaded.restored_from, None);
+        assert_eq!(loaded.image, None);
     }
 }
