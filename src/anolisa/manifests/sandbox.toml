@@ -29,6 +29,9 @@ requires_kernel = ">=4.14"
 
 [[scenario]]
 name = "gvisor"
+# The gvisor meta-package pulls in runsc and containerd-shim-runsc-v1.
+# Do not switch to gvisor-runsc: it owns the same /usr/bin/runsc path and
+# conflicts with the runsc package this meta-package depends on.
 packages = ["gvisor"]
 verify_commands = ["runsc --version"]
 requires_kvm = false
