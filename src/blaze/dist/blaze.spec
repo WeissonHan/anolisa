@@ -18,8 +18,10 @@ Provides:       anolisa-component(blaze)
 %description
 Blaze is the ANOLISA per-host sandbox orchestrator daemon. It manages sandbox
 instance lifecycles via HTTP API with policy-driven backend selection, supporting
-Firecracker microVM, Bubblewrap, and Mock backends. Features include warm-pool
-pre-allocation, multi-backend fallback, and Prometheus metrics export.
+gVisor, Firecracker microVM, Bubblewrap, and Mock backends. The gVisor backend
+supports the full lifecycle: pause, resume, snapshot (live or hibernating),
+restore in place, and hatching new instances from a snapshot. Features include
+warm-pool pre-allocation, multi-backend fallback, and Prometheus metrics export.
 
 %prep
 %setup -q
@@ -47,6 +49,9 @@ install -p -m 0644 README.md %{buildroot}%{_docdir}/blaze/
 install -p -m 0644 README_zh.md %{buildroot}%{_docdir}/blaze/
 install -p -m 0644 LICENSE %{buildroot}%{_docdir}/blaze/
 
+# The gVisor backend resolves its shared base rootfs under this directory.
+install -d -m 0755 %{buildroot}/var/lib/blaze/images
+
 %post
 %systemd_post blazed.service
 
@@ -67,11 +72,32 @@ install -p -m 0644 LICENSE %{buildroot}%{_docdir}/blaze/
 %{_datadir}/anolisa/components/blaze/component.toml
 %dir /run/blaze
 %dir /var/lib/blaze
+%dir /var/lib/blaze/images
 %doc %{_docdir}/blaze/README.md
 %doc %{_docdir}/blaze/README_zh.md
 %license %{_docdir}/blaze/LICENSE
 
 %changelog
+* Sun Aug 02 2026 Weisson <Weisson@linux.alibaba.com> - 0.4.0-1
+- Add gVisor backend with the full sandbox lifecycle: pause, resume,
+  snapshot (live or hibernating), restore in place, and hatching new
+  instances from a snapshot
+- Add durable snapshot store; snapshots outlive the instance that
+  produced them and can be restored repeatedly
+- Own /var/lib/blaze/images, where the gVisor backend resolves its shared
+  base rootfs; populate it from a container image or with dnf --installroot
+- Pin the runsc state root under state_dir so a restarted daemon can still
+  address and reclaim the sandboxes it started
+- Wait for sandbox readiness on start, so an operation issued immediately
+  after create no longer fails spuriously
+- Expose pause/resume/restore/hatch and snapshot counters via metrics
+
+* Wed Jul 22 2026 Caspar Zhang <caspar@linux.alibaba.com> - 0.3.0-1
+- Add generic StorageProvider trait with pluggable backends
+- Add FileStorageProvider as the default file-based storage backend
+- Add [storage] config section with backward-compatible defaults
+- Report storage_pool status in GET /v1/health
+
 * Mon Jul 21 2026 Caspar Zhang <caspar@linux.alibaba.com> - 0.2.1-1
 - Rebrand: component renamed from Anvil to Blaze
 - Firecracker vCPU upper bound validation (1-32)

@@ -44,11 +44,15 @@ http_addr = ""
 # Supported backend names (kebab-case):
 #   firecracker, gvisor, gvisor-substrate, rund, kata-fc, kata-clh,
 #   kata-qemu, runc, bubblewrap.
+# Backends are probed in a fixed order: firecracker, then gvisor, then
+# bubblewrap, falling back to mock. The first usable one becomes the data
+# plane, so comment out firecracker if you want gVisor to be selected.
 firecracker = "/usr/bin/firecracker"
 bubblewrap = "/usr/bin/bwrap"
 # gVisor supports the full lifecycle (pause, resume, snapshot, restore).
-# Its runsc state root is created under [daemon].state_dir.
-gvisor = "/usr/local/bin/runsc"
+# Path as installed by the gvisor-runsc package; the runsc state root is
+# created under [daemon].state_dir.
+gvisor = "/usr/bin/runsc"
 # Phase 2+ backends (uncomment when spawner implementations land):
 # rund = "/usr/bin/rund"
 # kata-fc = "/usr/bin/containerd-shim-kata-v2"
