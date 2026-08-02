@@ -701,6 +701,7 @@ async fn quarantine_warm_instance(
         tracing::error!(instance = %id, %error, "quarantined stop state retention failed");
         return;
     }
+    release_backend_rootfs(state, instance.backend, id).await;
     if let Err(error) = state.storage.release_by_id(&id.to_string()).await {
         tracing::error!(instance = %id, %error, "quarantined storage cleanup failed");
         return;
@@ -731,6 +732,25 @@ async fn quarantine_warm_instance(
         Err(poisoned) => {
             poisoned.into_inner().remove(&id);
         }
+    }
+}
+
+/// Ask the backend to release any filesystem it provisioned for `id`.
+///
+/// Runs wherever the daemon releases storage, which is the only point every
+/// teardown path shares: a hibernated instance has no live owner, so neither
+/// `kill` nor `cleanup_orphan` reaches it. Failures are logged rather than
+/// propagated — the sandbox is already gone by this point, and refusing to
+/// finish a destroy over a stale mount would strand the instance.
+async fn release_backend_rootfs(state: &Arc<ServerState>, backend: BackendKind, id: Uuid) {
+    let Some(spawner) = state.spawner_for(backend) else {
+        return;
+    };
+    if let Err(error) = spawner
+        .release_rootfs(id, &state.state_dir.join(id.to_string()))
+        .await
+    {
+        tracing::warn!(instance = %id, %backend, %error, "backend rootfs release failed");
     }
 }
 
@@ -774,6 +794,7 @@ async fn cleanup_failed_create(
 
     let mut storage_released = false;
     if backend_stopped {
+        release_backend_rootfs(state, instance.backend, instance.id).await;
         match state.storage.release(storage).await {
             Ok(()) => storage_released = true,
             Err(error) => cleanup_errors.push(format!("storage release failed: {error}")),
@@ -1720,6 +1741,7 @@ async fn destroy_instance(state: &Arc<ServerState>, id: &str) -> Result<Response
         )));
     }
 
+    release_backend_rootfs(state, original.backend, uuid).await;
     if let Err(error) = state.storage.release_by_id(&uuid.to_string()).await {
         return Err(BlazeDaemonError::RecoveryRequired(format!(
             "destroy {uuid}: backend stopped but storage release failed: {error}; lifecycle retained for retry"
@@ -2622,6 +2644,95 @@ mod tests {
             state.snapshots.lock().expect("snapshots").list().is_empty(),
             "a refused snapshot leaves no reservation"
         );
+    }
+
+    /// Spawner that counts rootfs releases, to prove the daemon asks for one
+    /// on every teardown path.
+    struct CountingReleaseSpawner {
+        released: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl BackendSpawner for CountingReleaseSpawner {
+        async fn spawn(
+            &self,
+            request: SpawnRequest,
+        ) -> std::result::Result<DynBackendInstance, crate::spawner::SpawnFailure> {
+            MockSpawner.spawn(request).await
+        }
+
+        async fn probe(&self, _binary_path: &Path) -> blaze_core::Result<bool> {
+            Ok(true)
+        }
+
+        async fn cleanup_orphan(
+            &self,
+            _instance_id: Uuid,
+            _run_dir: &Path,
+        ) -> blaze_core::Result<()> {
+            Ok(())
+        }
+
+        async fn restore(
+            &self,
+            request: RestoreRequest,
+        ) -> std::result::Result<DynBackendInstance, crate::spawner::SpawnFailure> {
+            MockSpawner.restore(request).await
+        }
+
+        async fn release_rootfs(
+            &self,
+            _instance_id: Uuid,
+            _run_dir: &Path,
+        ) -> blaze_core::Result<()> {
+            self.released.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    /// A hibernated instance has no live owner and records `Stopped`
+    /// ownership, so destroy invokes neither `kill` nor `cleanup_orphan`.
+    /// Anything the backend mounted would leak if release were attached to
+    /// either of those.
+    #[tokio::test]
+    async fn destroying_a_hibernated_instance_releases_its_rootfs() {
+        let temp = tempfile::tempdir().expect("temp");
+        let released = Arc::new(AtomicUsize::new(0));
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let spawner: DynSpawner = Arc::new(CountingReleaseSpawner {
+            released: Arc::clone(&released),
+        });
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, false),
+            spawners(BackendKind::Mock, spawner),
+            BackendKind::Mock,
+            storage,
+        );
+
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id").to_string();
+        snapshot_instance(
+            &state,
+            &id,
+            br#"{"leave_running": false}"#,
+            SnapshotRoute::Snapshot,
+        )
+        .await
+        .expect("hibernate");
+        assert_eq!(instance_state(&state, &id), SandboxState::Checkpointed);
+        assert_eq!(
+            released.load(Ordering::Acquire),
+            0,
+            "hibernating must keep the rootfs: a restore still needs it"
+        );
+
+        destroy_instance(&state, &id).await.expect("destroy");
+        assert_eq!(released.load(Ordering::Acquire), 1);
     }
 
     /// Spawner whose `restore` fails once, to prove a failed restore leaves

@@ -104,6 +104,28 @@ mem_size = 4294967296
 # flush_interval = "30s"   # [Reserved] Dirty data flush period (not yet active)
 
 # ---------------------------------------------------------------------------
+# containerd-provided sandbox filesystems (optional).
+#
+# When enabled, the gVisor backend roots each sandbox in an ordinary OCI
+# image with its own writable layer, instead of the shared read-only
+# directory at <images_dir>/gvisor-rootfs. Create requests then carry an
+# "image" field, e.g. {"image": "docker.io/library/alpine:latest"}.
+#
+# Only containerd's image and snapshot services are used: blaze still starts
+# and owns the sandbox process, so pause, resume, snapshot and restore stay
+# under blaze's control.
+#
+# Leave the section out (or set address = "") to keep the static base rootfs.
+# `anolisa osbase sandbox install gvisor` already installs containerd,
+# because containerd-shim-runsc-v1 depends on it.
+# ---------------------------------------------------------------------------
+# [containerd]
+# address = "/run/containerd/containerd.sock"
+# namespace = "blaze"          # containerd namespace owning blaze's images
+# ctr_path = "/usr/bin/ctr"
+# snapshotter = ""             # empty selects containerd's own default
+
+# ---------------------------------------------------------------------------
 # Instance pool settings (global defaults for warm-pool recycling).
 # Per-workload pool settings are configured in each policy file.
 # ---------------------------------------------------------------------------

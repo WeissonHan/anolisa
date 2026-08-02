@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Backend process ownership and runtime lifecycle abstraction.
 
+pub mod containerd;
 pub mod firecracker;
 pub mod gvisor;
 
@@ -210,6 +211,23 @@ pub trait BackendSpawner: Send + Sync {
             backend: request.kind.to_string(),
             operation: "restore",
         }))
+    }
+
+    /// Release filesystem resources the backend provisioned for a sandbox,
+    /// such as an image snapshot mounted into the run directory.
+    ///
+    /// This is a distinct step from [`BackendInstance::kill`] and
+    /// [`Self::cleanup_orphan`] because neither runs for a hibernated
+    /// sandbox: its owner has already been dropped and its recorded
+    /// ownership is `Stopped`, so destroy skips both and anything the
+    /// backend mounted would leak. The daemon therefore calls this wherever
+    /// it releases storage, which also covers failed creation and warm-pool
+    /// quarantine.
+    ///
+    /// Implementations must be idempotent: this runs on failure paths and
+    /// may be reached more than once for the same sandbox.
+    async fn release_rootfs(&self, _instance_id: Uuid, _run_dir: &Path) -> Result<()> {
+        Ok(())
     }
 }
 

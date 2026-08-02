@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! gVisor (runsc) process ownership via foreground `runsc run`.
 //!
-//! PoC spawner: each sandbox is a foreground `runsc run` child process whose
-//! lifetime mirrors the container. The OCI bundle is generated per instance
-//! under the run directory; the rootfs is a shared read-only base image at
-//! `<images_dir>/gvisor-rootfs`.
+//! Each sandbox is a foreground `runsc run` child process whose lifetime
+//! mirrors the container. The OCI bundle is generated per instance under the
+//! run directory. The rootfs comes from a container image via containerd
+//! when `[containerd]` is configured, and otherwise from a shared read-only
+//! base image at `<images_dir>/gvisor-rootfs`.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -23,12 +24,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use super::containerd::ContainerdImages;
 use super::{
     BackendInstance, BackendSpawner, DynBackendInstance, SpawnFailure, SpawnResult,
     record_backend_stopped, remove_file_if_exists, spawn_result, stopped_marker, terminate_child,
 };
 
 const ROOTFS_DIR_NAME: &str = "gvisor-rootfs";
+/// Rootfs directory inside the bundle. The OCI spec names it relatively so
+/// runsc resolves it against `--bundle`, which keeps one spec valid for every
+/// instance — a hard requirement, because a restore replays the spec stored
+/// in the snapshot byte for byte.
+const BUNDLE_ROOTFS_DIR: &str = "rootfs";
 const RUNSC_ROOT_DIR_NAME: &str = "runsc";
 const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Budget for short runsc state operations (pause, resume, state).
@@ -47,25 +54,51 @@ pub struct GvisorSpawner {
     /// hands it no binary path, and a PATH lookup could resolve a different
     /// runsc than the one that created the container.
     binary_path: PathBuf,
+    /// Present when `[containerd]` is configured; absent leaves every
+    /// sandbox on the shared read-only base image.
+    containerd: Option<ContainerdImages>,
 }
 
 impl GvisorSpawner {
-    /// Create a spawner using `<images_dir>/gvisor-rootfs` as the base image
-    /// and `<state_dir>/runsc` as the runsc state root.
+    /// Create a spawner using `<state_dir>/runsc` as the runsc state root.
     ///
-    /// One shared root per daemon is sufficient because container ids embed
-    /// the instance uuid, and it keeps `runsc --root=<dir> list` usable as a
-    /// reconciliation primitive.
-    pub fn new(images_dir: PathBuf, state_dir: PathBuf, binary_path: PathBuf) -> Self {
+    /// Without `containerd`, every sandbox roots at
+    /// `<images_dir>/gvisor-rootfs`.
+    ///
+    /// One shared runsc root per daemon is sufficient because container ids
+    /// embed the instance uuid, and it keeps `runsc --root=<dir> list` usable
+    /// as a reconciliation primitive.
+    pub fn new(
+        images_dir: PathBuf,
+        state_dir: PathBuf,
+        binary_path: PathBuf,
+        containerd: Option<ContainerdImages>,
+    ) -> Self {
         Self {
             images_dir,
             root_dir: state_dir.join(RUNSC_ROOT_DIR_NAME),
             binary_path,
+            containerd,
         }
     }
 
     fn rootfs_path(&self) -> PathBuf {
         self.images_dir.join(ROOTFS_DIR_NAME)
+    }
+}
+
+/// Mount target for an instance's image rootfs.
+fn rootfs_target(run_dir: &Path) -> PathBuf {
+    run_dir.join("bundle").join(BUNDLE_ROOTFS_DIR)
+}
+
+/// Whether `path` is missing or an empty directory. A mounted image rootfs
+/// always has entries, so this distinguishes "needs provisioning" from
+/// "already mounted".
+async fn is_empty_dir(path: &Path) -> bool {
+    match tokio::fs::read_dir(path).await {
+        Ok(mut entries) => matches!(entries.next_entry().await, Ok(None)),
+        Err(_) => true,
     }
 }
 
@@ -312,7 +345,10 @@ async fn runsc_state_command(
     Ok(output.stdout)
 }
 
-fn oci_spec(rootfs: &Path) -> serde_json::Value {
+/// Build the sandbox spec. `rootfs` is relative to the bundle for
+/// image-backed sandboxes and absolute for the shared base image; runsc
+/// resolves a relative path against `--bundle`.
+fn oci_spec(rootfs: &Path, readonly: bool) -> serde_json::Value {
     serde_json::json!({
         "ociVersion": "1.0.0",
         "process": {
@@ -327,7 +363,7 @@ fn oci_spec(rootfs: &Path) -> serde_json::Value {
                 {"type": "RLIMIT_NOFILE", "hard": 1024, "soft": 1024}
             ]
         },
-        "root": {"path": rootfs, "readonly": true},
+        "root": {"path": rootfs, "readonly": readonly},
         "hostname": "blaze-gvisor",
         "mounts": [
             {"destination": "/proc", "type": "proc", "source": "proc"},
@@ -373,18 +409,40 @@ impl BackendSpawner for GvisorSpawner {
         &self,
         request: SpawnRequest,
     ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
-        let rootfs = self.rootfs_path();
-        if !rootfs.is_dir() {
-            return Err(SpawnFailure::clean(BlazeError::BackendError {
-                msg: format!("gvisor base rootfs missing: {}", rootfs.display()),
-            }));
-        }
         let bundle = request.run_dir.join("bundle");
         tokio::fs::create_dir_all(&bundle).await?;
+        let spec = match self.containerd.as_ref() {
+            Some(containerd) => {
+                let image = request.image.as_deref().ok_or_else(|| {
+                    SpawnFailure::clean(BlazeError::BackendError {
+                        msg: "containerd is configured but the request carries no image reference"
+                            .to_string(),
+                    })
+                })?;
+                containerd
+                    .ensure_image(image)
+                    .await
+                    .map_err(SpawnFailure::clean)?;
+                let target = rootfs_target(&request.run_dir);
+                containerd
+                    .prepare_rootfs(image, &target)
+                    .await
+                    .map_err(SpawnFailure::clean)?;
+                oci_spec(Path::new(BUNDLE_ROOTFS_DIR), false)
+            }
+            None => {
+                let rootfs = self.rootfs_path();
+                if !rootfs.is_dir() {
+                    return Err(SpawnFailure::clean(BlazeError::BackendError {
+                        msg: format!("gvisor base rootfs missing: {}", rootfs.display()),
+                    }));
+                }
+                oci_spec(&rootfs, true)
+            }
+        };
         let pid_file = request.run_dir.join("backend.pid");
         let stopped_marker = stopped_marker(&request.run_dir);
         remove_file_if_exists(&stopped_marker).await?;
-        let spec = oci_spec(&rootfs);
         tokio::fs::write(
             bundle.join("config.json"),
             serde_json::to_vec_pretty(&spec).map_err(|error| BlazeError::BackendError {
@@ -490,6 +548,13 @@ impl BackendSpawner for GvisorSpawner {
         Ok(())
     }
 
+    async fn release_rootfs(&self, _instance_id: Uuid, run_dir: &Path) -> Result<()> {
+        if let Some(containerd) = self.containerd.as_ref() {
+            containerd.release_rootfs(&rootfs_target(run_dir)).await;
+        }
+        Ok(())
+    }
+
     async fn restore(
         &self,
         request: RestoreRequest,
@@ -514,6 +579,34 @@ impl BackendSpawner for GvisorSpawner {
         let bundle_dir = request.run_dir.join("bundle");
         tokio::fs::create_dir_all(&bundle_dir).await?;
         tokio::fs::copy(&stored_spec, bundle_dir.join(BUNDLE_SPEC_FILE)).await?;
+
+        // The stored spec names the rootfs relative to the bundle, so a
+        // hatched sandbox replays it verbatim while still rooting at its own
+        // filesystem. Provide that filesystem here. An in-place restore
+        // usually still has its overlay mounted, because kernel mounts
+        // outlive a daemon restart, so only mount when nothing is there.
+        if let Some(containerd) = self.containerd.as_ref() {
+            let target = rootfs_target(&request.run_dir);
+            if is_empty_dir(&target).await {
+                let image = request.image.as_deref().ok_or_else(|| {
+                    SpawnFailure::clean(BlazeError::BackendError {
+                        msg: format!(
+                            "containerd is configured and {} has no rootfs, but the snapshot records no image reference",
+                            target.display()
+                        ),
+                    })
+                })?;
+                containerd
+                    .ensure_image(image)
+                    .await
+                    .map_err(SpawnFailure::clean)?;
+                containerd
+                    .prepare_rootfs(image, &target)
+                    .await
+                    .map_err(SpawnFailure::clean)?;
+            }
+        }
+
         let stopped_marker = stopped_marker(&request.run_dir);
         remove_file_if_exists(&stopped_marker).await?;
 
@@ -921,13 +1014,33 @@ mod tests {
 
     #[test]
     fn oci_spec_is_instance_independent() {
-        let spec =
-            serde_json::to_string(&oci_spec(Path::new("/var/lib/blaze/images/gvisor-rootfs")))
-                .expect("serialize");
-        // Hatching reuses a snapshot's spec verbatim, so the spec must not
-        // embed anything tied to one instance.
-        assert!(!spec.contains("BLAZE_INSTANCE_ID"));
-        assert!(spec.contains("\"hostname\":\"blaze-gvisor\""));
+        // Hatching and in-place restore both replay a snapshot's spec
+        // verbatim, so neither shape may embed anything tied to one instance.
+        for rootfs in [
+            Path::new(BUNDLE_ROOTFS_DIR),
+            Path::new("/var/lib/blaze/images/gvisor-rootfs"),
+        ] {
+            let spec = serde_json::to_string(&oci_spec(rootfs, false)).expect("serialize");
+            assert!(!spec.contains("BLAZE_INSTANCE_ID"));
+            assert!(spec.contains("\"hostname\":\"blaze-gvisor\""));
+        }
+    }
+
+    /// An image-backed sandbox roots at a path relative to its own bundle,
+    /// which is what lets every instance share one spec while owning a
+    /// different filesystem.
+    #[test]
+    fn an_image_backed_spec_roots_relatively_and_writably() {
+        let spec = oci_spec(Path::new(BUNDLE_ROOTFS_DIR), false);
+        assert_eq!(spec["root"]["path"], "rootfs");
+        assert_eq!(spec["root"]["readonly"], false);
+    }
+
+    #[test]
+    fn the_shared_base_image_stays_read_only() {
+        let spec = oci_spec(Path::new("/var/lib/blaze/images/gvisor-rootfs"), true);
+        assert_eq!(spec["root"]["path"], "/var/lib/blaze/images/gvisor-rootfs");
+        assert_eq!(spec["root"]["readonly"], true);
     }
 
     #[tokio::test]
@@ -937,6 +1050,7 @@ mod tests {
             temp.path().join("images"),
             temp.path().to_path_buf(),
             PathBuf::from("/nonexistent/runsc"),
+            None,
         );
         record_backend_stopped(&stopped_marker(temp.path()))
             .await
@@ -956,6 +1070,7 @@ mod tests {
             temp.path().join("images"),
             temp.path().to_path_buf(),
             missing.clone(),
+            None,
         );
 
         // Neither a stop record nor a pid file exists, so cleanup cannot
@@ -966,5 +1081,89 @@ mod tests {
             .expect_err("termination is unproven");
         assert!(error.to_string().contains("missing PID metadata"));
         assert!(!missing.exists(), "the configured binary is used, not PATH");
+    }
+
+    #[tokio::test]
+    async fn spawning_without_containerd_requires_the_base_rootfs() {
+        let temp = tempfile::tempdir().expect("temp");
+        let spawner = GvisorSpawner::new(
+            temp.path().join("images"),
+            temp.path().to_path_buf(),
+            PathBuf::from("/nonexistent/runsc"),
+            None,
+        );
+
+        let error = spawn_error(&spawner, temp.path(), None).await;
+        assert!(
+            error.to_string().contains("gvisor base rootfs missing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawning_with_containerd_requires_an_image_reference() {
+        let temp = tempfile::tempdir().expect("temp");
+        let spawner = GvisorSpawner::new(
+            temp.path().join("images"),
+            temp.path().to_path_buf(),
+            PathBuf::from("/nonexistent/runsc"),
+            ContainerdImages::from_config(&blaze_core::config::ContainerdSection {
+                address: "/run/containerd/containerd.sock".to_string(),
+                ..Default::default()
+            }),
+        );
+
+        let error = spawn_error(&spawner, temp.path(), None).await;
+        assert!(
+            error.to_string().contains("no image reference"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Releasing a rootfs must succeed even with nothing mounted, because it
+    /// runs on failure paths and can be reached twice for one sandbox.
+    #[tokio::test]
+    async fn releasing_an_unprovisioned_rootfs_succeeds() {
+        let temp = tempfile::tempdir().expect("temp");
+        let spawner = GvisorSpawner::new(
+            temp.path().join("images"),
+            temp.path().to_path_buf(),
+            PathBuf::from("/nonexistent/runsc"),
+            None,
+        );
+
+        spawner
+            .release_rootfs(Uuid::new_v4(), temp.path())
+            .await
+            .expect("release is idempotent");
+    }
+
+    async fn spawn_error(
+        spawner: &GvisorSpawner,
+        root: &Path,
+        image: Option<String>,
+    ) -> BlazeError {
+        let instance_id = Uuid::new_v4();
+        let slot_dir = root.join("slot");
+        let request = SpawnRequest {
+            instance_id,
+            run_dir: root.join("run"),
+            binary_path: PathBuf::from("/nonexistent/runsc"),
+            image,
+            storage: blaze_core::storage::StorageSlot {
+                id: instance_id.to_string(),
+                rootfs_path: slot_dir.join("rootfs.ext4"),
+                mem_path: slot_dir.join("mem.bin"),
+                mem_diff_path: slot_dir.join("mem.diff"),
+                rootfs_diff_path: slot_dir.join("rootfs.diff"),
+                instance_dir: slot_dir,
+            },
+            backend: blaze_core::policy::BackendConfigs::default(),
+            vm: None,
+        };
+        let Err(failure) = spawner.spawn(request).await else {
+            panic!("spawn must fail without a usable rootfs");
+        };
+        failure.into_parts().0
     }
 }

@@ -132,6 +132,7 @@ async fn build_spawners(cfg: &DaemonConfig) -> (SpawnerRegistry, BackendKind) {
             .get(BackendKind::Gvisor.as_str())
             .cloned()
             .unwrap_or_default(),
+        crate::spawner::containerd::ContainerdImages::from_config(&cfg.containerd),
     ));
     let bubblewrap: DynSpawner = Arc::new(BubblewrapSpawner);
     let mock: DynSpawner = Arc::new(MockSpawner);

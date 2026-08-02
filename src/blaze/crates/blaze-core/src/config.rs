@@ -24,6 +24,8 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub storage: StorageSection,
     #[serde(default)]
+    pub containerd: ContainerdSection,
+    #[serde(default)]
     pub pool: PoolSection,
     #[serde(default)]
     pub template: TemplateSection,
@@ -58,6 +60,45 @@ pub struct ListenSection {
     /// Empty string or absent means remote API is disabled.
     #[serde(default)]
     pub http_addr: String,
+}
+
+/// containerd integration for image-provided sandbox filesystems.
+///
+/// Only the image and snapshot services are used: blaze still starts and
+/// owns sandbox processes itself, so the full sandbox lifecycle (pause,
+/// resume, checkpoint, restore) stays under blaze's control.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerdSection {
+    /// containerd gRPC socket, e.g. "/run/containerd/containerd.sock".
+    /// Empty string or absent means backends fall back to whatever static
+    /// base image they were configured with.
+    #[serde(default)]
+    pub address: String,
+    /// containerd namespace that owns blaze's images and snapshots.
+    #[serde(default = "default_containerd_namespace")]
+    pub namespace: String,
+    #[serde(default = "default_ctr_path")]
+    pub ctr_path: PathBuf,
+    /// Snapshotter name. Empty selects containerd's own default.
+    #[serde(default)]
+    pub snapshotter: String,
+}
+
+impl Default for ContainerdSection {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            namespace: default_containerd_namespace(),
+            ctr_path: default_ctr_path(),
+            snapshotter: String::new(),
+        }
+    }
+}
+
+impl ContainerdSection {
+    pub fn enabled(&self) -> bool {
+        !self.address.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +298,12 @@ fn default_template_idle_ttl() -> String {
 fn default_prometheus_socket() -> PathBuf {
     PathBuf::from("/run/blaze/metrics.sock")
 }
+fn default_containerd_namespace() -> String {
+    "blaze".to_string()
+}
+fn default_ctr_path() -> PathBuf {
+    PathBuf::from("/usr/bin/ctr")
+}
 fn default_images_dir() -> PathBuf {
     PathBuf::from("/var/lib/blaze/images")
 }
@@ -309,6 +356,31 @@ mod tests {
         assert_eq!(cfg.daemon.log_level, "debug");
         assert_eq!(cfg.policy.on_load_error, PolicyLoadErrorMode::Warn);
         assert_eq!(cfg.backends.len(), 2);
+    }
+
+    /// An absent section is what keeps existing deployments on their static
+    /// base rootfs, so it must stay disabled by default.
+    #[test]
+    fn containerd_is_disabled_without_an_address() {
+        let cfg: DaemonConfig = toml::from_str("").expect("empty parses to defaults");
+        assert!(!cfg.containerd.enabled());
+        assert_eq!(cfg.containerd.namespace, "blaze");
+        assert_eq!(cfg.containerd.ctr_path, PathBuf::from("/usr/bin/ctr"));
+        assert!(cfg.containerd.snapshotter.is_empty());
+    }
+
+    #[test]
+    fn an_address_is_enough_to_enable_containerd() {
+        let cfg: DaemonConfig = toml::from_str(
+            r#"
+            [containerd]
+            address = "/run/containerd/containerd.sock"
+        "#,
+        )
+        .expect("parses");
+        assert!(cfg.containerd.enabled());
+        assert_eq!(cfg.containerd.namespace, "blaze");
+        assert_eq!(cfg.containerd.ctr_path, PathBuf::from("/usr/bin/ctr"));
     }
 
     #[test]
