@@ -20,6 +20,13 @@
 - 通过 `GET /v1/snapshots`、`GET /v1/snapshots/{id}` 与 `DELETE /v1/snapshots/{id}`
   查看和回收快照。若某镜像是休眠 sandbox 唯一的恢复途径，删除会被拒绝而不会将其搁死。
 - gVisor 后端实现上述四个操作；策略中的 `[checkpoint].enabled = false` 现在会真正拒绝快照。
+- 新增可选的 `[containerd]` 配置段。配置后，gVisor 后端不再共用
+  `<images_dir>/gvisor-rootfs` 这份需要手工准备的只读目录，而是让每个 sandbox 根植于一个
+  普通 OCI 镜像并拥有自己的可写层。这里只借用 containerd 的镜像与快照服务，sandbox 进程
+  与完整生命周期仍归 blaze 持有。不写该段则继续使用共享基础镜像。
+- 创建请求支持 `image` 镜像引用，例如 `{"image": "docker.io/library/alpine:latest"}`。
+  `image_digest` 仍是策略匹配与 warm pool 配对所用的负载身份，`image` 则是后端准备文件
+  系统时的定位符。快照会记录它，因此孵化能在全新的运行目录里构建出一致的文件系统。
 - 新增计数器：`blaze_instances_paused_total`、`blaze_instances_resumed_total`、
   `blaze_instances_restored_total`、`blaze_instances_hatched_total`、
   `blaze_snapshots_created_total`、`blaze_snapshots_failed_total`、

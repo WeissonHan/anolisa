@@ -94,6 +94,44 @@ images_dir = "/var/lib/blaze/images"
 
 `file` provider 使用标准文件系统操作管理 sandbox 存储。`auto` 按优先级探测可用 provider（当前等同于 `file`）。无法识别的值将记录告警并回退到 `file`。
 
+### 容器镜像 rootfs
+
+默认情况下，gVisor 后端把所有 sandbox 都根植于 `<images_dir>/gvisor-rootfs`
+这一份共享只读目录，而这份目录需要运维手工准备。配置 `[containerd]` 后，
+每个 sandbox 改为根植于一个普通 OCI 镜像，并拥有自己的可写层：
+
+```toml
+[containerd]
+address = "/run/containerd/containerd.sock"   # 留空或整段缺失即关闭
+namespace = "blaze"                           # 存放 blaze 镜像的命名空间
+ctr_path = "/usr/bin/ctr"
+snapshotter = ""                              # 留空表示 containerd 默认值
+```
+
+创建请求随之携带镜像引用：
+
+```bash
+curl --unix-socket /run/blaze/api.sock -X POST http://localhost/v1/instances \
+  -d '{"workload_class":"agent-tool","image_digest":"sha256:...",
+       "image":"docker.io/library/alpine:latest"}'
+```
+
+`image_digest` 仍是策略匹配与 warm pool 配对所用的负载身份，`image` 则是后端
+拉取用的定位符。快照会记录它，因此孵化能在新的运行目录里准备出一致的文件系统。
+
+这里只借用 containerd 的镜像与快照服务。sandbox 进程仍由 blaze 自己启动并持有，
+所以 pause、resume、snapshot、restore、孵化的行为与静态 rootfs 完全一致。不写
+`[containerd]` 就继续使用共享基础镜像，既有部署不受影响。
+
+两个值得知道的行为：
+
+- runsc 会给容器根目录再包一层自己的 overlay（默认 `--overlay2=root:self`），
+  因此文件系统写入留在 sandbox 内部，随 checkpoint 载荷一起走，而不落在
+  containerd 的可写层。孵化出的 sandbox 因此能看到 checkpoint 之前的写入，
+  containerd 层只负责提供基础镜像。
+- 配置了 containerd 时产出的快照，无法在未配置 containerd 的守护进程上恢复：
+  存储的 spec 以相对 bundle 的方式命名 rootfs，而那个位置没有任何挂载。
+
 ## API 端点
 
 | 方法 | 路径 | 说明 |

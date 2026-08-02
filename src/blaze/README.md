@@ -95,6 +95,50 @@ images_dir = "/var/lib/blaze/images"
 
 The `file` provider uses standard filesystem operations for sandbox storage. The `auto` provider probes available backends in priority order (currently equivalent to `file`). Unrecognized values will log a warning and fall back to `file`.
 
+### Container Image Rootfs
+
+By default the gVisor backend roots every sandbox in one shared read-only
+directory at `<images_dir>/gvisor-rootfs`, which an operator has to assemble
+by hand. Configure `[containerd]` to root each sandbox in an ordinary OCI
+image with its own writable layer instead:
+
+```toml
+[containerd]
+address = "/run/containerd/containerd.sock"   # empty or absent = disabled
+namespace = "blaze"                           # namespace owning blaze's images
+ctr_path = "/usr/bin/ctr"
+snapshotter = ""                              # empty = containerd's default
+```
+
+Create requests then name an image:
+
+```bash
+curl --unix-socket /run/blaze/api.sock -X POST http://localhost/v1/instances \
+  -d '{"workload_class":"agent-tool","image_digest":"sha256:...",
+       "image":"docker.io/library/alpine:latest"}'
+```
+
+`image_digest` remains the workload identity used for policy matching and
+warm-pool keying; `image` is the locator the backend pulls from. Snapshots
+record it so hatching can provision an identical filesystem in a new run
+directory.
+
+Only containerd's image and snapshot services are used. blaze still launches
+and owns the sandbox process, so pause, resume, snapshot, restore and hatch
+work exactly as they do on the static rootfs. Leaving `[containerd]` out
+keeps the shared base image, so existing deployments are unaffected.
+
+Two behaviours worth knowing:
+
+- runsc wraps the container root in its own overlay (`--overlay2=root:self`
+  by default), so filesystem writes stay inside the sandbox and travel in the
+  checkpoint payload rather than the containerd layer. A hatched sandbox
+  therefore sees writes made before the checkpoint, and the containerd layer
+  supplies the base image only.
+- A snapshot taken with containerd configured cannot be restored by a daemon
+  running without it: the stored spec names its rootfs relative to the bundle
+  and there is nothing mounted there.
+
 ## API Endpoints
 
 | Method | Path | Description |
