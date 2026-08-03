@@ -30,10 +30,13 @@ workload_class = "agent-tool"
 # Backend and hook selection.
 # ---------------------------------------------------------------------------
 [select]
-# Ordered list of backends to try. Daemon picks the first available.
+# Backends this policy allows. The daemon selects one data plane at startup
+# (probe order: firecracker, gvisor, bubblewrap, mock); this list filters
+# that choice, so name every backend you are willing to run on — a request
+# is rejected with 503 when the selected data plane is not listed here.
 # Options: firecracker, gvisor, gvisor-substrate, rund, kata-fc, kata-clh,
 #          kata-qemu, runc, bubblewrap.
-backend_priority = ["firecracker", "bubblewrap"]
+backend_priority = ["gvisor", "firecracker", "bubblewrap"]
 
 # Kernel hooks to activate. Empty means none.  Default: [].
 kernel_hooks = []

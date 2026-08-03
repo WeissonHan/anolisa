@@ -69,10 +69,11 @@ pub struct ListenSection {
 /// resume, checkpoint, restore) stays under blaze's control.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerdSection {
-    /// containerd gRPC socket, e.g. "/run/containerd/containerd.sock".
-    /// Empty string or absent means backends fall back to whatever static
-    /// base image they were configured with.
-    #[serde(default)]
+    /// containerd gRPC socket. Defaults to the standard location, so image
+    /// rootfs is on unless explicitly disabled: the alternative for the
+    /// gVisor backend is a shared base directory that no package provides.
+    /// Set to an empty string to opt out and use that directory instead.
+    #[serde(default = "default_containerd_address")]
     pub address: String,
     /// containerd namespace that owns blaze's images and snapshots.
     #[serde(default = "default_containerd_namespace")]
@@ -87,7 +88,7 @@ pub struct ContainerdSection {
 impl Default for ContainerdSection {
     fn default() -> Self {
         Self {
-            address: String::new(),
+            address: default_containerd_address(),
             namespace: default_containerd_namespace(),
             ctr_path: default_ctr_path(),
             snapshotter: String::new(),
@@ -298,6 +299,9 @@ fn default_template_idle_ttl() -> String {
 fn default_prometheus_socket() -> PathBuf {
     PathBuf::from("/run/blaze/metrics.sock")
 }
+fn default_containerd_address() -> String {
+    "/run/containerd/containerd.sock".to_string()
+}
 fn default_containerd_namespace() -> String {
     "blaze".to_string()
 }
@@ -358,29 +362,44 @@ mod tests {
         assert_eq!(cfg.backends.len(), 2);
     }
 
-    /// An absent section is what keeps existing deployments on their static
-    /// base rootfs, so it must stay disabled by default.
+    /// Image rootfs is the only path that works out of the box, so an absent
+    /// section must leave it on.
     #[test]
-    fn containerd_is_disabled_without_an_address() {
+    fn containerd_is_enabled_by_default() {
         let cfg: DaemonConfig = toml::from_str("").expect("empty parses to defaults");
-        assert!(!cfg.containerd.enabled());
+        assert!(cfg.containerd.enabled());
+        assert_eq!(cfg.containerd.address, "/run/containerd/containerd.sock");
         assert_eq!(cfg.containerd.namespace, "blaze");
         assert_eq!(cfg.containerd.ctr_path, PathBuf::from("/usr/bin/ctr"));
         assert!(cfg.containerd.snapshotter.is_empty());
     }
 
+    /// The opt-out, for hosts that deliberately use a shared base rootfs.
     #[test]
-    fn an_address_is_enough_to_enable_containerd() {
+    fn an_empty_address_opts_out_of_containerd() {
         let cfg: DaemonConfig = toml::from_str(
             r#"
             [containerd]
-            address = "/run/containerd/containerd.sock"
+            address = ""
+        "#,
+        )
+        .expect("parses");
+        assert!(!cfg.containerd.enabled());
+    }
+
+    #[test]
+    fn containerd_overrides_are_honoured() {
+        let cfg: DaemonConfig = toml::from_str(
+            r#"
+            [containerd]
+            namespace = "custom"
+            snapshotter = "overlayfs"
         "#,
         )
         .expect("parses");
         assert!(cfg.containerd.enabled());
-        assert_eq!(cfg.containerd.namespace, "blaze");
-        assert_eq!(cfg.containerd.ctr_path, PathBuf::from("/usr/bin/ctr"));
+        assert_eq!(cfg.containerd.namespace, "custom");
+        assert_eq!(cfg.containerd.snapshotter, "overlayfs");
     }
 
     #[test]

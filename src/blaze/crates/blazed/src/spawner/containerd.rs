@@ -240,8 +240,19 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_address_disables_containerd() {
-        assert!(ContainerdImages::from_config(&ContainerdSection::default()).is_none());
+    fn an_empty_address_opts_out_of_containerd() {
+        assert!(
+            ContainerdImages::from_config(&ContainerdSection::default()).is_some(),
+            "containerd is on by default"
+        );
+        assert!(
+            ContainerdImages::from_config(&ContainerdSection {
+                address: String::new(),
+                ..Default::default()
+            })
+            .is_none(),
+            "an empty address is the opt-out"
+        );
     }
 
     #[test]

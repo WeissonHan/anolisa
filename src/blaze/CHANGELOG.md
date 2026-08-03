@@ -23,17 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused instead of stranding it.
 - gVisor backend implements all four operations; `[checkpoint].enabled = false` in a
   policy now actually refuses snapshots.
-- Optional `[containerd]` configuration section. When set, the gVisor backend roots
-  each sandbox in an ordinary OCI image with its own writable layer instead of the
-  shared read-only directory at `<images_dir>/gvisor-rootfs`, which had to be
-  assembled by hand. Only containerd's image and snapshot services are used, so blaze
-  keeps owning the sandbox process and the whole lifecycle. Leaving the section out
-  keeps the shared base image.
+- The gVisor backend roots each sandbox in an ordinary OCI image with its own
+  writable layer, provisioned through containerd's image and snapshot services.
+  This is the default; the shipped `[containerd]` section points at
+  `/run/containerd/containerd.sock`. blaze still owns the sandbox process, so
+  the whole lifecycle is unaffected. Set `address = ""` to opt out, which then
+  requires a shared read-only rootfs at `<images_dir>/gvisor-rootfs` that you
+  build yourself — no package provides it.
 - Create requests accept an `image` reference, e.g.
-  `{"image": "docker.io/library/alpine:latest"}`. `image_digest` remains the workload
-  identity used for policy matching and warm-pool keying; `image` is the locator the
-  backend provisions from. Snapshots record it so hatching can build an identical
-  filesystem in a brand-new run directory.
+  `{"image": "docker.io/library/alpine:latest"}`. `image_digest` remains the
+  workload identity used for policy matching and warm-pool keying; `image` is
+  the locator the backend provisions from. Snapshots record it so hatching can
+  build an identical filesystem in a brand-new run directory.
+- The shipped policies list `gvisor` in `backend_priority`, so a host whose
+  data plane is gVisor is no longer rejected with 503.
 - New counters: `blaze_instances_paused_total`, `blaze_instances_resumed_total`,
   `blaze_instances_restored_total`, `blaze_instances_hatched_total`,
   `blaze_snapshots_created_total`, `blaze_snapshots_failed_total`,

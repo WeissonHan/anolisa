@@ -97,20 +97,18 @@ The `file` provider uses standard filesystem operations for sandbox storage. The
 
 ### Container Image Rootfs
 
-By default the gVisor backend roots every sandbox in one shared read-only
-directory at `<images_dir>/gvisor-rootfs`, which an operator has to assemble
-by hand. Configure `[containerd]` to root each sandbox in an ordinary OCI
-image with its own writable layer instead:
+The gVisor backend roots each sandbox in an ordinary OCI image with its own
+writable layer, provisioned through containerd. This is on by default:
 
 ```toml
 [containerd]
-address = "/run/containerd/containerd.sock"   # empty or absent = disabled
+address = "/run/containerd/containerd.sock"   # "" opts out
 namespace = "blaze"                           # namespace owning blaze's images
 ctr_path = "/usr/bin/ctr"
 snapshotter = ""                              # empty = containerd's default
 ```
 
-Create requests then name an image:
+Create requests name an image:
 
 ```bash
 curl --unix-socket /run/blaze/api.sock -X POST http://localhost/v1/instances \
@@ -125,8 +123,11 @@ directory.
 
 Only containerd's image and snapshot services are used. blaze still launches
 and owns the sandbox process, so pause, resume, snapshot, restore and hatch
-work exactly as they do on the static rootfs. Leaving `[containerd]` out
-keeps the shared base image, so existing deployments are unaffected.
+are unaffected by where the filesystem came from.
+
+Setting `address = ""` opts out. The backend then expects a shared read-only
+rootfs at `<images_dir>/gvisor-rootfs`, which you have to build yourself —
+no package provides it, and every sandbox shares it with no writable layer.
 
 Two behaviours worth knowing:
 
@@ -135,9 +136,9 @@ Two behaviours worth knowing:
   checkpoint payload rather than the containerd layer. A hatched sandbox
   therefore sees writes made before the checkpoint, and the containerd layer
   supplies the base image only.
-- A snapshot taken with containerd configured cannot be restored by a daemon
-  running without it: the stored spec names its rootfs relative to the bundle
-  and there is nothing mounted there.
+- A snapshot taken with containerd enabled cannot be restored by a daemon that
+  opted out: the stored spec names its rootfs relative to the bundle and there
+  is nothing mounted there.
 
 ## API Endpoints
 

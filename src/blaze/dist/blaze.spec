@@ -20,11 +20,10 @@ Blaze is the ANOLISA per-host sandbox orchestrator daemon. It manages sandbox
 instance lifecycles via HTTP API with policy-driven backend selection, supporting
 gVisor, Firecracker microVM, Bubblewrap, and Mock backends. The gVisor backend
 supports the full lifecycle: pause, resume, snapshot (live or hibernating),
-restore in place, and hatching new instances from a snapshot. It can root each
-sandbox in an ordinary OCI image with its own writable layer by configuring the
-optional [containerd] section, or fall back to a shared base rootfs. Features
-include warm-pool pre-allocation, multi-backend fallback, and Prometheus metrics
-export.
+restore in place, and hatching new instances from a snapshot. By default it
+roots each sandbox in an ordinary OCI image with its own writable layer,
+provisioned through containerd. Features include warm-pool pre-allocation,
+multi-backend fallback, and Prometheus metrics export.
 
 %prep
 %setup -q
@@ -87,12 +86,14 @@ install -d -m 0755 %{buildroot}/var/lib/blaze/images
   instances from a snapshot
 - Add durable snapshot store; snapshots outlive the instance that
   produced them and can be restored repeatedly
-- Own /var/lib/blaze/images, where the gVisor backend resolves its shared
-  base rootfs; populate it from a container image or with dnf --installroot
-- Add an optional [containerd] config section: the gVisor backend then roots
-  each sandbox in an ordinary OCI image named by a new "image" request field,
-  with its own writable layer. Omitting the section keeps the shared base
-  rootfs, so existing deployments are unaffected
+- Root each gVisor sandbox in an ordinary OCI image with its own writable
+  layer, provisioned through containerd. Enabled by default; create requests
+  name the image via a new "image" field. Set [containerd] address = "" to
+  opt out, which then needs a self-built shared rootfs under
+  /var/lib/blaze/images/gvisor-rootfs
+- Ship policies that allow the gvisor backend, so a host whose data plane is
+  gVisor is not rejected
+- Own /var/lib/blaze/images, used by the opt-out shared-rootfs path
 - Pin the runsc state root under state_dir so a restarted daemon can still
   address and reclaim the sandboxes it started
 - Wait for sandbox readiness on start, so an operation issued immediately

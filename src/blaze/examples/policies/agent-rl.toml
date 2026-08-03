@@ -33,11 +33,15 @@ workload_class = "agent-rl"
 # Backend and hook selection. Determines how the sandbox is created.
 # ---------------------------------------------------------------------------
 [select]
-# Ordered list of backends to try. Daemon picks the first one whose binary
-# is available (configured in [backends] of config.toml).
+# Backends this policy allows. The daemon selects one data plane at startup
+# (probe order: firecracker, gvisor, bubblewrap, mock); this list filters
+# that choice, so name every backend you are willing to run on — a request
+# is rejected with 503 when the selected data plane is not listed here.
+# gvisor comes first because it is the backend with working snapshot,
+# restore and hatch, which is what rollout reuse depends on.
 # Options: firecracker, gvisor, gvisor-substrate, rund, kata-fc, kata-clh,
 #          kata-qemu, runc, bubblewrap.
-backend_priority = ["firecracker", "bubblewrap"]
+backend_priority = ["gvisor", "firecracker", "bubblewrap"]
 
 # Kernel hooks to activate for this workload class.
 # Available hooks (Phase 2+): "mm-template", "uffd-wp".
