@@ -93,7 +93,7 @@ pub struct SandboxInstance {
     /// Last durably known backend ownership state.
     #[serde(default)]
     pub backend_ownership: BackendOwnership,
-    /// Snapshot this instance was last restored or hatched from.
+    /// Snapshot this instance was last restored from.
     #[serde(default)]
     pub restored_from: Option<Uuid>,
     /// Most recent snapshot taken of this instance. While `checkpointed`
@@ -104,8 +104,8 @@ pub struct SandboxInstance {
 
 impl SandboxInstance {
     /// Create a new instance in [`SandboxState::Pending`] with `start_path`
-    /// pre-classified by the caller (cold for fresh boots, warm for
-    /// pool reuses, restored when hatching from a snapshot).
+    /// pre-classified by the caller (cold for fresh boots or warm for
+    /// pool reuses). Restore reclassifies an existing checkpointed instance.
     pub fn new(
         backend: BackendKind,
         workload_class: WorkloadClass,
@@ -145,18 +145,12 @@ impl SandboxInstance {
         self.state = target;
         self.updated_at = Utc::now();
         // entering `creating` re-classifies the start path: warm-pool
-        // reuse goes warm → creating, restores come from checkpointed or
-        // declare themselves at construction, fresh boots go
-        // pending → creating.
+        // reuse goes warm → creating, restores come from checkpointed, and
+        // fresh boots go pending → creating.
         if target == SandboxState::Creating {
             self.start_path = match prev {
                 SandboxState::Warm => StartPath::Warm,
                 SandboxState::Checkpointed => StartPath::Restored,
-                // A hatch-from-snapshot request declares `Restored` before
-                // its first transition; do not downgrade it here.
-                SandboxState::Pending if self.start_path == StartPath::Restored => {
-                    StartPath::Restored
-                }
                 _ => StartPath::Cold,
             };
         }
@@ -327,19 +321,6 @@ mod tests {
         assert_eq!(inst.start_path, StartPath::Restored);
         inst.transition(SandboxState::Running).expect("restored");
         assert_eq!(inst.state, SandboxState::Running);
-    }
-
-    #[test]
-    fn pending_to_creating_preserves_declared_restored_path() {
-        let mut inst = SandboxInstance::new(
-            BackendKind::Gvisor,
-            WorkloadClass::AgentTool,
-            "sha256:deadbeef".into(),
-            StartPath::Restored,
-            "agent-tool-default".into(),
-        );
-        inst.transition(SandboxState::Creating).expect("hatch");
-        assert_eq!(inst.start_path, StartPath::Restored);
     }
 
     #[test]

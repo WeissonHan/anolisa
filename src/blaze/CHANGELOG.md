@@ -14,10 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pause and resume a running sandbox: `POST /v1/instances/{id}/pause` and `/resume`.
 - Snapshot a sandbox into a durable store: `POST /v1/instances/{id}/snapshot` keeps
   the sandbox running by default, or hibernates it with `{"leave_running": false}`.
-- Restore a hibernated sandbox in place with `POST /v1/instances/{id}/restore`, and
-  hatch a brand-new instance from any snapshot with `POST /v1/snapshots/{id}/restore`.
-  Snapshots outlive the instance that produced them, so one image can be restored
-  repeatedly and still used after the source is destroyed.
+- Restore a hibernated sandbox in place with `POST /v1/instances/{id}/restore`.
+  Restore does not consume the checkpoint, so the same source instance can use it
+  repeatedly while its instance record and storage remain available.
 - Browse and reclaim snapshots via `GET /v1/snapshots`, `GET /v1/snapshots/{id}` and
   `DELETE /v1/snapshots/{id}`. Deleting an image a hibernated sandbox still needs is
   refused instead of stranding it.
@@ -33,14 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Create requests accept an `image` reference, e.g.
   `{"image": "docker.io/library/alpine:latest"}`. `image_digest` remains the
   workload identity used for policy matching and warm-pool keying; `image` is
-  the locator the backend provisions from. Snapshots record it so hatching can
-  build an identical filesystem in a brand-new run directory.
+  the locator the backend provisions from. The source instance records it so
+  in-place restore can rebuild a missing rootfs in the same run directory.
 - The shipped policies list `gvisor` in `backend_priority`, so a host whose
   data plane is gVisor is no longer rejected with 503.
 - New counters: `blaze_instances_paused_total`, `blaze_instances_resumed_total`,
-  `blaze_instances_restored_total`, `blaze_instances_hatched_total`,
-  `blaze_snapshots_created_total`, `blaze_snapshots_failed_total`,
-  `blaze_snapshots_deleted_total`.
+  `blaze_instances_restored_total`, `blaze_snapshots_created_total`,
+  `blaze_snapshots_failed_total`, `blaze_snapshots_deleted_total`.
 
 ### Changed
 
@@ -123,4 +121,3 @@ Initial scaffold of ANOLISA Anvil per-host sandbox daemon.
 - Warm pool: pre-created sandboxes ready for instant allocation, configurable min/target/max.
 - Template sharing: multiple sandboxes share one base memory image, reducing per-instance cost.
 - Prometheus metrics endpoint for monitoring.
-

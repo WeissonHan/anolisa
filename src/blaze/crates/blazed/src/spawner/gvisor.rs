@@ -573,25 +573,24 @@ impl BackendSpawner for GvisorSpawner {
             }));
         }
 
-        // Copy the spec instead of pointing --bundle at the snapshot: the
-        // restored instance then owns its bundle, can be snapshotted again,
-        // and cannot corrupt a payload other instances may still restore from.
+        // Copy the spec instead of pointing --bundle at the snapshot. The
+        // restored instance owns its bundle, can be snapshotted again,
+        // and cannot corrupt the reusable checkpoint payload.
         let bundle_dir = request.run_dir.join("bundle");
         tokio::fs::create_dir_all(&bundle_dir).await?;
         tokio::fs::copy(&stored_spec, bundle_dir.join(BUNDLE_SPEC_FILE)).await?;
 
-        // The stored spec names the rootfs relative to the bundle, so a
-        // hatched sandbox replays it verbatim while still rooting at its own
-        // filesystem. Provide that filesystem here. An in-place restore
-        // usually still has its overlay mounted, because kernel mounts
-        // outlive a daemon restart, so only mount when nothing is there.
+        // The stored spec names the rootfs relative to the bundle. An
+        // in-place restore usually still has its overlay mounted because
+        // kernel mounts outlive a daemon restart, so rebuild the source
+        // instance's filesystem only when the target is empty.
         if let Some(containerd) = self.containerd.as_ref() {
             let target = rootfs_target(&request.run_dir);
             if is_empty_dir(&target).await {
                 let image = request.image.as_deref().ok_or_else(|| {
                     SpawnFailure::clean(BlazeError::BackendError {
                         msg: format!(
-                            "containerd is configured and {} has no rootfs, but the snapshot records no image reference",
+                            "containerd is configured and {} has no rootfs, but the source instance records no image reference",
                             target.display()
                         ),
                     })
@@ -611,8 +610,7 @@ impl BackendSpawner for GvisorSpawner {
         remove_file_if_exists(&stopped_marker).await?;
 
         let container_id = format!("blaze-{}", request.instance_id);
-        // Clear any stale record so in-place restore and hatching take the
-        // same path, and so a retry after a crash is safe.
+        // Clear any stale record so an in-place retry after a crash is safe.
         if let Err(error) =
             runsc_delete_force(&request.binary_path, &self.root_dir, &container_id).await
         {
@@ -1014,8 +1012,8 @@ mod tests {
 
     #[test]
     fn oci_spec_is_instance_independent() {
-        // Hatching and in-place restore both replay a snapshot's spec
-        // verbatim, so neither shape may embed anything tied to one instance.
+        // In-place restore replays the snapshot's spec in a reconstructed
+        // bundle, so the persisted shape must not contain stale instance IDs.
         for rootfs in [
             Path::new(BUNDLE_ROOTFS_DIR),
             Path::new("/var/lib/blaze/images/gvisor-rootfs"),

@@ -96,9 +96,6 @@ async fn dispatch(
         ("GET", ["v1", "snapshots"]) => list_snapshots(state),
         ("GET", ["v1", "snapshots", sid]) => get_snapshot(state, sid),
         ("DELETE", ["v1", "snapshots", sid]) => delete_snapshot(state, sid).await,
-        ("POST", ["v1", "snapshots", sid, "restore"]) => {
-            hatch_from_snapshot(state, sid, &body).await
-        }
         ("GET", ["v1", "pools"]) => list_pools(state),
         ("GET", ["v1", "pools", backend, class]) => pool_status(state, backend, class),
         ("POST", ["v1", "pools", backend, class, "drain"]) => drain_pool(state, backend, class),
@@ -1089,7 +1086,7 @@ async fn snapshot_instance(
 
     // Reserve before invoking the backend, so a crash mid-checkpoint leaves a
     // reapable directory instead of an unowned payload.
-    let mut meta = SnapshotMeta::reserving(
+    let meta = SnapshotMeta::reserving(
         instance.backend,
         instance.id,
         instance.workload_class,
@@ -1098,7 +1095,6 @@ async fn snapshot_instance(
         req.compression,
         req.labels,
     );
-    meta.image = instance.image.clone();
     let snapshot_id = meta.id;
     let snapshot_dir = state
         .snapshots
@@ -1270,12 +1266,6 @@ struct RestoreReq {
     snapshot_id: Option<Uuid>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct HatchReq {
-    #[serde(default)]
-    labels: HashMap<String, String>,
-}
-
 fn parse_optional_body<T: Default + for<'de> Deserialize<'de>>(
     body: &[u8],
     what: &str,
@@ -1344,6 +1334,12 @@ async fn restore_instance(
         ))
     })?;
     let meta = restorable_snapshot(state, sid, Some(instance.backend))?;
+    if meta.source_instance != uuid {
+        return Err(BlazeDaemonError::Conflict(format!(
+            "snapshot {sid} belongs to source instance {}, not {uuid}",
+            meta.source_instance
+        )));
+    }
     if state
         .backend_instances
         .lock()
@@ -1372,15 +1368,17 @@ async fn restore_instance(
             instance.backend
         ))
     })?;
-    let storage = state.storage.reconstruct(&uuid.to_string()).await.map_err(
-        |error| match error {
-            BlazeError::StorageIncomplete { .. } => BlazeDaemonError::Conflict(format!(
-                "instance {uuid} storage slot is gone; hatch a new instance from snapshot {sid} \
-                 instead"
-            )),
-            other => other.into(),
-        },
-    )?;
+    let storage =
+        state
+            .storage
+            .reconstruct(&uuid.to_string())
+            .await
+            .map_err(|error| match error {
+                BlazeError::StorageIncomplete { .. } => BlazeDaemonError::Conflict(format!(
+                    "instance {uuid} storage slot is unavailable; snapshot {sid} cannot be restored"
+                )),
+                other => other.into(),
+            })?;
 
     // Publish intent without moving the state machine: `Starting` is what
     // recovery consults, and leaving `state` at checkpointed makes a failed
@@ -1444,176 +1442,6 @@ async fn restore_instance(
     state.metrics.inc(&state.metrics.instances_restored);
 
     json_ok(&json!({ "instance": instance, "snapshot_id": sid }))
-}
-
-async fn hatch_from_snapshot(
-    state: &Arc<ServerState>,
-    id: &str,
-    body: &[u8],
-) -> Result<Response<Full<Bytes>>> {
-    let sid = parse_uuid(id)?;
-    let req: HatchReq = parse_optional_body(body, "hatch")?;
-    let meta = restorable_snapshot(state, sid, None)?;
-
-    // Only the probed backend can execute, mirroring create's constraint.
-    if meta.backend != state.active_backend {
-        return Err(BlazeError::BackendUnavailable {
-            requested: vec![meta.backend.as_str().to_string()],
-            available: vec![state.active_backend.as_str().to_string()],
-        }
-        .into());
-    }
-
-    // Re-evaluate policy from the snapshot's own metadata so hatching works
-    // after the source instance's record is gone.
-    let decision = {
-        let engine = state
-            .policy
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("policy lock poisoned".into()))?;
-        let image = ImageMetadata {
-            digest: meta.image_digest.clone(),
-            workload_class: Some(meta.workload_class),
-            kernel_version: None,
-        };
-        engine.evaluate(&req.labels, &image).inspect_err(|_| {
-            state.metrics.inc(&state.metrics.policy_eval_failures);
-        })?
-    };
-
-    let mut instance = SandboxInstance::new(
-        meta.backend,
-        decision.workload_class,
-        meta.image_digest.clone(),
-        StartPath::Restored,
-        decision.policy_name.clone(),
-    );
-    instance.image = meta.image.clone();
-    instance.transition(SandboxState::Creating)?;
-    let operation_lock = state.operation_lock(instance.id);
-    let _operation = operation_lock.lock().await;
-
-    let (binary_path, rootfs_size, mem_size) = {
-        let cfg = state
-            .config
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()))?;
-        (
-            cfg.backends
-                .get(meta.backend.as_str())
-                .cloned()
-                .unwrap_or_default(),
-            cfg.storage.rootfs_size,
-            cfg.storage.mem_size,
-        )
-    };
-    // Write-ahead ownership publish, as in create.
-    instance.persist(&state.state_dir)?;
-    if let Some(details) = retain_instance_state(state, instance.clone()) {
-        return Err(BlazeDaemonError::RecoveryRequired(format!(
-            "hatch {}: {details}",
-            instance.id
-        )));
-    }
-    let storage = match state
-        .storage
-        .acquire(&AcquireOpts {
-            instance_id: instance.id.to_string(),
-            rootfs_size,
-            mem_size,
-        })
-        .await
-    {
-        Ok(storage) => storage,
-        Err(error) => {
-            let (source, residual) = error.into_parts();
-            return Err(retain_failed_acquire(
-                state,
-                &mut instance,
-                residual,
-                source.into(),
-            ));
-        }
-    };
-
-    instance.backend_ownership = BackendOwnership::Starting;
-    if let Err(error) = instance.persist(&state.state_dir) {
-        instance.backend_ownership = BackendOwnership::NotStarted;
-        return Err(cleanup_failed_create(
-            state,
-            &mut instance,
-            storage,
-            None,
-            false,
-            error.into(),
-        )
-        .await);
-    }
-    let spawner = state.spawner_for(meta.backend).ok_or_else(|| {
-        BlazeDaemonError::Internal(format!(
-            "no spawner registered for backend {}",
-            meta.backend
-        ))
-    })?;
-    let snapshot_dir = state
-        .snapshots
-        .lock()
-        .map_err(|_| BlazeDaemonError::Internal("snapshot store lock poisoned".into()))?
-        .dir(sid);
-    let owner = match spawner
-        .restore(RestoreRequest {
-            instance_id: instance.id,
-            kind: meta.backend,
-            run_dir: state.state_dir.join(instance.id.to_string()),
-            binary_path,
-            image: instance.image.clone(),
-            snapshot_dir,
-            storage: storage.clone(),
-            backend: decision.backend.clone(),
-            vm: decision.vm.clone(),
-        })
-        .await
-    {
-        Ok(owner) => owner,
-        Err(failure) => {
-            let (source, residual) = failure.into_parts();
-            instance.backend_ownership = if residual.is_some() {
-                BackendOwnership::Running
-            } else {
-                BackendOwnership::Stopped
-            };
-            return Err(cleanup_failed_create(
-                state,
-                &mut instance,
-                storage,
-                residual,
-                false,
-                source.into(),
-            )
-            .await);
-        }
-    };
-
-    instance.backend_ownership = BackendOwnership::Running;
-    if let Some(details) = retain_backend_owner(state, instance.id, owner) {
-        return Err(BlazeDaemonError::RecoveryRequired(details));
-    }
-    instance.transition(SandboxState::Running)?;
-    instance.restored_from = Some(sid);
-    instance.persist(&state.state_dir)?;
-    if let Some(details) = retain_instance_state(state, instance.clone()) {
-        return Err(BlazeDaemonError::RecoveryRequired(details));
-    }
-    record_snapshot_restore(state, sid, instance.id);
-    state.metrics.inc(&state.metrics.instances_created);
-    state.metrics.inc(&state.metrics.instances_hatched);
-
-    json_created(&json!({
-        "instance": instance,
-        "decision": decision,
-        "snapshot_id": sid,
-        "selected_backend": meta.backend,
-    }))
 }
 
 /// Backend configuration for restoring an instance, taken from the policy the
@@ -2832,6 +2660,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_in_place_rejects_another_instances_snapshot() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (state, _config) = mock_backed_state(&temp);
+        let (first_id, _first_sid) = hibernate(&state).await;
+        let (_second_id, second_sid) = hibernate(&state).await;
+        let request =
+            serde_json::to_vec(&json!({ "snapshot_id": second_sid })).expect("restore request");
+
+        let error = restore_instance(&state, &first_id, &request)
+            .await
+            .expect_err("cross-instance restore must be rejected");
+
+        assert_eq!(error.status_code(), 409);
+        assert!(error.to_string().contains("belongs to source instance"));
+        assert_eq!(
+            instance_state(&state, &first_id),
+            SandboxState::Checkpointed,
+            "a rejected restore must not change source state"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_restore_leaves_the_instance_retryable() {
         let temp = tempfile::tempdir().expect("temp");
         let config = test_config(&temp);
@@ -2863,102 +2713,6 @@ mod tests {
 
         let body = body_json(restore_instance(&state, &id, b"").await.expect("retry")).await;
         assert_eq!(body["instance"]["state"], "running");
-    }
-
-    #[tokio::test]
-    async fn hatch_from_snapshot_creates_an_independent_instance() {
-        let temp = tempfile::tempdir().expect("temp");
-        let (state, _config) = mock_backed_state(&temp);
-        let created = created_json(&state, &test_request()).await;
-        let source_id = created["instance"]["id"].as_str().expect("id").to_string();
-        let body = body_json(
-            snapshot_instance(&state, &source_id, b"", SnapshotRoute::Snapshot)
-                .await
-                .expect("snapshot"),
-        )
-        .await;
-        let sid = body["snapshot"]["id"].as_str().expect("sid").to_string();
-
-        let hatched = body_json(hatch_from_snapshot(&state, &sid, b"").await.expect("hatch")).await;
-
-        let hatched_id = hatched["instance"]["id"].as_str().expect("id");
-        assert_ne!(hatched_id, source_id, "hatching mints a new instance");
-        assert_eq!(hatched["instance"]["state"], "running");
-        assert_eq!(hatched["instance"]["start_path"], "restored");
-        assert_eq!(hatched["instance"]["restored_from"], sid);
-        // The source keeps running and is untouched by hatching.
-        assert_eq!(instance_state(&state, &source_id), SandboxState::Running);
-        assert!(
-            state
-                .metrics
-                .render()
-                .contains("blaze_instances_hatched_total 1")
-        );
-    }
-
-    #[tokio::test]
-    async fn image_reference_reaches_the_hatched_instance() {
-        let temp = tempfile::tempdir().expect("temp");
-        let (state, _config) = mock_backed_state(&temp);
-        let request = serde_json::to_vec(&json!({
-            "workload_class": "agent-tool",
-            "image_digest": "sha256:ownership-test",
-            "image": "docker.io/library/alpine:latest"
-        }))
-        .expect("request");
-        let created = created_json(&state, &request).await;
-        assert_eq!(
-            created["instance"]["image"], "docker.io/library/alpine:latest",
-            "create records the requested image reference"
-        );
-        let source_id = created["instance"]["id"].as_str().expect("id").to_string();
-
-        let body = body_json(
-            snapshot_instance(&state, &source_id, b"", SnapshotRoute::Snapshot)
-                .await
-                .expect("snapshot"),
-        )
-        .await;
-        assert_eq!(
-            body["snapshot"]["image"], "docker.io/library/alpine:latest",
-            "the payload records what to provision a hatched rootfs from"
-        );
-        let sid = body["snapshot"]["id"].as_str().expect("sid").to_string();
-
-        let hatched = body_json(hatch_from_snapshot(&state, &sid, b"").await.expect("hatch")).await;
-        assert_eq!(
-            hatched["instance"]["image"], "docker.io/library/alpine:latest",
-            "a hatched instance inherits the image so it can build its own rootfs"
-        );
-    }
-
-    #[tokio::test]
-    async fn snapshot_outlives_instance_destroy_and_still_hatches() {
-        let temp = tempfile::tempdir().expect("temp");
-        let (state, _config) = mock_backed_state(&temp);
-        let created = created_json(&state, &test_request()).await;
-        let source_id = created["instance"]["id"].as_str().expect("id").to_string();
-        let body = body_json(
-            snapshot_instance(&state, &source_id, b"", SnapshotRoute::Snapshot)
-                .await
-                .expect("snapshot"),
-        )
-        .await;
-        let sid = body["snapshot"]["id"].as_str().expect("sid").to_string();
-
-        destroy_instance(&state, &source_id)
-            .await
-            .expect("destroy source");
-        assert_eq!(instance_state(&state, &source_id), SandboxState::Destroyed);
-
-        let hatched = body_json(
-            hatch_from_snapshot(&state, &sid, b"")
-                .await
-                .expect("hatch after destroy"),
-        )
-        .await;
-        assert_eq!(hatched["instance"]["state"], "running");
-        assert_eq!(hatched["snapshot_id"], sid);
     }
 
     #[tokio::test]

@@ -117,12 +117,12 @@ curl --unix-socket /run/blaze/api.sock -X POST http://localhost/v1/instances \
 ```
 
 `image_digest` remains the workload identity used for policy matching and
-warm-pool keying; `image` is the locator the backend pulls from. Snapshots
-record it so hatching can provision an identical filesystem in a new run
-directory.
+warm-pool keying; `image` is the locator the backend pulls from. The source
+instance records it so in-place restore can rebuild a missing rootfs in the
+same run directory.
 
 Only containerd's image and snapshot services are used. blaze still launches
-and owns the sandbox process, so pause, resume, snapshot, restore and hatch
+and owns the sandbox process, so pause, resume, snapshot and in-place restore
 are unaffected by where the filesystem came from.
 
 Setting `address = ""` opts out. The backend then expects a shared read-only
@@ -133,9 +133,9 @@ Two behaviours worth knowing:
 
 - runsc wraps the container root in its own overlay (`--overlay2=root:self`
   by default), so filesystem writes stay inside the sandbox and travel in the
-  checkpoint payload rather than the containerd layer. A hatched sandbox
-  therefore sees writes made before the checkpoint, and the containerd layer
-  supplies the base image only.
+  checkpoint payload rather than the containerd layer. The source instance
+  therefore sees pre-checkpoint writes after an in-place restore, while the
+  containerd layer supplies the base image only.
 - A snapshot taken with containerd enabled cannot be restored by a daemon that
   opted out: the stored spec names its rootfs relative to the bundle and there
   is nothing mounted there.
@@ -158,7 +158,6 @@ Two behaviours worth knowing:
 | GET | `/v1/snapshots` | List snapshots |
 | GET | `/v1/snapshots/{id}` | Get snapshot details |
 | DELETE | `/v1/snapshots/{id}` | Delete a snapshot |
-| POST | `/v1/snapshots/{id}/restore` | Hatch a new instance from a snapshot |
 | GET | `/v1/pools` | List warm pools |
 | GET | `/v1/pools/{backend}/{class}` | Get pool status |
 | POST | `/v1/pools/{backend}/{class}/drain` | Drain a pool |
@@ -201,4 +200,3 @@ src/blaze/
 - Linux host with root privileges for sandbox backends
 
 ## License
-

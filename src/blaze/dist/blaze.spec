@@ -20,7 +20,7 @@ Blaze is the ANOLISA per-host sandbox orchestrator daemon. It manages sandbox
 instance lifecycles via HTTP API with policy-driven backend selection, supporting
 gVisor, Firecracker microVM, Bubblewrap, and Mock backends. The gVisor backend
 supports the full lifecycle: pause, resume, snapshot (live or hibernating),
-restore in place, and hatching new instances from a snapshot. By default it
+and restore in place. By default it
 roots each sandbox in an ordinary OCI image with its own writable layer,
 provisioned through containerd. Features include warm-pool pre-allocation,
 multi-backend fallback, and Prometheus metrics export.
@@ -82,10 +82,9 @@ install -d -m 0755 %{buildroot}/var/lib/blaze/images
 %changelog
 * Sun Aug 02 2026 Weisson <Weisson@linux.alibaba.com> - 0.4.0-1
 - Add gVisor backend with the full sandbox lifecycle: pause, resume,
-  snapshot (live or hibernating), restore in place, and hatching new
-  instances from a snapshot
-- Add durable snapshot store; snapshots outlive the instance that
-  produced them and can be restored repeatedly
+  snapshot (live or hibernating), and restore in place
+- Add durable snapshot store; a source instance can restore the same
+  checkpoint repeatedly while its instance record and storage remain available
 - Root each gVisor sandbox in an ordinary OCI image with its own writable
   layer, provisioned through containerd. Enabled by default; create requests
   name the image via a new "image" field. Set [containerd] address = "" to
@@ -98,7 +97,7 @@ install -d -m 0755 %{buildroot}/var/lib/blaze/images
   address and reclaim the sandboxes it started
 - Wait for sandbox readiness on start, so an operation issued immediately
   after create no longer fails spuriously
-- Expose pause/resume/restore/hatch and snapshot counters via metrics
+- Expose pause/resume/restore and snapshot counters via metrics
 
 * Wed Jul 22 2026 Caspar Zhang <caspar@linux.alibaba.com> - 0.3.0-1
 - Add generic StorageProvider trait with pluggable backends

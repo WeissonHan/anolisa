@@ -3,7 +3,7 @@
 //!
 //! Only containerd's image and snapshot services are used. blaze still
 //! launches and owns the sandbox process itself, which is what keeps the
-//! full lifecycle (pause, resume, checkpoint, restore, hatch) under blaze's
+//! lifecycle (pause, resume, checkpoint, and in-place restore) under blaze's
 //! control rather than a shim's.
 //!
 //! containerd is driven through `ctr` rather than its gRPC API: the three

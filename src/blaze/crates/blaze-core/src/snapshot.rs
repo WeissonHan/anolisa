@@ -2,9 +2,8 @@
 //! Durable snapshot store.
 //!
 //! A snapshot is a backend-written checkpoint payload plus store-owned
-//! metadata. Snapshots deliberately outlive the instance that produced
-//! them so a single image can be restored in place, restored repeatedly,
-//! or used to hatch new instances after the source is destroyed.
+//! metadata. A ready payload can restore its source instance repeatedly;
+//! metadata remains durable until the payload is explicitly deleted.
 //!
 //! Unlike [`crate::template`] this store is persistent: metadata is
 //! written with the same tmp-then-rename discipline as
@@ -37,30 +36,25 @@ pub enum SnapshotStatus {
 
 /// Durable description of one checkpoint image.
 ///
-/// `workload_class`, `image_digest` and `policy_name` are what let a
-/// snapshot be policy-evaluated afresh after the source instance's
-/// `state.json` is gone, which is what makes hatching self-sufficient.
+/// Workload and policy fields preserve checkpoint provenance and let restore
+/// recover the backend configuration used by the source instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMeta {
     pub id: Uuid,
     pub status: SnapshotStatus,
     /// Backend that wrote the payload; only this kind can restore it.
     pub backend: BackendKind,
-    /// Provenance only — the snapshot stays valid after this instance dies.
+    /// Instance whose lifecycle this checkpoint can restore.
     pub source_instance: Uuid,
     pub workload_class: WorkloadClass,
     pub image_digest: String,
-    /// Image reference the source rootfs came from. Hatching needs it because
-    /// the new instance's run directory has no filesystem yet.
-    #[serde(default)]
-    pub image: Option<String>,
     pub policy_name: String,
     /// False when the source was hibernated into this image.
     pub left_running: bool,
     pub compression: SnapshotCompression,
     pub size_bytes: u64,
     pub created_at: DateTime<Utc>,
-    /// Instances restored or hatched from this image, oldest first.
+    /// Source instances restored from this image, oldest first.
     #[serde(default)]
     pub restored_by: Vec<Uuid>,
     #[serde(default)]
@@ -87,7 +81,6 @@ impl SnapshotMeta {
             source_instance,
             workload_class,
             image_digest,
-            image: None,
             policy_name,
             left_running: false,
             compression,
@@ -213,7 +206,7 @@ impl SnapshotStore {
         ready
     }
 
-    /// Record that `instance` was restored or hatched from `id`.
+    /// Record that the source `instance` was restored from `id`.
     ///
     /// # Errors
     /// Returns an error when `id` is unknown or metadata cannot be written.
@@ -290,7 +283,6 @@ mod tests {
 
         pending.size_bytes = 4096;
         pending.left_running = true;
-        pending.image = Some("docker.io/library/alpine:latest".to_string());
         store.commit(pending).expect("commit");
 
         let listed = store.list();
@@ -299,13 +291,8 @@ mod tests {
         assert_eq!(listed[0].status, SnapshotStatus::Ready);
         assert_eq!(listed[0].size_bytes, 4096);
 
-        // Hatching reads the image reference back from disk, so it has to
-        // survive a reopen rather than only living in the in-memory index.
         let reopened = SnapshotStore::open(temp.path()).expect("reopen");
-        assert_eq!(
-            reopened.list()[0].image.as_deref(),
-            Some("docker.io/library/alpine:latest")
-        );
+        assert_eq!(reopened.list()[0].id, id);
     }
 
     #[test]

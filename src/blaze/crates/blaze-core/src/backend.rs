@@ -145,16 +145,15 @@ pub struct SnapshotArtifacts {
 /// Complete input for re-establishing a sandbox from a checkpoint.
 #[derive(Debug, Clone)]
 pub struct RestoreRequest {
-    /// Instance that will own the restored sandbox. Differs from the
-    /// snapshot's source instance when hatching a new sandbox.
+    /// Source instance that will own the restored sandbox.
     pub instance_id: Uuid,
     /// Backend kind recorded in the snapshot; must match the spawner.
     pub kind: BackendKind,
     /// Provider-owned runtime directory.
     pub run_dir: PathBuf,
     pub binary_path: PathBuf,
-    /// Image reference recorded when the snapshot was taken. A hatched
-    /// sandbox needs it because its run directory has no rootfs yet.
+    /// Image reference recorded by the source instance. Restore uses it to
+    /// rebuild a missing rootfs in the same run directory.
     pub image: Option<String>,
     /// Payload root previously handed to [`SnapshotRequest::snapshot_dir`].
     pub snapshot_dir: PathBuf,

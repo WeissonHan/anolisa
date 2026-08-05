@@ -37,8 +37,8 @@ workload_class = "agent-rl"
 # (probe order: firecracker, gvisor, bubblewrap, mock); this list filters
 # that choice, so name every backend you are willing to run on — a request
 # is rejected with 503 when the selected data plane is not listed here.
-# gvisor comes first because it is the backend with working snapshot,
-# restore and hatch, which is what rollout reuse depends on.
+# gvisor comes first because it is the backend with working snapshot and
+# in-place restore, which is what checkpointed rollout reuse depends on.
 # Options: firecracker, gvisor, gvisor-substrate, rund, kata-fc, kata-clh,
 #          kata-qemu, runc, bubblewrap.
 backend_priority = ["gvisor", "firecracker", "bubblewrap"]

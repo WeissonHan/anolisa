@@ -14,9 +14,8 @@
 - 暂停与恢复运行中的 sandbox：`POST /v1/instances/{id}/pause` 与 `/resume`。
 - 将 sandbox 快照写入持久化快照库：`POST /v1/instances/{id}/snapshot` 默认保持 sandbox
   继续运行，传 `{"leave_running": false}` 则休眠。
-- 用 `POST /v1/instances/{id}/restore` 原地恢复已休眠的 sandbox；用
-  `POST /v1/snapshots/{id}/restore` 从任意快照孵化全新实例。快照的生命周期长于产生它的
-  实例，因此同一镜像可反复恢复，源实例销毁后依然可用。
+- 用 `POST /v1/instances/{id}/restore` 原地恢复已休眠的 sandbox。恢复不会消耗
+  checkpoint，因此在源实例记录和存储仍然可用时，同一源实例可以反复恢复。
 - 通过 `GET /v1/snapshots`、`GET /v1/snapshots/{id}` 与 `DELETE /v1/snapshots/{id}`
   查看和回收快照。若某镜像是休眠 sandbox 唯一的恢复途径，删除会被拒绝而不会将其搁死。
 - gVisor 后端实现上述四个操作；策略中的 `[checkpoint].enabled = false` 现在会真正拒绝快照。
@@ -27,12 +26,11 @@
   目录——没有任何包提供它。
 - 创建请求支持 `image` 镜像引用，例如 `{"image": "docker.io/library/alpine:latest"}`。
   `image_digest` 仍是策略匹配与 warm pool 配对所用的负载身份，`image` 则是后端准备文件
-  系统时的定位符。快照会记录它，因此孵化能在全新的运行目录里构建出一致的文件系统。
+  系统时的定位符。源实例会记录它，使原地恢复可以在同一运行目录缺少 rootfs 时重新准备文件系统。
 - 包内策略的 `backend_priority` 已包含 `gvisor`，数据面为 gVisor 的机器不再被拒（503）。
 - 新增计数器：`blaze_instances_paused_total`、`blaze_instances_resumed_total`、
-  `blaze_instances_restored_total`、`blaze_instances_hatched_total`、
-  `blaze_snapshots_created_total`、`blaze_snapshots_failed_total`、
-  `blaze_snapshots_deleted_total`。
+  `blaze_instances_restored_total`、`blaze_snapshots_created_total`、
+  `blaze_snapshots_failed_total`、`blaze_snapshots_deleted_total`。
 
 ### 变更
 
