@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use blaze_core::backend::{RestoreRequest, SnapshotKind};
+use blaze_core::backend::{RestoreNetwork, RestoreRequest, SnapshotKind};
 use blaze_core::checkpoint::validate_checkpoint_id;
 use blaze_core::lifecycle::{BackendOwnership, OperationPhase, SandboxInstance, SandboxState};
 use blaze_core::storage::StorageRestoreTransaction;
@@ -262,7 +262,7 @@ impl SandboxManager {
                         expected_version: target.metadata.backend_version.clone(),
                         snapshot_kind: target.metadata.snapshot_kind,
                         expose_guest_socket: target.metadata.expose_guest_socket,
-                        network_slot: target.metadata.network_slot,
+                        network: RestoreNetwork::from(target.metadata.network_slot),
                     })
                     .await
             }

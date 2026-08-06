@@ -112,6 +112,30 @@ pub struct RestoreCapability {
     pub snapshot_kind: SnapshotKind,
 }
 
+/// Host-network allocation required before loading a runtime snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreNetwork {
+    /// The captured runtime has no host network device.
+    Disabled,
+    /// Allocate a new isolated network when restoring into a new sandbox.
+    Fresh,
+    /// Recreate the exact slot whose device names are embedded in a snapshot.
+    Fixed(usize),
+}
+
+impl RestoreNetwork {
+    /// Return whether restore must create host-side network resources.
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+impl From<Option<usize>> for RestoreNetwork {
+    fn from(slot: Option<usize>) -> Self {
+        slot.map_or(Self::Disabled, Self::Fixed)
+    }
+}
+
 /// Complete input for restoring an owned backend instance.
 #[derive(Debug, Clone)]
 pub struct RestoreRequest {
@@ -135,8 +159,8 @@ pub struct RestoreRequest {
     pub snapshot_kind: SnapshotKind,
     /// Whether the captured runtime exposed the stable run-directory guest transport.
     pub expose_guest_socket: bool,
-    /// Stable host-network slot whose device names are embedded in the snapshot.
-    pub network_slot: Option<usize>,
+    /// Host network allocation required before the snapshot can be loaded.
+    pub network: RestoreNetwork,
 }
 
 /// Snapshot flavor requested from a backend.

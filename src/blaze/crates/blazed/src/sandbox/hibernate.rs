@@ -6,7 +6,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use blaze_core::backend::{BackendKind, RestoreRequest, SnapshotKind, SnapshotRequest};
+use blaze_core::backend::{
+    BackendKind, RestoreNetwork, RestoreRequest, SnapshotKind, SnapshotRequest,
+};
 use blaze_core::checkpoint::CheckpointArtifact;
 use blaze_core::lifecycle::{BackendOwnership, OperationPhase, SandboxInstance, SandboxState};
 use serde::{Deserialize, Serialize};
@@ -480,7 +482,7 @@ impl SandboxManager {
                             expected_version: manifest.backend_version.clone(),
                             snapshot_kind: manifest.snapshot_kind,
                             expose_guest_socket: manifest.expose_guest_socket,
-                            network_slot: manifest.network_slot,
+                            network: RestoreNetwork::from(manifest.network_slot),
                         })
                         .await
                 }

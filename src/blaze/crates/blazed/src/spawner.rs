@@ -421,7 +421,7 @@ impl BackendSpawner for MockSpawner {
             expected_version,
             snapshot_kind,
             expose_guest_socket,
-            network_slot: _,
+            network: _,
             ..
         } = request;
         if checkpoint_backend != BackendKind::Mock
@@ -1271,7 +1271,7 @@ mod tests {
             expected_version: None,
             snapshot_kind: SnapshotKind::Full,
             expose_guest_socket: true,
-            network_slot: None,
+            network: blaze_core::backend::RestoreNetwork::Disabled,
         };
 
         assert!(

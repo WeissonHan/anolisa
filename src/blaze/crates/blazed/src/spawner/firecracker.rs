@@ -2,6 +2,8 @@
 //! Firecracker process ownership and HTTP API over Unix domain sockets.
 
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -10,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use blaze_core::backend::{
-    BackendKind, RestoreCapability, RestoreRequest, SnapshotKind, SnapshotRequest, SnapshotResult,
-    SpawnRequest,
+    BackendKind, RestoreCapability, RestoreNetwork, RestoreRequest, SnapshotKind, SnapshotRequest,
+    SnapshotResult, SpawnRequest,
 };
 use blaze_core::policy::{FirecrackerConfig, VmConfig, parse_memory_value, to_mib_ceil};
 use blaze_core::{BlazeError, Result};
@@ -36,6 +38,22 @@ use super::{
 
 const NETWORK_BOOT_IP: &str = "ip=169.254.0.2::169.254.0.1:255.255.255.252::eth0:off";
 const MAX_API_RESPONSE_BYTES: usize = 64 * 1024;
+const PORTABLE_ROOTFS_PATH: &str = "/run/blaze-snapshot-view/rootfs.ext4";
+const PORTABLE_RUNTIME_PATH: &str = "/run/blaze-snapshot-view/runtime";
+#[cfg(target_os = "linux")]
+const MOUNT_AND_EXEC: &str = r#"set -eu
+rootfs_source=$1
+rootfs_target=$2
+runtime_source=$3
+runtime_target=$4
+binary=$5
+api_socket=$6
+instance_id=$7
+shift 7
+mount --bind "$rootfs_source" "$rootfs_target"
+mount --bind "$runtime_source" "$runtime_target"
+exec "$binary" --api-sock "$api_socket" --id "$instance_id" "$@"
+"#;
 
 /// Firecracker backend factory.
 pub struct FirecrackerSpawner {
@@ -125,6 +143,7 @@ impl FirecrackerSpawner {
         if let Some(restore) = &restore {
             validate_restore_compatibility(restore, &capture.backend_version)?;
         }
+        prepare_portable_view_targets().await?;
         tokio::fs::create_dir_all(&request.run_dir).await?;
         let guest_socket = request.run_dir.join("vsock.uds");
         let pid_file = request.run_dir.join("firecracker.pid");
@@ -152,20 +171,23 @@ impl FirecrackerSpawner {
                 }
                 .into());
             }
-            let created = match restore.as_ref().and_then(|restore| restore.network_slot) {
-                Some(slot) => {
+            let created = match restore.as_ref().map(|restore| restore.network) {
+                Some(RestoreNetwork::Fixed(slot)) => {
                     self.network
                         .create_at(request.instance_id, slot, |slot| {
                             write_network_metadata(&network_file, slot)
                         })
                         .await
                 }
-                None => {
+                None | Some(RestoreNetwork::Fresh) => {
                     self.network
                         .create(request.instance_id, |slot| {
                             write_network_metadata(&network_file, slot)
                         })
                         .await
+                }
+                Some(RestoreNetwork::Disabled) => {
+                    unreachable!("disabled restore networking is not allocated")
                 }
             };
             match created {
@@ -249,13 +271,19 @@ impl FirecrackerSpawner {
             None
         };
 
-        let mut command = build_launch_command(&request.binary_path, network.as_ref(), &api_socket);
+        let mut command = build_launch_command(
+            &request.binary_path,
+            network.as_ref(),
+            &api_socket,
+            &request.storage.rootfs_path,
+            &request.run_dir,
+        );
         if restore.is_none() {
             let config_path = match write_vm_config(
                 &self.images_dir,
                 &request,
                 &fc_config,
-                &guest_socket,
+                &Path::new(PORTABLE_RUNTIME_PATH).join("vsock.uds"),
                 network.as_ref(),
             ) {
                 Ok(path) => path,
@@ -467,12 +495,12 @@ impl BackendSpawner for FirecrackerSpawner {
             expected_version,
             snapshot_kind,
             expose_guest_socket,
-            network_slot,
+            network,
         } = request;
         let backend = blaze_core::policy::BackendConfigs {
             firecracker: Some(blaze_core::policy::FirecrackerConfig {
                 enable_vsock: expose_guest_socket,
-                enable_network: network_slot.is_some(),
+                enable_network: network.is_enabled(),
                 ..blaze_core::policy::FirecrackerConfig::default()
             }),
         };
@@ -494,14 +522,18 @@ impl BackendSpawner for FirecrackerSpawner {
                 expected_version,
                 snapshot_kind,
                 expose_guest_socket,
-                network_slot,
+                network,
             }),
         )
         .await
     }
 
     async fn probe(&self, binary_path: &Path) -> Result<bool> {
-        if !binary_path.is_file() || !executable_in_path("unshare") {
+        if !binary_path.is_file()
+            || !executable_in_path("unshare")
+            || !executable_in_path("mount")
+            || !executable_in_path("sh")
+        {
             return Ok(false);
         }
         if !self.network_probe_ready().await? {
@@ -587,7 +619,19 @@ impl FirecrackerInstance {
     }
 
     async fn load_snapshot(&self, restore: &FirecrackerRestore) -> Result<()> {
-        self.capture.api.load_snapshot(restore).await
+        let tap_name = self
+            .network
+            .lock()
+            .await
+            .as_ref()
+            .map(|network| network.tap_name().to_string());
+        let guest_socket = restore
+            .expose_guest_socket
+            .then(|| Path::new(PORTABLE_RUNTIME_PATH).join("vsock.uds"));
+        self.capture
+            .api
+            .load_snapshot(restore, tap_name.as_deref(), guest_socket.as_deref())
+            .await
     }
 }
 
@@ -733,7 +777,7 @@ struct FirecrackerRestore {
     expected_version: Option<String>,
     snapshot_kind: SnapshotKind,
     expose_guest_socket: bool,
-    network_slot: Option<usize>,
+    network: RestoreNetwork,
 }
 
 impl FirecrackerCapture {
@@ -756,20 +800,33 @@ impl FirecrackerApiClient {
         Self { socket, timeout }
     }
 
-    async fn load_snapshot(&self, restore: &FirecrackerRestore) -> Result<()> {
-        self.call_json(
-            Method::PUT,
-            "/snapshot/load",
-            Some(serde_json::json!({
-                "snapshot_path": path_string(&restore.snapshot_path, "VM-state snapshot")?,
-                "mem_backend": {
-                    "backend_type": "File",
-                    "backend_path": path_string(&restore.mem_path, "memory snapshot")?
-                },
-                "resume_vm": true
-            })),
-        )
-        .await?;
+    async fn load_snapshot(
+        &self,
+        restore: &FirecrackerRestore,
+        tap_name: Option<&str>,
+        guest_socket: Option<&Path>,
+    ) -> Result<()> {
+        let mut payload = serde_json::json!({
+            "snapshot_path": path_string(&restore.snapshot_path, "VM-state snapshot")?,
+            "mem_backend": {
+                "backend_type": "File",
+                "backend_path": path_string(&restore.mem_path, "memory snapshot")?
+            },
+            "resume_vm": true
+        });
+        if let Some(tap_name) = tap_name {
+            payload["network_overrides"] = serde_json::json!([{
+                "iface_id": "eth0",
+                "host_dev_name": tap_name
+            }]);
+        }
+        if let Some(guest_socket) = guest_socket {
+            payload["vsock_override"] = serde_json::json!({
+                "uds_path": path_string(guest_socket, "guest socket")?
+            });
+        }
+        self.call_json(Method::PUT, "/snapshot/load", Some(payload))
+            .await?;
         Ok(())
     }
 
@@ -913,11 +970,7 @@ fn write_vm_config(
     guest_socket: &Path,
     network: Option<&NetworkSlot>,
 ) -> Result<PathBuf> {
-    let vcpus = config
-        .vcpus
-        .or(request.vm.as_ref().map(|vm| vm.vcpus))
-        .unwrap_or(1);
-    let memory_mib = resolve_memory(config, request.vm.as_ref())?;
+    let (vcpus, memory_mib) = effective_vm_shape(config, request.vm.as_ref())?;
     let mut boot_args = config.boot_args.clone();
     if network.is_some() {
         let network_arguments = boot_args
@@ -951,7 +1004,7 @@ fn write_vm_config(
         },
         "drives": [{
             "drive_id": "rootfs",
-            "path_on_host": path_string(&request.storage.rootfs_path, "rootfs")?,
+            "path_on_host": PORTABLE_ROOTFS_PATH,
             "is_root_device": true,
             "is_read_only": false
         }],
@@ -983,23 +1036,27 @@ fn write_vm_config(
     Ok(path)
 }
 
-fn resolve_memory(config: &FirecrackerConfig, vm: Option<&VmConfig>) -> Result<u64> {
+fn effective_vm_shape(config: &FirecrackerConfig, vm: Option<&VmConfig>) -> Result<(u32, u64)> {
+    let vcpus = config.vcpus.or(vm.map(|vm| vm.vcpus)).unwrap_or(1);
     let value = config
         .memory
         .as_deref()
         .or_else(|| vm.map(|vm| vm.memory.as_str()))
         .unwrap_or("256Mi");
-    parse_memory_value(value)
+    let memory_mib = parse_memory_value(value)
         .map(to_mib_ceil)
         .map_err(|error| BlazeError::BackendError {
             msg: format!("invalid Firecracker memory {value:?}: {error}"),
-        })
+        })?;
+    Ok((vcpus, memory_mib))
 }
 
 fn build_launch_command(
     binary: &Path,
     network: Option<&NetworkSlot>,
     api_socket: &Path,
+    rootfs_source: &Path,
+    runtime_source: &Path,
 ) -> Command {
     #[cfg(target_os = "linux")]
     let mut command = if let Some(network) = network {
@@ -1012,8 +1069,7 @@ fn build_launch_command(
             .arg("--mount")
             .arg("--propagation")
             .arg("private")
-            .arg("--")
-            .arg(binary);
+            .arg("--");
         command
     } else {
         let mut command = Command::new("unshare");
@@ -1021,25 +1077,134 @@ fn build_launch_command(
             .arg("--mount")
             .arg("--propagation")
             .arg("private")
-            .arg("--")
-            .arg(binary);
+            .arg("--");
         command
     };
     #[cfg(not(target_os = "linux"))]
     let mut command = {
-        let _ = network;
+        let _ = (network, rootfs_source, runtime_source);
         Command::new(binary)
     };
-    command.arg("--api-sock").arg(api_socket);
-    command.arg("--id").arg(format!(
+    let instance_id = format!(
         "fc-{}",
         api_socket
             .parent()
             .and_then(Path::file_name)
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("blaze")
-    ));
+    );
+    #[cfg(target_os = "linux")]
     command
+        .arg("sh")
+        .arg("-c")
+        .arg(MOUNT_AND_EXEC)
+        .arg("blaze-firecracker")
+        .arg(rootfs_source)
+        .arg(PORTABLE_ROOTFS_PATH)
+        .arg(runtime_source)
+        .arg(PORTABLE_RUNTIME_PATH)
+        .arg(binary)
+        .arg(api_socket)
+        .arg(instance_id);
+    #[cfg(not(target_os = "linux"))]
+    command
+        .arg("--api-sock")
+        .arg(api_socket)
+        .arg("--id")
+        .arg(instance_id);
+    command
+}
+
+#[cfg(target_os = "linux")]
+async fn prepare_portable_view_targets() -> Result<()> {
+    let target = Path::new(PORTABLE_ROOTFS_PATH);
+    let parent = target.parent().expect("portable rootfs parent");
+    match tokio::fs::symlink_metadata(parent).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "portable Firecracker directory {} is not a plain directory",
+                    parent.display()
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::create_dir(parent).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = tokio::fs::symlink_metadata(parent).await?;
+    let expected_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != expected_uid {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "portable Firecracker directory {} has unexpected ownership or type",
+                parent.display()
+            ),
+        });
+    }
+    tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(target)
+        .await?;
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() || metadata.uid() != expected_uid {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "portable Firecracker rootfs target {} has unexpected ownership or type",
+                target.display()
+            ),
+        });
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .await?;
+    let runtime = Path::new(PORTABLE_RUNTIME_PATH);
+    match tokio::fs::symlink_metadata(runtime).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "portable Firecracker runtime target {} is not a plain directory",
+                    runtime.display()
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::create_dir(runtime).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = tokio::fs::symlink_metadata(runtime).await?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != expected_uid {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "portable Firecracker runtime target {} has unexpected ownership or type",
+                runtime.display()
+            ),
+        });
+    }
+    tokio::fs::set_permissions(runtime, std::fs::Permissions::from_mode(0o700)).await?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn prepare_portable_view_targets() -> Result<()> {
+    Ok(())
 }
 
 fn configure_logs(command: &mut Command, run_dir: &Path, serial_log: bool) -> Result<()> {
@@ -1410,7 +1575,7 @@ mod tests {
             expected_version: Some("Firecracker v1.16.0".to_string()),
             snapshot_kind: SnapshotKind::Full,
             expose_guest_socket: false,
-            network_slot: None,
+            network: RestoreNetwork::Disabled,
         };
 
         validate_restore_compatibility(&restore, "Firecracker v1.16.0").expect("matching version");
@@ -1680,7 +1845,7 @@ mod tests {
                 expected_version: Some("Firecracker v1.16.0".to_string()),
                 snapshot_kind: SnapshotKind::Full,
                 expose_guest_socket: false,
-                network_slot: None,
+                network: RestoreNetwork::Disabled,
             })
             .await
         {
@@ -1738,7 +1903,7 @@ mod tests {
                 expected_version: Some("Firecracker v1.16.0".to_string()),
                 snapshot_kind: SnapshotKind::Full,
                 expose_guest_socket: false,
-                network_slot: None,
+                network: RestoreNetwork::Disabled,
             })
             .await
             .expect("load snapshot");
@@ -1760,6 +1925,39 @@ mod tests {
             )]
         );
         instance.kill().await.expect("kill");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn snapshot_load_rebinds_a_restored_network() {
+        let temp = tempfile::tempdir().expect("temp");
+        let api_socket = temp.path().join("api.sock");
+        let observed = spawn_api(&api_socket, 1).await;
+        let snapshot_path = temp.path().join("vmstate.snap");
+        let mem_path = temp.path().join("memory.snap");
+        let restore = FirecrackerRestore {
+            snapshot_path: snapshot_path.clone(),
+            mem_path: mem_path.clone(),
+            backend: BackendKind::Firecracker,
+            expected_version: Some("Firecracker v1.16.0".to_string()),
+            snapshot_kind: SnapshotKind::Full,
+            expose_guest_socket: false,
+            network: RestoreNetwork::Fresh,
+        };
+
+        FirecrackerApiClient::new(api_socket, Duration::from_secs(1))
+            .load_snapshot(&restore, Some("tap0"), None)
+            .await
+            .expect("load snapshot");
+
+        let calls = observed.await.expect("observed call");
+        assert_eq!(
+            calls[0].2["network_overrides"],
+            serde_json::json!([{
+                "iface_id": "eth0",
+                "host_dev_name": "tap0"
+            }])
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1804,7 +2002,7 @@ mod tests {
                 expected_version: Some("Firecracker v1.16.0".to_string()),
                 snapshot_kind: SnapshotKind::Full,
                 expose_guest_socket: true,
-                network_slot: None,
+                network: RestoreNetwork::Disabled,
             })
             .await
             .expect("load snapshot");
@@ -1822,6 +2020,9 @@ mod tests {
                         "backend_path": mem_path,
                     },
                     "resume_vm": true,
+                    "vsock_override": {
+                        "uds_path": Path::new(PORTABLE_RUNTIME_PATH).join("vsock.uds"),
+                    },
                 }),
             )]
         );
@@ -1872,7 +2073,7 @@ mod tests {
             expected_version: Some("Firecracker v1.16.0".to_string()),
             snapshot_kind: SnapshotKind::Full,
             expose_guest_socket: true,
-            network_slot: None,
+            network: RestoreNetwork::Disabled,
         };
 
         let load_error = instance
@@ -2055,6 +2256,36 @@ mod tests {
             serde_json::from_slice(&std::fs::read(path).expect("read config"))
                 .expect("parse config");
         assert!(value.get("network-interfaces").is_none());
+        assert_eq!(value["drives"][0]["path_on_host"], PORTABLE_ROOTFS_PATH);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_command_binds_owned_resources_to_portable_paths() {
+        let temp = tempfile::tempdir().expect("temp");
+        let binary = temp.path().join("firecracker");
+        let api_socket = temp.path().join("run/api.sock");
+        let rootfs = temp.path().join("slot/rootfs.ext4");
+        let runtime = temp.path().join("run");
+        let config = runtime.join("vmconfig.json");
+
+        let mut command = build_launch_command(&binary, None, &api_socket, &rootfs, &runtime);
+        command.arg("--config-file").arg(&config);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args.iter().any(|arg| arg == &rootfs.to_string_lossy()));
+        assert!(args.iter().any(|arg| arg == PORTABLE_ROOTFS_PATH));
+        assert!(args.iter().any(|arg| arg == &runtime.to_string_lossy()));
+        assert!(args.iter().any(|arg| arg == PORTABLE_RUNTIME_PATH));
+        assert!(args.ends_with(&[
+            "--config-file".to_string(),
+            config.to_string_lossy().into_owned(),
+        ]));
+        assert!(MOUNT_AND_EXEC.contains("\"$@\""));
     }
 
     #[test]
