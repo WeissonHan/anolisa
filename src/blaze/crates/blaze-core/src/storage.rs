@@ -5,6 +5,7 @@
 //! (warm pools, copy-on-write, content-addressable dedup) but present
 //! a uniform interface to the daemon layer.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -66,6 +67,40 @@ pub struct AcquireOpts {
     pub mem_size: u64,
 }
 
+/// One already-open runtime-template artifact.
+///
+/// The open file object binds later materialization to the object that was
+/// validated by the catalog, even if its catalog path is replaced afterward.
+#[derive(Debug)]
+pub struct RuntimeTemplateArtifact {
+    /// Stable source object positioned at the beginning of the artifact.
+    pub file: File,
+    /// Exact byte length recorded by the template manifest.
+    pub size_bytes: u64,
+    /// Lowercase SHA-256 digest recorded by the template manifest.
+    pub sha256: String,
+}
+
+/// Self-contained artifacts needed to restore one runtime template.
+#[derive(Debug)]
+pub struct RuntimeTemplateStorage {
+    /// Backend VM-state snapshot.
+    pub vmstate: RuntimeTemplateArtifact,
+    /// Guest-memory snapshot.
+    pub memory: RuntimeTemplateArtifact,
+    /// Independent root filesystem snapshot.
+    pub rootfs: RuntimeTemplateArtifact,
+}
+
+/// Provider-owned storage produced from one runtime template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTemplateStorageSlot {
+    /// Writable storage owned by the new sandbox.
+    pub storage: StorageSlot,
+    /// Provider-owned backend VM-state snapshot.
+    pub snapshot_path: PathBuf,
+}
+
 /// Storage allocation failure with an optional residual slot owner.
 ///
 /// A provider returns `residual` only when rollback could not remove resources
@@ -119,6 +154,26 @@ pub trait StorageProvider: Send + Sync {
         &self,
         opts: &AcquireOpts,
     ) -> std::result::Result<StorageSlot, StorageAcquireError>;
+
+    /// Materialize a self-contained runtime template into a new owned slot.
+    ///
+    /// Providers must not retain paths into the catalog. Every artifact used
+    /// by the restored sandbox must be copied into provider-owned storage.
+    async fn acquire_runtime_template(
+        &self,
+        opts: &AcquireOpts,
+        source: RuntimeTemplateStorage,
+    ) -> std::result::Result<RuntimeTemplateStorageSlot, StorageAcquireError> {
+        let _ = (opts, source);
+        Err(StorageAcquireError::clean(BlazeError::StorageError {
+            msg: "storage provider does not support runtime templates".to_string(),
+        }))
+    }
+
+    /// Report whether runtime-template materialization is implemented.
+    fn supports_runtime_templates(&self) -> bool {
+        false
+    }
 
     /// Release a storage slot (cleanup all associated resources).
     async fn release(&self, slot: StorageSlot) -> Result<()>;

@@ -4,14 +4,18 @@
 //! instance slots use separate roots; runtime pooling is owned by the daemon.
 
 use std::ffi::OsString;
+use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use blaze_core::error::{BlazeError, Result};
 use blaze_core::storage::{
-    AcquireOpts, PoolStatus, StorageAcquireError, StorageProvider, StorageRestoreTransaction,
+    AcquireOpts, PoolStatus, RuntimeTemplateArtifact, RuntimeTemplateStorage,
+    RuntimeTemplateStorageSlot, StorageAcquireError, StorageProvider, StorageRestoreTransaction,
     StorageSlot,
 };
 
@@ -242,6 +246,97 @@ impl StorageProvider for FileStorageProvider {
         }
 
         Ok(slot)
+    }
+
+    async fn acquire_runtime_template(
+        &self,
+        opts: &AcquireOpts,
+        source: RuntimeTemplateStorage,
+    ) -> std::result::Result<RuntimeTemplateStorageSlot, StorageAcquireError> {
+        crate::failpoint::storage("storage-acquire-runtime-template")?;
+        if opts.rootfs_size != source.rootfs.size_bytes || opts.mem_size != source.memory.size_bytes
+        {
+            return Err(StorageAcquireError::clean(BlazeError::StorageError {
+                msg: format!(
+                    "acquire runtime template '{}': requested sizes do not match the template",
+                    opts.instance_id
+                ),
+            }));
+        }
+
+        let slot = self.slot_for_id(&opts.instance_id)?;
+        let instance_dir = slot.instance_dir.clone();
+        match tokio::fs::create_dir(&instance_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(StorageAcquireError::clean(BlazeError::StorageError {
+                    msg: format!(
+                        "acquire runtime template '{}': instance directory already exists",
+                        opts.instance_id
+                    ),
+                }));
+            }
+            Err(error) => {
+                return Err(StorageAcquireError::clean(BlazeError::StorageError {
+                    msg: format!(
+                        "acquire runtime template '{}': create dir: {error}",
+                        opts.instance_id
+                    ),
+                }));
+            }
+        }
+
+        let snapshot_path = instance_dir.join("vmstate.snap");
+        let result = async {
+            copy_runtime_template_artifact(source.rootfs, &slot.rootfs_path).await?;
+            copy_runtime_template_artifact(source.memory, &slot.mem_path).await?;
+            copy_runtime_template_artifact(source.vmstate, &snapshot_path).await?;
+            create_empty_durable_file(&slot.mem_diff_path).await?;
+            create_empty_durable_file(&slot.rootfs_diff_path).await?;
+            crate::failpoint::storage("storage-acquire-runtime-template-artifacts")?;
+            tokio::fs::File::open(&instance_dir)
+                .await?
+                .sync_all()
+                .await?;
+            Ok::<(), BlazeError>(())
+        }
+        .await;
+
+        if let Err(error) = result {
+            let rollback = match crate::failpoint::storage("storage-acquire-rollback") {
+                Ok(()) => tokio::fs::remove_dir_all(&instance_dir)
+                    .await
+                    .map_err(BlazeError::from),
+                Err(cleanup) => Err(cleanup),
+            };
+            return match rollback {
+                Ok(()) => Err(StorageAcquireError::clean(BlazeError::StorageError {
+                    msg: format!(
+                        "acquire runtime template '{}': artifact setup failed, rolled back: {error}",
+                        opts.instance_id
+                    ),
+                })),
+                Err(cleanup) => Err(StorageAcquireError::with_residual(
+                    BlazeError::StorageError {
+                        msg: format!(
+                            "acquire runtime template '{}': artifact setup failed ({error}); rollback failed for {}: {cleanup}",
+                            opts.instance_id,
+                            instance_dir.display()
+                        ),
+                    },
+                    slot,
+                )),
+            };
+        }
+
+        Ok(RuntimeTemplateStorageSlot {
+            storage: slot,
+            snapshot_path,
+        })
+    }
+
+    fn supports_runtime_templates(&self) -> bool {
+        true
     }
 
     async fn release(&self, slot: StorageSlot) -> Result<()> {
@@ -516,6 +611,89 @@ async fn create_or_copy(
     Ok(())
 }
 
+async fn copy_runtime_template_artifact(
+    source: RuntimeTemplateArtifact,
+    target: &Path,
+) -> Result<()> {
+    let metadata = source
+        .file
+        .metadata()
+        .map_err(|error| BlazeError::StorageError {
+            msg: format!("inspect runtime template artifact: {error}"),
+        })?;
+    if !metadata.is_file() || metadata.len() != source.size_bytes {
+        return Err(BlazeError::StorageError {
+            msg: format!(
+                "runtime template artifact has size {}; expected {}",
+                metadata.len(),
+                source.size_bytes
+            ),
+        });
+    }
+
+    let mut source_file = tokio::fs::File::from_std(source.file);
+    source_file.seek(SeekFrom::Start(0)).await?;
+    let mut destination = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .await?;
+    let mut digest = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = source_file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| BlazeError::StorageError {
+                msg: "runtime template artifact size overflow".to_string(),
+            })?;
+        if copied > source.size_bytes {
+            return Err(BlazeError::StorageError {
+                msg: format!(
+                    "runtime template artifact exceeds declared size {}",
+                    source.size_bytes
+                ),
+            });
+        }
+        digest.update(&buffer[..read]);
+        destination.write_all(&buffer[..read]).await?;
+    }
+    if copied != source.size_bytes {
+        return Err(BlazeError::StorageError {
+            msg: format!(
+                "runtime template artifact has {copied} bytes; expected {}",
+                source.size_bytes
+            ),
+        });
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if actual != source.sha256 {
+        return Err(BlazeError::StorageError {
+            msg: format!(
+                "runtime template artifact digest mismatch: expected {}, got {actual}",
+                source.sha256
+            ),
+        });
+    }
+    destination.sync_all().await?;
+    Ok(())
+}
+
+async fn create_empty_durable_file(path: &Path) -> Result<()> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await?
+        .sync_all()
+        .await?;
+    Ok(())
+}
+
 async fn canonical_plain_path(path: &Path, required_type: RequiredPathType) -> Result<PathBuf> {
     let metadata =
         tokio::fs::symlink_metadata(path)
@@ -641,6 +819,24 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    fn runtime_template_artifact(root: &Path, name: &str, bytes: &[u8]) -> RuntimeTemplateArtifact {
+        let path = root.join(name);
+        std::fs::write(&path, bytes).expect("template artifact");
+        RuntimeTemplateArtifact {
+            file: std::fs::File::open(path).expect("open template artifact"),
+            size_bytes: u64::try_from(bytes.len()).expect("artifact length"),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
+    }
+
+    fn runtime_template_storage(root: &Path) -> RuntimeTemplateStorage {
+        RuntimeTemplateStorage {
+            vmstate: runtime_template_artifact(root, "source-vmstate", b"snapshot"),
+            memory: runtime_template_artifact(root, "source-memory", b"memory"),
+            rootfs: runtime_template_artifact(root, "source-rootfs", b"rootfs"),
+        }
+    }
+
     async fn checkpoint_fixture(
         instance_id: &str,
     ) -> (tempfile::TempDir, FileStorageProvider, StorageSlot, PathBuf) {
@@ -698,6 +894,109 @@ mod tests {
             tokio::fs::metadata(&slot.mem_path).await.unwrap().len(),
             512
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_template_acquire_owns_independent_artifacts() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let instances = temp.path().join("instances");
+        let source = temp.path().join("source");
+        tokio::fs::create_dir(&instances).await.unwrap();
+        tokio::fs::create_dir(&source).await.unwrap();
+        let provider = FileStorageProvider::new(instances);
+        let materialized = provider
+            .acquire_runtime_template(
+                &AcquireOpts {
+                    instance_id: "template-instance".to_string(),
+                    rootfs_size: 6,
+                    mem_size: 6,
+                },
+                runtime_template_storage(&source),
+            )
+            .await
+            .expect("materialize template");
+
+        std::fs::write(source.join("source-rootfs"), b"changed").unwrap();
+        std::fs::write(source.join("source-memory"), b"changed").unwrap();
+        std::fs::write(source.join("source-vmstate"), b"changed").unwrap();
+
+        assert_eq!(
+            tokio::fs::read(&materialized.storage.rootfs_path)
+                .await
+                .unwrap(),
+            b"rootfs"
+        );
+        assert_eq!(
+            tokio::fs::read(&materialized.storage.mem_path)
+                .await
+                .unwrap(),
+            b"memory"
+        );
+        assert_eq!(
+            tokio::fs::read(&materialized.snapshot_path).await.unwrap(),
+            b"snapshot"
+        );
+        assert!(materialized.storage.mem_diff_path.is_file());
+        assert!(materialized.storage.rootfs_diff_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn runtime_template_acquire_rolls_back_digest_mismatch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let instances = temp.path().join("instances");
+        let source = temp.path().join("source");
+        tokio::fs::create_dir(&instances).await.unwrap();
+        tokio::fs::create_dir(&source).await.unwrap();
+        let provider = FileStorageProvider::new(instances.clone());
+        let mut storage = runtime_template_storage(&source);
+        storage.rootfs.sha256 = "0".repeat(64);
+
+        let error = provider
+            .acquire_runtime_template(
+                &AcquireOpts {
+                    instance_id: "bad-template".to_string(),
+                    rootfs_size: 6,
+                    mem_size: 6,
+                },
+                storage,
+            )
+            .await
+            .expect_err("digest mismatch");
+        let (_, residual) = error.into_parts();
+
+        assert!(residual.is_none());
+        assert!(!instances.join("bad-template").exists());
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn runtime_template_acquire_retains_failed_rollback() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let instances = temp.path().join("instances");
+        let source = temp.path().join("source");
+        tokio::fs::create_dir(&instances).await.unwrap();
+        tokio::fs::create_dir(&source).await.unwrap();
+        let provider = FileStorageProvider::new(instances.clone());
+        let hook = crate::failpoint::TestFailpoint::new(&[
+            "storage-acquire-runtime-template-artifacts",
+            "storage-acquire-rollback",
+        ]);
+
+        let error = hook
+            .run(provider.acquire_runtime_template(
+                &AcquireOpts {
+                    instance_id: "residual-template".to_string(),
+                    rootfs_size: 6,
+                    mem_size: 6,
+                },
+                runtime_template_storage(&source),
+            ))
+            .await
+            .expect_err("rollback failure");
+        let (_, residual) = error.into_parts();
+
+        assert_eq!(residual.expect("residual owner").id, "residual-template");
+        assert!(instances.join("residual-template").is_dir());
     }
 
     #[tokio::test]
