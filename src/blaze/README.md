@@ -115,6 +115,16 @@ sync_timeout = "30s"       # Maximum scheduler wait for reconstruction plus arti
 ```
 
 The `file` provider uses standard filesystem operations for sandbox storage. The `auto` provider probes available backends in priority order (currently equivalent to `file`). Unrecognized values will log a warning and fall back to `file`.
+Existing storage configuration fields, HTTP APIs, and successful lifecycle
+behavior are unchanged. The file provider now rejects an instances-root path
+that contains `..` or a symbolic-link component; storage roots that resolve to
+overlapping locations; an instances root that would own the daemon state
+directory or enter a sandbox UUID subtree, directly or through an alias; or a
+root already owned by another daemon. If the configured pathname is replaced
+while Blaze is running, new allocation and reconstruction fail closed. Release,
+and any synchronization attempt that already completed reconstruction,
+continue against the original storage root. See [File storage compatibility and safety checks](../../docs/user-guide/en/runtime/blaze.md#file-storage-compatibility-and-safety-checks)
+for the complete behavior.
 When periodic synchronization is enabled, a completed provider failure is
 isolated from later sandboxes. If a provider cannot stop its filesystem work at
 the deadline, that work keeps the sandbox operation lock and the single

@@ -158,6 +158,31 @@ Leave `listen.http_addr` disabled in production until
 Daemon shutdown also does not yet wait for every active HTTP handler or release
 all runtime owners, so an in-flight request may observe a closed connection.
 
+## File Storage Compatibility and Safety Checks
+
+This release does not change the storage configuration fields, HTTP API, or
+successful sandbox lifecycle. It tightens failure handling for unsafe file
+storage layouts and ownership changes.
+
+The file provider rejects `storage.instances_dir` when its path contains `..`
+or a symbolic-link component; when `storage.images_dir` and
+`storage.instances_dir` resolve to overlapping filesystem locations, including
+through a symbolic link or bind mount; when the instances root would own
+`daemon.state_dir` or enter one of its sandbox UUID subtrees, directly or
+through an alias; or when another daemon already owns the same instances root.
+Resolve these errors by choosing distinct, stable directories; do not work
+around them with path aliases.
+
+Blaze retains ownership of the instances root that it opened at startup. If
+the configured pathname is later renamed or replaced, operations that must
+create or reconstruct backend-visible paths fail closed instead of using the
+replacement. This includes the reconstruction step that normally starts a
+periodic synchronization attempt. Release always uses the original opened
+root, and a synchronization attempt that completed reconstruction before the
+replacement also finishes against that root. The replacement directory is not
+modified accidentally. Restore the configured pathname to the original
+directory before requesting new allocation, reconstruction, or synchronization.
+
 ## Storage Artifact Synchronization
 
 Blaze can periodically persist the already-written host artifacts and directory

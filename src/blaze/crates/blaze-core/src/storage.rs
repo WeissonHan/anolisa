@@ -55,9 +55,10 @@ pub struct AcquireOpts {
 
 /// Storage allocation failure with an optional residual slot owner.
 ///
-/// A provider returns `residual` only when rollback could not remove resources
-/// that were created for this request. The caller must retain the stable slot
-/// ID until a later release succeeds.
+/// A provider returns `residual` when rollback could not remove resources that
+/// were created for this request, or when a blocking allocation transaction's
+/// completion is unknown. The caller must retain the stable slot ID until a
+/// later release succeeds.
 #[derive(Debug, Error)]
 #[error("{source}")]
 pub struct StorageAcquireError {
@@ -75,7 +76,7 @@ impl StorageAcquireError {
         }
     }
 
-    /// Build a failure that transfers residual slot ownership to the caller.
+    /// Build a failure that transfers possible residual ownership to the caller.
     pub fn with_residual(source: BlazeError, residual: StorageSlot) -> Self {
         Self {
             source,

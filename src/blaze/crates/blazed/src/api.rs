@@ -2479,11 +2479,15 @@ mod tests {
                 cleanup_count: policy_cleanups.clone(),
             }),
         );
-        let restarted_storage: Arc<dyn StorageProvider> =
-            Arc::new(FileStorageProvider::with_images(
+        let restarted_storage: Arc<dyn StorageProvider> = Arc::new(
+            FileStorageProvider::reopen_after_simulated_restart(
                 config.storage.images_dir.clone(),
                 instances_dir.clone(),
-            ));
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("restart storage instances root"),
+        );
         let restarted = build_test_state(
             config,
             test_policy(BackendKind::Firecracker, false),
@@ -3430,11 +3434,15 @@ mod tests {
         drop(initial_state);
 
         let cleanup_count = Arc::new(AtomicUsize::new(0));
-        let restarted_storage: Arc<dyn StorageProvider> =
-            Arc::new(FileStorageProvider::with_images(
+        let restarted_storage: Arc<dyn StorageProvider> = Arc::new(
+            FileStorageProvider::reopen_after_simulated_restart(
                 config.storage.images_dir.clone(),
                 instances_dir.clone(),
-            ));
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("restart storage instances root"),
+        );
         let restarted = build_test_state(
             config,
             test_policy(BackendKind::Mock, false),

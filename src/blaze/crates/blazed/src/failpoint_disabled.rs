@@ -16,6 +16,25 @@ pub(crate) fn storage(_name: &str) -> blaze_core::Result<()> {
     Ok(())
 }
 
+/// Empty test context used by the production no-op implementation.
+#[cfg(test)]
+pub(crate) struct TestFailpointContext;
+
+/// Capture an empty failpoint context in default-feature tests.
+#[cfg(test)]
+pub(crate) fn capture_test_context() -> TestFailpointContext {
+    TestFailpointContext
+}
+
+/// Run a blocking operation unchanged in default-feature tests.
+#[cfg(test)]
+pub(crate) fn with_test_context<T>(
+    _context: TestFailpointContext,
+    operation: impl FnOnce() -> T,
+) -> T {
+    operation()
+}
+
 /// Leave guest operations unchanged in production builds.
 pub(crate) fn guest(_name: &str) -> crate::guest::Result<()> {
     Ok(())

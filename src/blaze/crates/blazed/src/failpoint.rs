@@ -39,6 +39,10 @@ pub(crate) struct TestFailpoint {
     state: Arc<TestFailpointState>,
 }
 
+/// Captured task-local failpoint state for a blocking worker.
+#[cfg(test)]
+pub(crate) struct TestFailpointContext(Option<Arc<TestFailpointState>>);
+
 #[cfg(test)]
 struct TestFailpointScope {
     previous: Option<Arc<TestFailpointState>>,
@@ -91,6 +95,23 @@ impl TestFailpoint {
         self.state.released.store(true, Ordering::Release);
         self.state.release_notify.notify_waiters();
     }
+}
+
+/// Capture the current test failpoints without triggering them.
+#[cfg(test)]
+pub(crate) fn capture_test_context() -> TestFailpointContext {
+    TestFailpointContext(TEST_FAILPOINTS.with(|current| current.borrow().clone()))
+}
+
+/// Install captured test failpoints while one blocking operation runs.
+#[cfg(test)]
+pub(crate) fn with_test_context<T>(
+    context: TestFailpointContext,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let previous = TEST_FAILPOINTS.with(|current| current.replace(context.0));
+    let _scope = TestFailpointScope { previous };
+    operation()
 }
 
 /// Log that a test-only binary is accepting failpoint configuration.
