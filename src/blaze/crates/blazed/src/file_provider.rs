@@ -3,16 +3,17 @@
 //! rootfs and memory files on a local filesystem. Base images and mutable
 //! instance slots use separate roots; runtime pooling is owned by the daemon.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use rustix::fs::{
-    AtFlags, Dir, DirEntry, FileType, FlockOperation, Mode, OFlags, flock, fstat, fsync, mkdirat,
-    open, openat, statat, unlinkat,
+    AtFlags, Dir, DirEntry, FileType, FlockOperation, Mode, OFlags, RenameFlags, fchmod, flock,
+    fstat, fsync, mkdirat, open, openat, renameat_with, statat, unlinkat,
 };
 use rustix::io::Errno;
+use uuid::Uuid;
 
 use blaze_core::error::{BlazeError, Result};
 use blaze_core::storage::{
@@ -70,7 +71,7 @@ impl AcquireBlockingHook {
         }
     }
 
-    fn pause_after_mkdir(&self) {
+    fn pause_after_publish(&self) {
         self.entered.notify_one();
         let mut released = self.released.lock().expect("acquire hook lock");
         while !*released {
@@ -349,7 +350,14 @@ fn plan_instances_owner(path: &Path) -> Result<PlannedFileStorageProvider> {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
-            Ok(next) => current = next,
+            Ok(next) => {
+                ensure_trusted_existing_path_component(&current, name, &next).map_err(|error| {
+                    BlazeError::StorageError {
+                        msg: format!("inspect storage instances root {}: {error}", path.display()),
+                    }
+                })?;
+                current = next;
+            }
             Err(Errno::NOENT) => {
                 missing.extend(components[index..].iter().cloned());
                 break;
@@ -404,6 +412,400 @@ fn revalidate_instances_owner_plan(planned: &PlannedFileStorageProvider) -> Resu
     Ok(())
 }
 
+enum DirectoryPublicationError {
+    TargetExists,
+    Clean(String),
+    UnaddressableResidual(String),
+    PublishedOwnedResidual(String),
+}
+
+struct RetainedDirectoryIdentity {
+    metadata: rustix::fs::Stat,
+    mount_id: u64,
+}
+
+struct PublishedDirectory {
+    directory: std::os::fd::OwnedFd,
+    identity: RetainedDirectoryIdentity,
+}
+
+fn verify_linked_directory_identity(
+    parent: &std::os::fd::OwnedFd,
+    name: &OsStr,
+    expected: &RetainedDirectoryIdentity,
+    label: &str,
+) -> std::result::Result<(), String> {
+    let linked = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("open {label}: {error}"))?;
+    let metadata = fstat(&linked).map_err(|error| format!("inspect {label}: {error}"))?;
+    if metadata.st_dev != expected.metadata.st_dev || metadata.st_ino != expected.metadata.st_ino {
+        return Err(format!("{label} changed filesystem identity"));
+    }
+    let mount_id = opened_mount_id_for_owned_fd(&linked)
+        .map_err(|error| format!("inspect {label} mount identity: {error}"))?;
+    if mount_id != expected.mount_id {
+        return Err(format!(
+            "{label} changed mount identity {}->{mount_id}",
+            expected.mount_id
+        ));
+    }
+    Ok(())
+}
+
+fn slot_cleanup_is_retryable_by_id(
+    parent: &std::os::fd::OwnedFd,
+    name: &str,
+    expected: &RetainedDirectoryIdentity,
+) -> bool {
+    if matches!(
+        statat(parent, name, AtFlags::SYMLINK_NOFOLLOW),
+        Err(Errno::NOENT)
+    ) {
+        // The directory was removed but its parent fsync may have failed.
+        // release_by_id can safely retry that durability step.
+        return true;
+    }
+    verify_linked_directory_identity(
+        parent,
+        OsStr::new(name),
+        expected,
+        "provider-owned slot directory",
+    )
+    .is_ok()
+}
+
+fn ensure_trusted_existing_path_component(
+    parent: &std::os::fd::OwnedFd,
+    name: &OsStr,
+    child: &std::os::fd::OwnedFd,
+) -> std::result::Result<(), String> {
+    let parent_metadata =
+        fstat(parent).map_err(|error| format!("inspect path-component parent: {error}"))?;
+    let effective_uid = unsafe { libc::geteuid() };
+    let trusted_parent_owner =
+        parent_metadata.st_uid == 0 || parent_metadata.st_uid == effective_uid;
+    let shared_write = parent_metadata.st_mode & (libc::S_IWGRP | libc::S_IWOTH) != 0;
+    let sticky = parent_metadata.st_mode & libc::S_ISVTX != 0;
+    if !trusted_parent_owner || (shared_write && !sticky) {
+        return Err(format!(
+            "path-component parent has unsafe owner or permissions (uid {}, mode {:04o})",
+            parent_metadata.st_uid,
+            parent_metadata.st_mode & 0o7777
+        ));
+    }
+
+    let child_metadata = fstat(child)
+        .map_err(|error| format!("inspect existing path component {name:?}: {error}"))?;
+    if shared_write && child_metadata.st_uid != 0 && child_metadata.st_uid != effective_uid {
+        return Err(format!(
+            "existing path component {name:?} in a shared sticky parent is owned by untrusted uid {}",
+            child_metadata.st_uid
+        ));
+    }
+    let linked = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| format!("revalidate existing path component {name:?}: {error}"))?;
+    if linked.st_dev != child_metadata.st_dev || linked.st_ino != child_metadata.st_ino {
+        return Err(format!(
+            "existing path component {name:?} changed identity while it was opened"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_trusted_publication_parent(
+    parent: &std::os::fd::OwnedFd,
+) -> std::result::Result<(), String> {
+    let metadata = fstat(parent).map_err(|error| format!("inspect publication parent: {error}"))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+        return Err("publication parent is not a directory".to_string());
+    }
+
+    let effective_uid = unsafe { libc::geteuid() };
+    let trusted_owner = metadata.st_uid == 0 || metadata.st_uid == effective_uid;
+    let shared_write = metadata.st_mode & (libc::S_IWGRP | libc::S_IWOTH) != 0;
+    // A sticky directory protects existing entries, but another user can still
+    // reserve a not-yet-published sandbox name. Reject shared writers so later
+    // recovery can never mistake such a reservation for provider-owned storage.
+    if !trusted_owner || shared_write {
+        return Err(format!(
+            "publication parent has unsafe owner or permissions (uid {}, mode {:04o}); it must be owned by root or uid {} and must not be writable by group or other users",
+            metadata.st_uid,
+            metadata.st_mode & 0o7777,
+            effective_uid
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_owned_empty_directory_link(
+    parent: &std::os::fd::OwnedFd,
+    name: &OsStr,
+    expected: &rustix::fs::Stat,
+) -> std::result::Result<(), String> {
+    let observed = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(observed) => observed,
+        Err(Errno::NOENT) => return Err(format!("{name:?} disappeared before cleanup")),
+        Err(error) => return Err(format!("inspect {name:?} before cleanup: {error}")),
+    };
+    if observed.st_dev != expected.st_dev || observed.st_ino != expected.st_ino {
+        return Err(format!("{name:?} changed identity before cleanup"));
+    }
+    unlinkat(parent, name, AtFlags::REMOVEDIR)
+        .map_err(|error| format!("remove {name:?}: {error}"))?;
+    fsync(parent)
+        .map_err(|error| format!("synchronize parent after removing {name:?}: {error}"))?;
+    Ok(())
+}
+
+fn staging_publication_failure(
+    parent: &std::os::fd::OwnedFd,
+    staging_name: &OsStr,
+    staging_identity: &rustix::fs::Stat,
+    error: String,
+) -> DirectoryPublicationError {
+    match cleanup_owned_empty_directory_link(parent, staging_name, staging_identity) {
+        Ok(()) => DirectoryPublicationError::Clean(error),
+        Err(cleanup_error) => DirectoryPublicationError::UnaddressableResidual(format!(
+            "{error}; private staging cleanup could not be confirmed: {cleanup_error}"
+        )),
+    }
+}
+
+enum PublishedDirectoryCleanupError {
+    Unaddressable(String),
+    Addressable(String),
+}
+
+fn cleanup_published_empty_directory_link(
+    parent: &std::os::fd::OwnedFd,
+    name: &OsStr,
+    expected: &RetainedDirectoryIdentity,
+) -> std::result::Result<(), PublishedDirectoryCleanupError> {
+    verify_linked_directory_identity(parent, name, expected, "published directory")
+        .map_err(PublishedDirectoryCleanupError::Unaddressable)?;
+    let linked = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+        PublishedDirectoryCleanupError::Unaddressable(format!(
+            "inspect {name:?} before unlink: {error}"
+        ))
+    })?;
+    if linked.st_dev != expected.metadata.st_dev || linked.st_ino != expected.metadata.st_ino {
+        return Err(PublishedDirectoryCleanupError::Unaddressable(format!(
+            "{name:?} changed identity before unlink"
+        )));
+    }
+    unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(|error| {
+        PublishedDirectoryCleanupError::Addressable(format!("remove {name:?}: {error}"))
+    })?;
+    fsync(parent).map_err(|error| {
+        PublishedDirectoryCleanupError::Addressable(format!(
+            "synchronize parent after removing {name:?}: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn published_directory_failure(
+    parent: &std::os::fd::OwnedFd,
+    target_name: &OsStr,
+    directory_identity: &RetainedDirectoryIdentity,
+    error: String,
+) -> DirectoryPublicationError {
+    match cleanup_published_empty_directory_link(parent, target_name, directory_identity) {
+        Ok(()) => DirectoryPublicationError::Clean(error),
+        Err(PublishedDirectoryCleanupError::Unaddressable(cleanup_error)) => {
+            DirectoryPublicationError::UnaddressableResidual(format!(
+                "{error}; published directory cleanup was unsafe: {cleanup_error}"
+            ))
+        }
+        Err(PublishedDirectoryCleanupError::Addressable(cleanup_error)) => {
+            DirectoryPublicationError::PublishedOwnedResidual(format!(
+                "{error}; published directory cleanup could not be confirmed: {cleanup_error}"
+            ))
+        }
+    }
+}
+
+fn publish_new_directory_at<F>(
+    parent: &std::os::fd::OwnedFd,
+    target_name: &OsStr,
+    final_mode: Mode,
+    after_publish: F,
+) -> std::result::Result<PublishedDirectory, DirectoryPublicationError>
+where
+    F: FnOnce(),
+{
+    ensure_trusted_publication_parent(parent).map_err(DirectoryPublicationError::Clean)?;
+
+    let staging_name = loop {
+        let candidate = OsString::from(format!(".blaze-dir-{}.tmp", Uuid::new_v4()));
+        if candidate == target_name {
+            continue;
+        }
+        match mkdirat(parent, &candidate, Mode::from_bits_truncate(0o700)) {
+            Ok(()) => break candidate,
+            Err(Errno::EXIST) => continue,
+            Err(error) => {
+                return Err(DirectoryPublicationError::Clean(format!(
+                    "create private staging directory: {error}"
+                )));
+            }
+        }
+    };
+    let directory = match openat(
+        parent,
+        &staging_name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(error) => {
+            let staging_identity = match statat(parent, &staging_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(identity) => identity,
+                Err(_) => {
+                    return Err(DirectoryPublicationError::UnaddressableResidual(format!(
+                        "retain private staging directory: {error}; private staging cleanup could not be confirmed"
+                    )));
+                }
+            };
+            return Err(staging_publication_failure(
+                parent,
+                &staging_name,
+                &staging_identity,
+                format!("retain private staging directory: {error}"),
+            ));
+        }
+    };
+    let directory_metadata = match fstat(&directory) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let fallback_identity = match statat(parent, &staging_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(identity) => identity,
+                Err(_) => {
+                    return Err(DirectoryPublicationError::UnaddressableResidual(format!(
+                        "inspect private staging directory: {error}; private staging cleanup could not be confirmed"
+                    )));
+                }
+            };
+            return Err(staging_publication_failure(
+                parent,
+                &staging_name,
+                &fallback_identity,
+                format!("inspect private staging directory: {error}"),
+            ));
+        }
+    };
+    let effective_uid = unsafe { libc::geteuid() };
+    if FileType::from_raw_mode(directory_metadata.st_mode) != FileType::Directory
+        || directory_metadata.st_uid != effective_uid
+        || directory_metadata.st_mode & (libc::S_IWGRP | libc::S_IWOTH) != 0
+    {
+        return Err(staging_publication_failure(
+            parent,
+            &staging_name,
+            &directory_metadata,
+            format!(
+                "private staging directory has unexpected owner or permissions (uid {}, mode {:04o})",
+                directory_metadata.st_uid,
+                directory_metadata.st_mode & 0o7777
+            ),
+        ));
+    }
+    let mount_id = match opened_mount_id_for_owned_fd(&directory) {
+        Ok(mount_id) => mount_id,
+        Err(error) => {
+            return Err(staging_publication_failure(
+                parent,
+                &staging_name,
+                &directory_metadata,
+                format!("inspect private staging mount identity: {error}"),
+            ));
+        }
+    };
+    let directory_identity = RetainedDirectoryIdentity {
+        metadata: directory_metadata,
+        mount_id,
+    };
+    if let Err(error) = fchmod(&directory, final_mode) {
+        return Err(staging_publication_failure(
+            parent,
+            &staging_name,
+            &directory_identity.metadata,
+            format!("set private staging directory permissions: {error}"),
+        ));
+    }
+    if let Err(error) = fsync(&directory) {
+        return Err(staging_publication_failure(
+            parent,
+            &staging_name,
+            &directory_identity.metadata,
+            format!("synchronize private staging directory: {error}"),
+        ));
+    }
+
+    match renameat_with(
+        parent,
+        &staging_name,
+        parent,
+        target_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
+        Err(Errno::EXIST) => {
+            let cleanup = cleanup_owned_empty_directory_link(
+                parent,
+                &staging_name,
+                &directory_identity.metadata,
+            );
+            return match cleanup {
+                Ok(()) => Err(DirectoryPublicationError::TargetExists),
+                Err(cleanup_error) => {
+                    Err(DirectoryPublicationError::UnaddressableResidual(format!(
+                        "target already exists and private staging cleanup could not be confirmed: {cleanup_error}"
+                    )))
+                }
+            };
+        }
+        Err(error) => {
+            return Err(staging_publication_failure(
+                parent,
+                &staging_name,
+                &directory_identity.metadata,
+                format!("publish directory without replacement: {error}"),
+            ));
+        }
+    }
+
+    if let Err(error) = fsync(parent) {
+        return Err(published_directory_failure(
+            parent,
+            target_name,
+            &directory_identity,
+            format!("synchronize publication parent: {error}"),
+        ));
+    }
+    after_publish();
+
+    match verify_linked_directory_identity(
+        parent,
+        target_name,
+        &directory_identity,
+        "published directory",
+    ) {
+        Ok(()) => Ok(PublishedDirectory {
+            directory,
+            identity: directory_identity,
+        }),
+        Err(error) => Err(DirectoryPublicationError::UnaddressableResidual(format!(
+            "published directory identity could not be verified: {error}"
+        ))),
+    }
+}
+
 fn materialize_instances_owner(
     mut current: std::os::fd::OwnedFd,
     missing: &[OsString],
@@ -415,9 +817,14 @@ fn materialize_instances_owner(
     }
     for name in missing {
         walked.push(name);
-        match mkdirat(&current, name, Mode::from_bits_truncate(0o750)) {
-            Ok(()) => {}
-            Err(Errno::EXIST) => {
+        current = match publish_new_directory_at(
+            &current,
+            name,
+            Mode::from_bits_truncate(0o750),
+            || {},
+        ) {
+            Ok(published) => published.directory,
+            Err(DirectoryPublicationError::TargetExists) => {
                 return Err(BlazeError::StorageError {
                     msg: format!(
                         "storage instances path {} appeared after startup planning",
@@ -425,7 +832,11 @@ fn materialize_instances_owner(
                     ),
                 });
             }
-            Err(error) => {
+            Err(
+                DirectoryPublicationError::Clean(error)
+                | DirectoryPublicationError::UnaddressableResidual(error)
+                | DirectoryPublicationError::PublishedOwnedResidual(error),
+            ) => {
                 return Err(BlazeError::StorageError {
                     msg: format!(
                         "create storage instances path {}: {error}",
@@ -433,22 +844,15 @@ fn materialize_instances_owner(
                     ),
                 });
             }
-        }
-        // Synchronize each newly created component before descending into it.
-        fsync(&current).map_err(|error| BlazeError::StorageError {
-            msg: format!("synchronize storage parent {}: {error}", walked.display()),
-        })?;
-        current = openat(
-            &current,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| BlazeError::StorageError {
-            msg: format!("open storage instances path {}: {error}", walked.display()),
-        })?;
+        };
     }
     let directory = current;
+    ensure_trusted_publication_parent(&directory).map_err(|error| BlazeError::StorageError {
+        msg: format!(
+            "storage instances root {} cannot safely publish slots: {error}",
+            resolved.display()
+        ),
+    })?;
     if let Err(error) = flock(&directory, FlockOperation::NonBlockingLockExclusive) {
         return Err(BlazeError::StorageError {
             msg: if error == Errno::WOULDBLOCK {
@@ -513,10 +917,10 @@ impl StorageProvider for FileStorageProvider {
         let acquire_hook = self.acquire_blocking_hook.clone();
         #[cfg(test)]
         let finish_hook = self.acquire_blocking_hook.clone();
-        let after_mkdir = move || {
+        let after_publish = move || {
             #[cfg(test)]
             if let Some(hook) = acquire_hook {
-                hook.pause_after_mkdir();
+                hook.pause_after_publish();
             }
         };
         let instance_id = opts.instance_id.clone();
@@ -535,7 +939,7 @@ impl StorageProvider for FileStorageProvider {
                     images_dir,
                     rootfs_size,
                     mem_size,
-                    after_mkdir,
+                    after_publish,
                 )
             });
             #[cfg(not(test))]
@@ -546,7 +950,7 @@ impl StorageProvider for FileStorageProvider {
                 images_dir,
                 rootfs_size,
                 mem_size,
-                after_mkdir,
+                after_publish,
             );
             #[cfg(test)]
             if let Some(hook) = finish_hook {
@@ -558,13 +962,12 @@ impl StorageProvider for FileStorageProvider {
         match result {
             Ok(Ok(())) => Ok(slot),
             Ok(Err(error)) => Err(*error),
-            Err(error) => Err(StorageAcquireError::with_residual(
+            Err(error) => Err(StorageAcquireError::with_manual_cleanup_required(
                 BlazeError::StorageError {
                     msg: format!(
                         "acquire '{instance_id}': blocking transaction failed to join: {error}; outcome is unknown"
                     ),
                 },
-                slot,
             )),
         }
     }
@@ -764,9 +1167,51 @@ fn remove_slot_tree(root: &std::os::fd::OwnedFd, instance_id: &str) -> Result<()
     )
 }
 
+fn remove_slot_tree_matching(
+    root: &std::os::fd::OwnedFd,
+    instance_id: &str,
+    expected: &RetainedDirectoryIdentity,
+) -> Result<()> {
+    remove_slot_tree_with_identity_and_hooks(
+        root,
+        instance_id,
+        Some(expected),
+        &mut || Ok(()),
+        &mut || crate::failpoint::storage("storage-release-after-entry"),
+        &mut || Ok(()),
+        &mut || crate::failpoint::storage("storage-release-before-root-sync"),
+    )
+}
+
 fn remove_slot_tree_with_hooks<I, E, U, S>(
     root: &std::os::fd::OwnedFd,
     instance_id: &str,
+    after_inspect: &mut I,
+    after_entry: &mut E,
+    before_unlink: &mut U,
+    before_root_sync: &mut S,
+) -> Result<()>
+where
+    I: FnMut() -> Result<()>,
+    E: FnMut() -> Result<()>,
+    U: FnMut() -> Result<()>,
+    S: FnMut() -> Result<()>,
+{
+    remove_slot_tree_with_identity_and_hooks(
+        root,
+        instance_id,
+        None,
+        after_inspect,
+        after_entry,
+        before_unlink,
+        before_root_sync,
+    )
+}
+
+fn remove_slot_tree_with_identity_and_hooks<I, E, U, S>(
+    root: &std::os::fd::OwnedFd,
+    instance_id: &str,
+    expected: Option<&RetainedDirectoryIdentity>,
     after_inspect: &mut I,
     after_entry: &mut E,
     before_unlink: &mut U,
@@ -799,6 +1244,9 @@ where
             });
         }
     };
+    if let Some(expected) = expected {
+        ensure_same_metadata_object(&expected.metadata, &inspected, "provider-owned slot root")?;
+    }
     after_inspect()?;
     let directory = match openat(
         root,
@@ -819,6 +1267,21 @@ where
         }
     };
     ensure_same_object(&inspected, &directory, "provider slot root")?;
+    if let Some(expected) = expected {
+        ensure_same_object(&expected.metadata, &directory, "provider-owned slot root")?;
+        let mount_id =
+            opened_mount_id_for_owned_fd(&directory).map_err(|error| BlazeError::StorageError {
+                msg: format!("release '{instance_id}': inspect owned slot mount: {error}"),
+            })?;
+        if mount_id != expected.mount_id {
+            return Err(BlazeError::StorageError {
+                msg: format!(
+                    "release '{instance_id}': provider-owned slot changed mount identity {}->{mount_id}",
+                    expected.mount_id
+                ),
+            });
+        }
+    }
     remove_directory_contents_on_mount(
         &directory,
         root_mount_id,
@@ -1148,46 +1611,59 @@ fn acquire_slot_blocking<F>(
     images_dir: PathBuf,
     rootfs_size: u64,
     mem_size: u64,
-    after_create: F,
+    after_publish: F,
 ) -> std::result::Result<(), Box<StorageAcquireError>>
 where
     F: FnOnce(),
 {
     let instance_id = slot.id.clone();
-    match mkdirat(
+    crate::failpoint::pause_blocking("storage-acquire-before-slot-publish");
+    let published = match publish_new_directory_at(
         &owner,
-        instance_id.as_str(),
+        OsStr::new(&instance_id),
         Mode::from_bits_truncate(0o750),
+        || {},
     ) {
-        Ok(()) => {}
-        Err(Errno::EXIST) => {
+        Ok(published) => published,
+        Err(DirectoryPublicationError::TargetExists) => {
             return Err(Box::new(StorageAcquireError::clean(
                 BlazeError::StorageError {
                     msg: format!("acquire '{instance_id}': instance directory already exists"),
                 },
             )));
         }
-        Err(error) => {
+        Err(DirectoryPublicationError::Clean(error)) => {
             return Err(Box::new(StorageAcquireError::clean(
                 BlazeError::StorageError {
                     msg: format!("acquire '{instance_id}': create dir: {error}"),
                 },
             )));
         }
-    }
-    after_create();
+        Err(DirectoryPublicationError::PublishedOwnedResidual(error)) => {
+            return Err(Box::new(StorageAcquireError::with_residual(
+                BlazeError::StorageError {
+                    msg: format!("acquire '{instance_id}': create dir: {error}"),
+                },
+                slot,
+            )));
+        }
+        Err(DirectoryPublicationError::UnaddressableResidual(error)) => {
+            return Err(Box::new(StorageAcquireError::with_manual_cleanup_required(
+                BlazeError::StorageError {
+                    msg: format!("acquire '{instance_id}': create dir: {error}"),
+                },
+            )));
+        }
+    };
+    let PublishedDirectory {
+        directory: slot_directory,
+        identity: slot_identity,
+    } = published;
+    after_publish();
+    crate::failpoint::pause_blocking("storage-acquire-after-slot-publish");
 
     let setup = (|| -> Result<()> {
         crate::failpoint::storage("storage-acquire-retain-slot")?;
-        let slot_directory = openat(
-            &owner,
-            instance_id.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| BlazeError::StorageError {
-            msg: format!("acquire '{instance_id}': retain slot: {error}"),
-        })?;
         create_or_copy_at_blocking(
             &images_dir.join("rootfs.ext4"),
             &slot_directory,
@@ -1211,6 +1687,15 @@ where
         // the retained root immediately before returning them; provider-local
         // cleanup remains descriptor-relative if this check fails.
         revalidate_backend_visible_root(&owner, &instances_dir, "acquire")?;
+        verify_linked_directory_identity(
+            &owner,
+            OsStr::new(&instance_id),
+            &slot_identity,
+            "published slot directory",
+        )
+        .map_err(|error| BlazeError::StorageError {
+            msg: format!("acquire '{instance_id}': {error}"),
+        })?;
         Ok(())
     })();
     let Err(setup_error) = setup else {
@@ -1218,7 +1703,7 @@ where
     };
 
     let rollback_result = crate::failpoint::storage("storage-acquire-rollback")
-        .and_then(|_| remove_slot_tree(&owner, &instance_id));
+        .and_then(|_| remove_slot_tree_matching(&owner, &instance_id, &slot_identity));
     match rollback_result {
         Ok(()) => Err(Box::new(StorageAcquireError::clean(
             BlazeError::StorageError {
@@ -1227,14 +1712,26 @@ where
                 ),
             },
         ))),
-        Err(cleanup_error) => Err(Box::new(StorageAcquireError::with_residual(
+        Err(cleanup_error)
+            if slot_cleanup_is_retryable_by_id(&owner, &instance_id, &slot_identity) =>
+        {
+            Err(Box::new(StorageAcquireError::with_residual(
+                BlazeError::StorageError {
+                    msg: format!(
+                        "acquire '{instance_id}': slot setup failed ({setup_error}); rollback failed for {}: {cleanup_error}",
+                        slot.instance_dir.display()
+                    ),
+                },
+                slot,
+            )))
+        }
+        Err(cleanup_error) => Err(Box::new(StorageAcquireError::with_manual_cleanup_required(
             BlazeError::StorageError {
                 msg: format!(
-                    "acquire '{instance_id}': slot setup failed ({setup_error}); rollback failed for {}: {cleanup_error}",
+                    "acquire '{instance_id}': slot setup failed ({setup_error}); rollback could not safely address {}: {cleanup_error}",
                     slot.instance_dir.display()
                 ),
             },
-            slot,
         ))),
     }
 }
@@ -1318,7 +1815,7 @@ fn validate_instance_id(instance_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
+    use blaze_core::storage::StorageAcquireDisposition;
 
     fn write_complete_replacement_slot(root: &Path, id: &str, marker: &[u8]) {
         let slot = root.join(id);
@@ -1350,6 +1847,174 @@ mod tests {
             resolve_relative_instances_path(relative, current),
             current.join(relative)
         );
+    }
+
+    #[test]
+    fn directory_publication_never_replaces_an_existing_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("instances");
+        std::fs::create_dir(&target).expect("existing target");
+        std::fs::write(target.join("sentinel"), b"existing").expect("existing sentinel");
+        let parent = open(
+            temp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("publication parent");
+
+        let error = match publish_new_directory_at(
+            &parent,
+            OsStr::new("instances"),
+            Mode::from_bits_truncate(0o750),
+            || {},
+        ) {
+            Ok(_) => panic!("publication must not replace an existing target"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, DirectoryPublicationError::TargetExists));
+        assert_eq!(
+            std::fs::read(target.join("sentinel")).expect("existing sentinel remains"),
+            b"existing"
+        );
+        assert!(
+            temp.path()
+                .read_dir()
+                .expect("publication parent")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".blaze-dir-"))
+        );
+    }
+
+    #[test]
+    fn directory_publication_rejects_a_post_publish_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("instances");
+        let detached = temp.path().join("instances-retained");
+        let parent = open(
+            temp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("publication parent");
+
+        let error = match publish_new_directory_at(
+            &parent,
+            OsStr::new("instances"),
+            Mode::from_bits_truncate(0o750),
+            || {
+                std::fs::rename(&target, &detached).expect("detach published directory");
+                std::fs::create_dir(&target).expect("replacement directory");
+                std::fs::write(target.join("sentinel"), b"replacement")
+                    .expect("replacement sentinel");
+            },
+        ) {
+            Ok(_) => panic!("publication must not retain a replacement directory"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            DirectoryPublicationError::UnaddressableResidual(ref message)
+                if message.contains("changed filesystem identity")
+        ));
+        assert!(detached.is_dir());
+        assert_eq!(
+            std::fs::read(target.join("sentinel")).expect("replacement remains"),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_a_shared_writable_instances_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("instances");
+        std::fs::create_dir(&target).expect("instances root");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777))
+            .expect("unsafe shared permissions");
+        let planned = FileStorageProvider::plan(target.clone()).expect("plan instances root");
+
+        let error = match FileStorageProvider::prepare(planned) {
+            Ok(_) => panic!("unsafe shared parent must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("must not be writable by group or other users")
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_a_sticky_shared_writable_instances_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("instances");
+        std::fs::create_dir(&target).expect("instances root");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o1777))
+            .expect("sticky shared permissions");
+        let planned = FileStorageProvider::plan(target).expect("plan instances root");
+
+        let error = match FileStorageProvider::prepare(planned) {
+            Ok(_) => panic!("sticky shared parent must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("must not be writable by group or other users")
+        );
+    }
+
+    #[test]
+    fn plan_rejects_a_non_sticky_shared_writable_existing_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shared = temp.path().join("shared");
+        let owned = shared.join("owned");
+        std::fs::create_dir(&shared).expect("shared ancestor");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+            .expect("unsafe shared permissions");
+        std::fs::create_dir(&owned).expect("owned child");
+
+        let error = match FileStorageProvider::plan(owned.join("instances")) {
+            Ok(_) => panic!("unsafe existing ancestor must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("path-component parent has unsafe owner or permissions")
+        );
+    }
+
+    #[test]
+    fn plan_accepts_an_owned_component_below_a_sticky_system_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shared = temp.path().join("shared");
+        let owned = shared.join("owned");
+        std::fs::create_dir(&shared).expect("shared ancestor");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))
+            .expect("sticky shared permissions");
+        std::fs::create_dir(&owned).expect("owned child");
+
+        let target = owned.join("instances");
+        let planned = FileStorageProvider::plan(target.clone()).expect("safe existing chain");
+        let prepared = FileStorageProvider::prepare(planned).expect("publish below owned child");
+
+        assert_eq!(prepared.resolved_instances_dir, target);
     }
 
     #[test]
@@ -1560,14 +2225,14 @@ mod tests {
             })
             .await
             .expect_err("acquire must not return a path through a replacement root");
-        let (source, residual) = acquire_error.into_parts();
+        let (source, disposition) = acquire_error.into_parts();
         assert!(matches!(&source, BlazeError::StorageError { .. }));
         assert!(
             source
                 .to_string()
                 .contains("backend-visible storage instances root")
         );
-        assert!(residual.is_none());
+        assert!(matches!(disposition, StorageAcquireDisposition::Clean));
         assert!(!detached.join(&later_id).exists());
         for name in ["rootfs.ext4", "mem.bin", "mem.diff", "rootfs.diff"] {
             assert_eq!(
@@ -1816,9 +2481,9 @@ mod tests {
             .run(provider.acquire(&opts))
             .await
             .expect_err("slot retain failure");
-        let (_source, residual) = error.into_parts();
+        let (_source, disposition) = error.into_parts();
 
-        assert!(residual.is_none());
+        assert!(matches!(disposition, StorageAcquireDisposition::Clean));
         assert!(!temporary.path().join(&opts.instance_id).exists());
     }
 
@@ -1841,8 +2506,10 @@ mod tests {
             .run(provider.acquire(&opts))
             .await
             .expect_err("slot retain and rollback failure");
-        let (_source, residual) = error.into_parts();
-        let residual = residual.expect("residual slot ownership");
+        let (_source, disposition) = error.into_parts();
+        let StorageAcquireDisposition::Residual(residual) = disposition else {
+            panic!("residual slot ownership must be transferred");
+        };
 
         assert_eq!(residual.id, opts.instance_id);
         assert!(temporary.path().join(&residual.id).is_dir());
@@ -1850,6 +2517,37 @@ mod tests {
             .release(residual)
             .await
             .expect("release residual slot");
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn acquire_returns_a_retryable_residual_after_unlink_sync_failure() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let provider = FileStorageProvider::new(temporary.path().to_path_buf());
+        let opts = AcquireOpts {
+            instance_id: "removed-residual".into(),
+            rootfs_size: 64,
+            mem_size: 32,
+        };
+        let failpoint = crate::failpoint::TestFailpoint::new(&[
+            "storage-acquire-artifacts",
+            "storage-release-before-root-sync",
+        ]);
+
+        let error = failpoint
+            .run(provider.acquire(&opts))
+            .await
+            .expect_err("root synchronization failure");
+        let (_source, disposition) = error.into_parts();
+        let StorageAcquireDisposition::Residual(residual) = disposition else {
+            panic!("removed slot must retain a retryable cleanup owner");
+        };
+
+        assert!(!temporary.path().join(&opts.instance_id).exists());
+        provider
+            .release_by_id(&residual.id)
+            .await
+            .expect("retry missing-slot parent synchronization");
     }
 
     #[cfg(feature = "test-failpoints")]
@@ -1868,14 +2566,14 @@ mod tests {
             .run(provider.acquire(&opts))
             .await
             .expect_err("instances-root synchronization failure");
-        let (source, residual) = error.into_parts();
+        let (source, disposition) = error.into_parts();
 
         assert!(
             source
                 .to_string()
                 .contains("storage-acquire-before-root-sync")
         );
-        assert!(residual.is_none());
+        assert!(matches!(disposition, StorageAcquireDisposition::Clean));
         assert!(!temporary.path().join(&opts.instance_id).exists());
     }
 
@@ -2374,6 +3072,54 @@ mod tests {
                 .file_type()
                 .is_socket()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acquire_rejects_a_slot_replaced_after_publication() -> Result<()> {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir()?;
+        let mut provider = FileStorageProvider::new(temp.path().to_path_buf());
+        let hook = Arc::new(AcquireBlockingHook::new());
+        provider.acquire_blocking_hook = Some(Arc::clone(&hook));
+        let provider = Arc::new(provider);
+        let task_provider = Arc::clone(&provider);
+        let task = tokio::spawn(async move {
+            task_provider
+                .acquire(&AcquireOpts {
+                    instance_id: "publication-race".to_string(),
+                    rootfs_size: 64,
+                    mem_size: 32,
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(4), hook.wait_until_entered())
+            .await
+            .expect("slot publication reached deterministic boundary");
+        let published = temp.path().join("publication-race");
+        let detached = temp.path().join("publication-race-retained");
+        std::fs::rename(&published, &detached).expect("detach published slot");
+        std::fs::create_dir(&published).expect("replacement slot");
+        std::fs::write(published.join("sentinel"), b"replacement").expect("replacement sentinel");
+        hook.resume();
+
+        let acquire_error = task
+            .await
+            .expect("acquire task completed")
+            .expect_err("replacement must fail acquisition");
+        let (source, disposition) = acquire_error.into_parts();
+        assert!(source.to_string().contains("changed identity"));
+        assert!(matches!(
+            disposition,
+            StorageAcquireDisposition::ManualCleanupRequired
+        ));
+        assert!(detached.is_dir());
+        assert_eq!(
+            std::fs::read(published.join("sentinel")).expect("replacement remains"),
+            b"replacement"
+        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]

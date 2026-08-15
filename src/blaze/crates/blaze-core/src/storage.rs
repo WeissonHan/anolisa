@@ -53,18 +53,28 @@ pub struct AcquireOpts {
     pub mem_size: u64,
 }
 
-/// Storage allocation failure with an optional residual slot owner.
+/// Cleanup responsibility after a storage allocation failure.
+#[derive(Debug)]
+pub enum StorageAcquireDisposition {
+    /// The provider proved that the failed request left no resources.
+    Clean,
+    /// The caller owns a provider object that can be retried by stable slot ID.
+    Residual(StorageSlot),
+    /// Stable-name cleanup is unsafe and requires manual inspection.
+    ManualCleanupRequired,
+}
+
+/// Storage allocation failure with an explicit cleanup disposition.
 ///
-/// A provider returns `residual` when rollback could not remove resources that
-/// were created for this request, or when a blocking allocation transaction's
-/// completion is unknown. The caller must retain the stable slot ID until a
-/// later release succeeds.
+/// A provider returns `Residual` when rollback could not remove resources that
+/// were created for this request. `ManualCleanupRequired` means that the stable
+/// slot name cannot safely identify the provider object.
 #[derive(Debug, Error)]
 #[error("{source}")]
 pub struct StorageAcquireError {
     #[source]
     source: BlazeError,
-    residual: Option<StorageSlot>,
+    disposition: StorageAcquireDisposition,
 }
 
 impl StorageAcquireError {
@@ -72,7 +82,7 @@ impl StorageAcquireError {
     pub fn clean(source: BlazeError) -> Self {
         Self {
             source,
-            residual: None,
+            disposition: StorageAcquireDisposition::Clean,
         }
     }
 
@@ -80,13 +90,29 @@ impl StorageAcquireError {
     pub fn with_residual(source: BlazeError, residual: StorageSlot) -> Self {
         Self {
             source,
-            residual: Some(residual),
+            disposition: StorageAcquireDisposition::Residual(residual),
         }
     }
 
-    /// Split the original provider error from any residual slot owner.
-    pub fn into_parts(self) -> (BlazeError, Option<StorageSlot>) {
-        (self.source, self.residual)
+    /// Build a failure that cannot be cleaned up safely by stable slot name.
+    pub fn with_manual_cleanup_required(source: BlazeError) -> Self {
+        Self {
+            source,
+            disposition: StorageAcquireDisposition::ManualCleanupRequired,
+        }
+    }
+
+    /// Whether automatic cleanup by stable slot name must be suppressed.
+    pub fn requires_manual_cleanup(&self) -> bool {
+        matches!(
+            self.disposition,
+            StorageAcquireDisposition::ManualCleanupRequired
+        )
+    }
+
+    /// Split the provider error from the required cleanup action.
+    pub fn into_parts(self) -> (BlazeError, StorageAcquireDisposition) {
+        (self.source, self.disposition)
     }
 }
 

@@ -173,6 +173,29 @@ through an alias; or when another daemon already owns the same instances root.
 Resolve these errors by choosing distinct, stable directories; do not work
 around them with path aliases.
 
+Blaze still creates a missing `storage.instances_dir` on first start. Every
+directory into which Blaze publishes a missing component or sandbox slot, and
+the final instances root, must be owned by root or the daemon's effective user
+and must not be writable by group or other users. A shared writable ancestor
+in the already-existing path is accepted only when it is sticky and the next
+component is owned by root or the daemon's effective user. A sticky publication
+parent is still rejected because another user could reserve a not-yet-published
+name. These checks preserve normal first-start behavior while rejecting layouts
+where an untrusted user could exchange or reserve a directory. Root and
+processes running as the same effective user as the daemon remain within the
+host administration trust boundary. Stop Blaze before an administrator changes
+its storage paths.
+
+Missing path components and sandbox slots are published without replacing an
+existing name. If the target name is occupied at atomic publication, Blaze
+rejects the operation and leaves that directory unchanged.
+If a published sandbox slot changes identity before allocation completes,
+creation enters recovery handling and automatic cleanup by the stable sandbox
+identifier is suppressed for that daemon process so that the replacement is
+not removed. This safeguard does not claim to isolate Blaze from concurrent
+changes made by root or the daemon's own effective user across a process restart.
+Inspect or restore the storage path before restarting after such an intervention.
+
 Blaze retains ownership of the instances root that it opened at startup. If
 the configured pathname is later renamed or replaced, operations that must
 create or reconstruct backend-visible paths fail closed instead of using the

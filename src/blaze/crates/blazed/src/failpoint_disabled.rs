@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! No-op hooks used when daemon verification support is disabled.
 
-#![allow(dead_code)] // Call sites land with their owning lifecycle commits.
-
 /// Keep daemon startup independent from verification-only configuration.
 pub(crate) fn announce() {}
 
@@ -47,6 +45,18 @@ pub(crate) fn state(_name: &str) -> crate::error::Result<()> {
 
 /// Never pause production requests.
 pub(crate) async fn pause(_name: &str) {}
+
+// Spawn detached supervision in production builds.
+pub(crate) fn spawn<F, R>(future: F) -> tokio::task::JoinHandle<R>
+where
+    F: std::future::Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::spawn(future)
+}
+
+/// Never pause production blocking operations.
+pub(crate) fn pause_blocking(_name: &str) {}
 
 #[cfg(test)]
 mod tests {
