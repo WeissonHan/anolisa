@@ -775,6 +775,71 @@ impl BackendSpawner for GuestMockSpawner {
         Ok(true)
     }
 
+    async fn restore_capability(&self, _binary_path: &Path) -> Result<Option<RestoreCapability>> {
+        Ok(Some(RestoreCapability {
+            backend: BackendKind::Mock,
+            version: Some("guest-mock-v1".to_string()),
+            snapshot_kind: blaze_core::backend::SnapshotKind::Full,
+        }))
+    }
+
+    /// Restore a guest-capable owner, including the guest files the snapshot
+    /// captured, so hibernation tests can assert that guest-visible state
+    /// survives a release-and-resume cycle.
+    async fn restore(&self, request: BackendRestoreRequest) -> RestoreResult {
+        let run_dir = request.run_dir.clone();
+        let RestoreRequest {
+            instance_id,
+            snapshot_path,
+            mem_path,
+            checkpoint_backend,
+            expected_version,
+            snapshot_kind,
+            ..
+        } = request.request;
+        if checkpoint_backend != BackendKind::Mock
+            || expected_version.as_deref() != Some("guest-mock-v1")
+            || snapshot_kind != blaze_core::backend::SnapshotKind::Full
+        {
+            return Err(SpawnFailure::clean(BlazeError::BackendError {
+                msg: "guest mock snapshot identity is incompatible with the restore adapter"
+                    .to_string(),
+            }));
+        }
+        let vmstate: serde_json::Value = match tokio::fs::read(&snapshot_path)
+            .await
+            .map_err(BlazeError::from)
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| BlazeError::BackendError {
+                    msg: format!("parse guest mock VM state: {error}"),
+                })
+            }) {
+            Ok(vmstate) => vmstate,
+            Err(error) => return Err(SpawnFailure::clean(error)),
+        };
+        if vmstate["format"].as_str() != Some("blaze-guest-mock-v1")
+            || vmstate["instance_id"].as_str() != Some(instance_id.to_string().as_str())
+        {
+            return Err(SpawnFailure::clean(BlazeError::BackendError {
+                msg: "guest mock VM state does not describe this sandbox".to_string(),
+            }));
+        }
+        let files: HashMap<String, Vec<u8>> = match tokio::fs::read(&mem_path)
+            .await
+            .map_err(BlazeError::from)
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| BlazeError::BackendError {
+                    msg: format!("parse guest mock memory: {error}"),
+                })
+            }) {
+            Ok(files) => files,
+            Err(error) => return Err(SpawnFailure::clean(error)),
+        };
+        spawn_guest_mock_instance_with_files(instance_id, &run_dir, files)
+            .await
+            .map_err(SpawnFailure::from)
+    }
+
     async fn cleanup_orphan(&self, _instance_id: Uuid, _run_dir: &OwnedRunDir) -> Result<()> {
         Ok(())
     }
@@ -795,6 +860,15 @@ async fn spawn_guest_mock_instance(
     instance_id: Uuid,
     run_dir: &OwnedRunDir,
 ) -> Result<DynBackendInstance> {
+    spawn_guest_mock_instance_with_files(instance_id, run_dir, HashMap::new()).await
+}
+
+#[cfg(test)]
+async fn spawn_guest_mock_instance_with_files(
+    instance_id: Uuid,
+    run_dir: &OwnedRunDir,
+    initial_files: HashMap<String, Vec<u8>>,
+) -> Result<DynBackendInstance> {
     let socket = run_dir.path().join("vsock.uds");
     if socket.exists() {
         tokio::fs::remove_file(&socket).await?;
@@ -802,7 +876,7 @@ async fn spawn_guest_mock_instance(
     let listener = UnixListener::bind(&socket)?;
     let cancellation = CancellationToken::new();
     let task_token = cancellation.clone();
-    let files = Arc::new(Mutex::new(HashMap::new()));
+    let files = Arc::new(Mutex::new(initial_files));
     let task_files = files.clone();
     let task = tokio::spawn(async move {
         loop {

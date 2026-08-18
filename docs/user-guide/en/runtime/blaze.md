@@ -97,7 +97,8 @@ destruction uses `DELETE /v1/sandboxes/{id}`. Checkpoint capture and history
 use
 `POST /v1/sandboxes/{id}/checkpoint` and
 `GET /v1/sandboxes/{id}/checkpoints`. Restore uses
-`POST /v1/sandboxes/{id}/rollback/{checkpoint_id}`.
+`POST /v1/sandboxes/{id}/rollback/{checkpoint_id}`. Hibernation uses
+`POST /v1/sandboxes/{id}/hibernate` and `POST /v1/sandboxes/{id}/resume`.
 
 ## Host Integration Boundary
 
@@ -316,6 +317,54 @@ destruction can finish cleanup. Restore moves checkpoint HEAD but does not
 rewrite `last_checkpoint` or capture history.
 
 Checkpoint deletion and pruning are not provided by this API.
+
+## Hibernation and Resume
+
+Hibernation exists to free the host resources a running sandbox holds — the
+backend process and its memory — during a period when the sandbox is not needed,
+without discarding guest-visible state. Unlike destroy, the sandbox keeps its
+identity and storage; unlike checkpoint capture, the live backend does not keep
+running afterwards.
+
+```http
+POST /v1/sandboxes/{id}/hibernate
+POST /v1/sandboxes/{id}/resume
+```
+
+Hibernation requires a running sandbox whose backend supports pause and full
+snapshot capture, and whose configured adapter can restore the same backend
+version. Blaze verifies this before it changes the lifecycle journal, so an
+unsupported combination returns HTTP 501 with the sandbox still running.
+Requests against a sandbox that is not in the expected state return HTTP 409.
+
+A successful hibernate records intent, pauses the backend, writes VM state and
+guest memory into a private staging directory, flushes the retained storage
+slot, records each artifact's size and SHA-256 digest in a manifest,
+synchronizes the complete image, and only then publishes it and commits
+`Hibernated`. The published image is resolved through the retained sandbox
+directory descriptor, so a replaced or symlinked instance directory cannot
+redirect it.
+
+Resume verifies the manifest identity, the exact file set, and every artifact
+digest before it starts a replacement backend. Blaze takes ownership of that
+backend before waiting for optional guest readiness and commits `Running` only
+after a final liveness check. Corrupted or incomplete artifacts are refused
+before any backend starts.
+
+Failure handling follows the same "before the stop" boundary the restore
+endpoint uses. A failure before Blaze begins stopping the backend resumes the
+original runtime and leaves the sandbox `Running`. A resume failure whose
+cleanup can be confirmed returns the sandbox to `Hibernated` so the request can
+be retried; when cleanup cannot be confirmed, the replacement owner and the
+operation journal are retained through `RecoveryRequired` for explicit destroy.
+
+Two durability properties are worth planning for. The storage slot stays
+allocated for the whole hibernated period, and a successful resume keeps the
+most recent hibernation image until the next hibernate replaces it or destroy
+removes it — this trades disk space for a repeatable resume. After a daemon
+restart, a completed hibernation is retained so it can still be resumed, but an
+interrupted hibernate or resume is not completed automatically; it is retained
+as `RecoveryRequired` and waits for explicit destroy.
 
 ## Storage Artifact Synchronization
 
