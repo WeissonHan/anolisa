@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -652,7 +653,7 @@ impl CheckpointStore {
             // directory it will hash or sync.
             let mut opened_artifacts = Vec::new();
             let mut payload_dirs = Vec::new();
-            collect_payload_files(
+            let backend_file_count = collect_payload_files(
                 &stage.backend_dir,
                 PAYLOAD_BACKEND_DIR,
                 1,
@@ -670,6 +671,13 @@ impl CheckpointStore {
             if opened_artifacts.is_empty() {
                 return Err(invariant(format!(
                     "checkpoint stage {} has an empty payload",
+                    stage.directory.configured_path().display()
+                )));
+            }
+            if backend_file_count == 0 {
+                return Err(invariant(format!(
+                    "checkpoint stage {} has an empty backend payload subtree; \
+                     the snapshot adapter must produce at least one artifact",
                     stage.directory.configured_path().display()
                 )));
             }
@@ -1714,6 +1722,55 @@ fn directory_names(
     Ok(names)
 }
 
+/// Enumerate every directory entry by raw `OsString`, including names that
+/// are not valid UTF-8.
+///
+/// Publication rejects non-UTF-8 names, but removal must be able to clean
+/// up a directory a backend populated with arbitrary names: rejecting the
+/// scan would strand the sandbox in `RecoveryRequired` with destroy as the
+/// only exit, and destroy itself calls this removal path.
+fn directory_names_os(
+    directory: &OwnedStateDirectory,
+    operation: &'static str,
+) -> Result<Vec<std::ffi::OsString>> {
+    let scan = openat(
+        directory.descriptor(),
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| {
+        io_error(
+            operation,
+            directory.configured_path(),
+            std::io::Error::from(source),
+        )
+    })?;
+    let entries = Dir::read_from(&scan).map_err(|source| {
+        io_error(
+            operation,
+            directory.configured_path(),
+            std::io::Error::from(source),
+        )
+    })?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            io_error(
+                operation,
+                directory.configured_path(),
+                std::io::Error::from(source),
+            )
+        })?;
+        let name = entry.file_name();
+        let name_bytes = name.to_bytes();
+        if name_bytes != b"." && name_bytes != b".." {
+            names.push(std::ffi::OsStr::from_bytes(name_bytes).to_os_string());
+        }
+    }
+    Ok(names)
+}
+
 fn hash_artifact(artifact: &mut OwnedArtifact, name: &str) -> Result<CheckpointArtifact> {
     artifact
         .file
@@ -1900,45 +1957,142 @@ fn remove_owned_directory_bounded(
         )));
     }
     require_linked_directory(parent, name, &directory)?;
-    let mut entries: Vec<_> = directory_names(&directory, "scan checkpoint scratch directory")?
-        .into_iter()
-        .collect();
+    // Use raw OsString enumeration so removal can clean up non-UTF-8 names
+    // a backend may have created; publication rejects them, but removal must
+    // not strand the sandbox in RecoveryRequired because it cannot scan.
+    let mut entries: Vec<_> = directory_names_os(&directory, "scan checkpoint scratch directory")?;
     entries.sort();
     for entry in entries {
         // Classification is deliberately laxer than payload validation:
         // publication rejects symlinks, FIFOs, sockets, and devices, and
         // removal must be able to delete exactly those rejected entries,
         // so anything that is not a directory is simply unlinked.
-        let stat = statat(
-            directory.descriptor(),
-            entry.as_str(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|source| {
-            io_error(
-                "inspect checkpoint scratch entry",
-                directory.configured_path().join(&entry),
-                std::io::Error::from(source),
-            )
-        })?;
+        let stat = statat(directory.descriptor(), &entry, AtFlags::SYMLINK_NOFOLLOW).map_err(
+            |source| {
+                io_error(
+                    "inspect checkpoint scratch entry",
+                    directory.configured_path().join(&entry),
+                    std::io::Error::from(source),
+                )
+            },
+        )?;
         if FileType::from_raw_mode(stat.st_mode as _) == FileType::Directory {
-            let child =
-                required_child_directory(&directory, &entry, "open checkpoint scratch directory")?;
-            remove_owned_directory_bounded(&directory, &entry, child, depth + 1)?;
-        } else {
-            unlinkat(directory.descriptor(), entry.as_str(), AtFlags::empty()).map_err(
-                |source| {
+            // Non-UTF-8 directory names cannot appear in the manifest, so
+            // the linkage check is skipped; the recursive removal still
+            // traverses and cleans the subtree.
+            if let Some(name_str) = entry.to_str() {
+                let child = required_child_directory(
+                    &directory,
+                    name_str,
+                    "open checkpoint scratch directory",
+                )?;
+                remove_owned_directory_bounded(&directory, name_str, child, depth + 1)?;
+            } else {
+                let child_fd = openat(
+                    directory.descriptor(),
+                    &entry,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|source| {
                     io_error(
-                        "remove checkpoint scratch file",
+                        "open checkpoint scratch directory with non-UTF-8 name",
                         directory.configured_path().join(&entry),
                         std::io::Error::from(source),
                     )
-                },
-            )?;
+                })?;
+                let child =
+                    OwnedStateDirectory::new(directory.configured_path().join(&entry), child_fd);
+                remove_owned_directory_bounded_os(&directory, &entry, child, depth + 1)?;
+            }
+        } else {
+            unlinkat(directory.descriptor(), &entry, AtFlags::empty()).map_err(|source| {
+                io_error(
+                    "remove checkpoint scratch file",
+                    directory.configured_path().join(&entry),
+                    std::io::Error::from(source),
+                )
+            })?;
         }
     }
     sync_directory(&directory)?;
     require_linked_directory(parent, name, &directory)?;
+    unlinkat(parent.descriptor(), name, AtFlags::REMOVEDIR).map_err(|source| {
+        io_error(
+            "remove checkpoint scratch directory",
+            parent.configured_path().join(name),
+            std::io::Error::from(source),
+        )
+    })
+}
+
+/// Remove a directory tree whose name is not valid UTF-8.
+///
+/// Publication rejects non-UTF-8 names, so this path is only reachable
+/// through removal of a rejected or partially-written payload. The linkage
+/// check against the parent is skipped because the parent's manifest cannot
+/// record a non-UTF-8 name; the subtree is still traversed and cleaned.
+fn remove_owned_directory_bounded_os(
+    parent: &OwnedStateDirectory,
+    name: &std::ffi::OsStr,
+    directory: OwnedStateDirectory,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_REMOVAL_DEPTH {
+        return Err(invariant(format!(
+            "checkpoint directory {} is nested too deeply to remove",
+            directory.configured_path().display()
+        )));
+    }
+    let mut entries: Vec<_> = directory_names_os(&directory, "scan checkpoint scratch directory")?;
+    entries.sort();
+    for entry in entries {
+        let stat = statat(directory.descriptor(), &entry, AtFlags::SYMLINK_NOFOLLOW).map_err(
+            |source| {
+                io_error(
+                    "inspect checkpoint scratch entry",
+                    directory.configured_path().join(&entry),
+                    std::io::Error::from(source),
+                )
+            },
+        )?;
+        if FileType::from_raw_mode(stat.st_mode as _) == FileType::Directory {
+            if let Some(name_str) = entry.to_str() {
+                let child = required_child_directory(
+                    &directory,
+                    name_str,
+                    "open checkpoint scratch directory",
+                )?;
+                remove_owned_directory_bounded(&directory, name_str, child, depth + 1)?;
+            } else {
+                let child_fd = openat(
+                    directory.descriptor(),
+                    &entry,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|source| {
+                    io_error(
+                        "open checkpoint scratch directory with non-UTF-8 name",
+                        directory.configured_path().join(&entry),
+                        std::io::Error::from(source),
+                    )
+                })?;
+                let child =
+                    OwnedStateDirectory::new(directory.configured_path().join(&entry), child_fd);
+                remove_owned_directory_bounded_os(&directory, &entry, child, depth + 1)?;
+            }
+        } else {
+            unlinkat(directory.descriptor(), &entry, AtFlags::empty()).map_err(|source| {
+                io_error(
+                    "remove checkpoint scratch file",
+                    directory.configured_path().join(&entry),
+                    std::io::Error::from(source),
+                )
+            })?;
+        }
+    }
+    sync_directory(&directory)?;
     unlinkat(parent.descriptor(), name, AtFlags::REMOVEDIR).map_err(|source| {
         io_error(
             "remove checkpoint scratch directory",
@@ -2295,6 +2449,27 @@ mod tests {
 
         assert_eq!(error.outcome(), CheckpointPublishOutcome::KnownUnpublished);
         assert!(error.to_string().contains("is empty"));
+        store
+            .abort(stage)
+            .expect("a rejected payload must remain removable");
+    }
+
+    #[test]
+    fn publish_rejects_an_empty_backend_subtree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = store(&temp);
+        let sandbox_id = Uuid::new_v4();
+        let stage = store.begin(sandbox_id).expect("begin checkpoint");
+        // Write only the storage rootfs capture; leave the backend subtree empty.
+        std::fs::write(stage.storage_payload_dir().join("rootfs.snap"), b"rootfs")
+            .expect("rootfs capture");
+
+        let error = store
+            .publish(&stage, commit_input(None))
+            .expect_err("an empty backend subtree must fail even with rootfs present");
+
+        assert_eq!(error.outcome(), CheckpointPublishOutcome::KnownUnpublished);
+        assert!(error.to_string().contains("empty backend payload subtree"));
         store
             .abort(stage)
             .expect("a rejected payload must remain removable");
