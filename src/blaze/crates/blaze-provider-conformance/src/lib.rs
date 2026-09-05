@@ -10,12 +10,13 @@ pub use example_provider::ExampleFileProvider;
 use std::collections::HashSet;
 
 use blaze_provider_api::{
-    AttachmentAccess, AttachmentRole, AttachmentSharing, CheckpointSubmission, CommitRequest,
-    DataPlaneProvider, FinalizeRequest, InspectRequest, InventorySnapshot, LeaseBinding,
-    LeaseState, PROVIDER_CONTRACT_VERSION, PrepareRequest, PrepareSource, PreparedLease,
-    PreparedResources, ProviderCheckpointRef, ProviderDescriptor, ProviderError,
-    ProviderSuspensionRef, PublicTransitionRef, ReconcileAction, ReleaseRequest, RequestContext,
-    RetireCheckpointResult, RetireSuspensionResult, StopRequest, SuspensionSubmission,
+    AttachmentAccess, AttachmentRole, AttachmentSharing, CapacityRequest, CapacitySnapshot,
+    CheckpointSubmission, CommitRequest, DataPlaneProvider, DrainRequest, DrainResult,
+    FinalizeRequest, InspectRequest, InventorySnapshot, LeaseBinding, LeaseState,
+    PROVIDER_CONTRACT_VERSION, PrepareRequest, PrepareSource, PreparedLease, PreparedResources,
+    ProviderCheckpointRef, ProviderDescriptor, ProviderError, ProviderSuspensionRef,
+    PublicTransitionRef, ReconcileAction, ReleaseRequest, RequestContext, RetireCheckpointResult,
+    RetireSuspensionResult, StopRequest, SuspensionSubmission,
 };
 use thiserror::Error;
 
@@ -43,6 +44,9 @@ pub enum ConformanceError {
     /// Suspension identity or provider content is invalid.
     #[error("provider suspension response is invalid")]
     InvalidSuspension,
+    /// Capacity scope, revision, accounting, or drain identity is invalid.
+    #[error("provider capacity response is invalid")]
+    InvalidCapacity,
 }
 
 /// Failure reported by the reusable create-and-delete contract exercise.
@@ -388,6 +392,52 @@ pub fn validate_suspension_retirement(
     Ok(())
 }
 
+/// Validate one complete and mutually exclusive capacity observation.
+pub fn validate_capacity_snapshot(
+    descriptor: ProviderDescriptor,
+    request: CapacityRequest,
+    snapshot: CapacitySnapshot,
+) -> Result<(), ConformanceError> {
+    if descriptor.provider_instance_id.is_nil()
+        || snapshot.provider_instance_id != descriptor.provider_instance_id
+        || snapshot.scope != request.scope
+        || snapshot.scope.class_digest == [0; 32]
+        || (snapshot.class.root_filesystem_capacity_bytes == 0
+            && snapshot.class.guest_memory_capacity_bytes == 0)
+        || snapshot.class.digest() != snapshot.scope.class_digest
+        || snapshot.revision == 0
+        || snapshot.checked_total().is_none()
+    {
+        return Err(ConformanceError::InvalidCapacity);
+    }
+    Ok(())
+}
+
+/// Validate a drain acknowledgement and its post-request capacity snapshot.
+pub fn validate_drain_result(
+    descriptor: ProviderDescriptor,
+    request: DrainRequest,
+    result: DrainResult,
+) -> Result<(), ConformanceError> {
+    if request.operation_id.is_nil()
+        || result.operation_id != request.operation_id
+        || result.deferred_in_use > result.snapshot.draining
+        || result.snapshot.accepting_allocations
+        || result.snapshot.ready != 0
+        || result.snapshot.building != 0
+        || result.snapshot.in_use != 0
+    {
+        return Err(ConformanceError::InvalidCapacity);
+    }
+    validate_capacity_snapshot(
+        descriptor,
+        CapacityRequest {
+            scope: request.scope,
+        },
+        result.snapshot,
+    )
+}
+
 /// Map a conformance violation to the public provider error category.
 pub fn invalid_response(_: ConformanceError) -> ProviderError {
     ProviderError::InvalidResponse
@@ -621,6 +671,83 @@ mod tests {
                 },
             ),
             Err(ConformanceError::InvalidSuspension)
+        );
+    }
+
+    #[test]
+    fn capacity_and_drain_require_exact_scope_identity_and_accounting() {
+        let descriptor = ProviderDescriptor {
+            contract_version: PROVIDER_CONTRACT_VERSION,
+            provider_instance_id: Uuid::new_v4(),
+        };
+        let class = blaze_provider_api::CapacityClass {
+            root_filesystem_capacity_bytes: 4 * 1024 * 1024 * 1024,
+            guest_memory_capacity_bytes: 512 * 1024 * 1024,
+        };
+        let scope = blaze_provider_api::CapacityScope {
+            backend: blaze_core::backend::BackendKind::Firecracker,
+            class_digest: class.digest(),
+        };
+        let request = CapacityRequest { scope };
+        let snapshot = CapacitySnapshot {
+            provider_instance_id: descriptor.provider_instance_id,
+            scope,
+            class,
+            revision: 7,
+            ready: 3,
+            building: 1,
+            in_use: 2,
+            draining: 1,
+            quarantined: 0,
+            accepting_allocations: true,
+        };
+        validate_capacity_snapshot(descriptor, request, snapshot).expect("capacity snapshot");
+        assert_eq!(snapshot.checked_total(), Some(7));
+
+        let drain = DrainRequest {
+            scope,
+            operation_id: Uuid::new_v4(),
+        };
+        validate_drain_result(
+            descriptor,
+            drain,
+            DrainResult {
+                operation_id: drain.operation_id,
+                removed_ready: 3,
+                deferred_in_use: 2,
+                snapshot: CapacitySnapshot {
+                    revision: 8,
+                    ready: 0,
+                    building: 0,
+                    in_use: 0,
+                    draining: 2,
+                    accepting_allocations: false,
+                    ..snapshot
+                },
+            },
+        )
+        .expect("drain result");
+
+        let invalid = CapacitySnapshot {
+            ready: u64::MAX,
+            building: 1,
+            ..snapshot
+        };
+        assert_eq!(
+            validate_capacity_snapshot(descriptor, request, invalid),
+            Err(ConformanceError::InvalidCapacity)
+        );
+
+        let mismatched_class = CapacitySnapshot {
+            class: blaze_provider_api::CapacityClass {
+                root_filesystem_capacity_bytes: class.root_filesystem_capacity_bytes + 1,
+                ..class
+            },
+            ..snapshot
+        };
+        assert_eq!(
+            validate_capacity_snapshot(descriptor, request, mismatched_class),
+            Err(ConformanceError::InvalidCapacity)
         );
     }
 }

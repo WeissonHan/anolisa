@@ -160,8 +160,8 @@ Blaze 通过 `/v1/sandboxes` 提供沙箱生命周期和客户机操作。
 | POST | `/v1/sandboxes/{id}/hibernate` | 持久化 VM 状态并释放正在运行的后端 |
 | POST | `/v1/sandboxes/{id}/resume` | 恢复休眠的 sandbox，并等待已启用的 guest 通信就绪 |
 | GET | `/v1/pools` | 预留接口；返回 `501` |
-| GET | `/v1/pools/{backend}/{class}` | 预留接口；返回 `501` |
-| POST | `/v1/pools/{backend}/{class}/drain` | 预留接口；返回 `501` |
+| GET | `/v1/pools/{backend}/{class}` | 查询构建时提供者的数据面容量分区；标准文件提供者返回 `501` |
+| POST | `/v1/pools/{backend}/{class}/drain` | 排空构建时提供者的数据面容量分区，但不驱逐活动沙箱；标准文件提供者返回 `501` |
 | PUT | `/v1/pools/{backend}/{class}/sizing` | 预留接口；返回 `501` |
 | GET | `/v1/templates` | 列出已发布 template 的名称 |
 | GET | `/v1/templates/{name}` | 查看已发布 template 的 metadata |
@@ -170,6 +170,10 @@ Blaze 通过 `/v1/sandboxes` 提供沙箱生命周期和客户机操作。
 | GET | `/v1/hooks` | 列出内核 hook |
 | GET | `/v1/metrics` | Prometheus 指标 |
 | POST | `/v1/admin/reload` | 热加载策略 |
+
+在提供者容量接口中，`{class}` 是由公开根文件系统和客户机内存容量计算出的 64 字符
+小写摘要，不是提供者名称或工作负载类别。规范摘要、计数和排空合同见
+[提供者数据面容量](docs/design/provider-capacity_zh.md)。
 
 升级兼容仅接受并忽略以下内容完全一致的 daemon `[pool]` 配置段：
 

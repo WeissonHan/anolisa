@@ -150,7 +150,16 @@ read 响应过大时返回 HTTP 502 和
 
 ## 可复用实例管理
 
-四个 `/v1/pools` 管理接口同样返回 HTTP 501。`storage.pool_size` 和
+`GET /v1/pools` 和 `PUT /v1/pools/{backend}/{class}/sizing` 是预留接口，
+始终返回 HTTP 501。构建时提供者实现 `DataPlaneCapacity` 后，守护进程还可提供
+`GET /v1/pools/{backend}/{class}` 和
+`POST /v1/pools/{backend}/{class}/drain`；标准文件提供者对这两个带范围的接口
+返回 HTTP 501。它们只查询或排空提供者持有的数据面容量，不管理可复用沙箱、后端
+进程、网络或客户机状态。排空会停止新分配、删除空闲资源，并把活动租约占用资源的
+删除推迟到租约释放后；不会驱逐沙箱。`{class}` 是根据根文件系统和客户机内存要求
+计算出的 64 字符小写摘要。
+
+`storage.pool_size` 和
 `storage.prefork` 始终会被拒绝；除历史软件包的精确默认值外，任何 `[pool]`
 配置段也会失败。软件包升级时，只会临时接受并忽略旧版守护进程配置和两份默认策略
 原样附带的 `[pool]` 默认值，同时记录警告。这项例外用于避免 RPM 通过

@@ -2,22 +2,18 @@
 
 [中文版](lifecycle-state-consistency_zh.md)
 
-Blaze has three related lifecycle boundaries. Before serving requests, it must
-reconstruct a complete persisted sandbox inventory without exposing a partial
-result. While serving requests, it exposes lifecycle and guest operations only
-through the sandbox namespace and rejects reserved reusable-capacity operations
-before they can change ownership. Checkpoint capture must publish artifacts,
-checkpoint history, and lifecycle state in a recoverable order. Retired
-`Reset`, `Warm`, and `start_path = "warm"` values remain decodable so startup
-can clean non-terminal records that contain them.
+Blaze coordinates several related lifecycle boundaries: complete startup
+inventory publication, optional provider inventory and backend adoption,
+recoverable checkpoint and hibernation ordering, and scoped provider capacity
+control. Retired `Reset`, `Warm`, and `start_path = "warm"` values remain
+decodable only so startup can clean non-terminal records that contain them.
 
-This document defines all three boundaries. The inventory-publication protocol
-does not change the HTTP API, configuration keys, or persisted JSON format. The
-management API section defines the sandbox namespace and the reserved
-reusable-capacity boundary. The checkpoint section defines four sandbox routes —
-capture, history, pruning, and restore — the durable operation fields used to recover
-interrupted capture, and the restore journal and lifecycle contract that keep an
-interrupted restore recoverable.
+The base inventory-publication protocol does not change the management HTTP or
+configuration surface. Optional provider extensions add implementation-neutral
+durable ownership records while keeping provider references out of management
+responses. The sections below define startup reconciliation, checkpoint
+capture and restore, and the boundary between data-plane capacity and complete
+reusable sandbox instances.
 
 ## Terms and owned objects
 
@@ -230,19 +226,25 @@ Action-style reset and destroy paths are unregistered and return
 `DELETE /v1/sandboxes/{id}`. Checkpoint capture, listing, pruning, and restore
 use the four routes defined in the preceding section.
 
-The following reserved management routes also return `501 Not Implemented` and
-do not manage reusable capacity:
+An optional build-time data-plane provider may implement scoped capacity
+reporting and drain through:
 
-- `GET /v1/pools`;
-- `GET /v1/pools/{backend}/{class}`;
-- `POST /v1/pools/{backend}/{class}/drain`; and
-- `PUT /v1/pools/{backend}/{class}/sizing`.
+- `GET /v1/pools/{backend}/{class}`; and
+- `POST /v1/pools/{backend}/{class}/drain`.
+
+These routes observe or drain provider-owned data-plane resources only. They do
+not manage reusable backend processes, network resources, or sandbox lifecycle
+records. `{class}` is the canonical public capacity-requirement digest, not a
+workload-policy or provider label. The standard file provider returns
+`501 Not Implemented` for both.
+`GET /v1/pools` and `PUT /v1/pools/{backend}/{class}/sizing` remain reserved and
+always return `501`.
 
 `GET /v1/health` retains its `storage_pool` object for response compatibility;
 the file provider reports zero ready, capacity, pending, and quarantined slots.
 The metrics endpoint does not publish a reset counter because no reset route is
-registered. Pool-hit and pool-miss counters also remain absent because reusable
-capacity has no supported success path.
+registered. Pool-hit and pool-miss counters also remain absent because the
+public lifecycle does not observe provider-managed capacity claims.
 
 New sandbox creation always records `start_path = "cold"`. Lifecycle
 transitions cannot enter `Reset` or `Warm`, so no supported path can produce or

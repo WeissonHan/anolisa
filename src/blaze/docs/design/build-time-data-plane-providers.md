@@ -161,7 +161,8 @@ implementing the base contract.
 | Provider-owned checkpoint and rollback | Requires the optional checkpoint contract and full backend snapshot and restore support |
 | Create a new sandbox from a provider checkpoint | Deferred; no public endpoint or policy contract |
 | Provider-owned hibernation and resume | Requires the optional suspension contract, full backend snapshot and restore support, and the documented guest protocol operations |
-| Provider capacity and reusable-resource pools | Not supported |
+| Provider-owned reusable data-plane capacity and drain | Supported through the optional capacity contract |
+| Reusable backend, network, and complete sandbox pools | Not supported |
 | Runtime dynamic-library or process plugin discovery | Not supported |
 
 A provider that does not support restart adoption must not be presented as
@@ -171,8 +172,10 @@ fail-closed recovery rules are specified in
 ownership and compensation are specified in
 [Provider-owned Checkpoints](provider-checkpoints.md). Suspension ownership,
 guest recovery hooks, and failure handling are specified in
-[Provider-owned Suspension](provider-suspension.md). Capacity still requires a
-separate optional contract rather than unused methods in the base interface.
+[Provider-owned Suspension](provider-suspension.md). Reusable data-plane
+capacity reporting and drain behavior are specified in
+[Provider Data-plane Capacity](provider-capacity.md); this does not provide a
+complete reusable-sandbox pool.
 
 ## Verification
 

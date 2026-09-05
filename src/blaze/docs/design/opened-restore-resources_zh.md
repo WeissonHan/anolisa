@@ -33,6 +33,10 @@ Blaze 在启动 Firecracker 前，把每项声明与从已打开描述符读取�
 
 ## 范围
 
-本合同只改变 Firecracker 的恢复输入和资源所有权，不负责选择或配置存储实现、分配
-资源、定义租约协议、在守护进程重启后接管资源，也不改变检查点和休眠语义。这些职责
-属于后续独立的数据面生命周期合同。
+本合同只改变 Firecracker 的恢复输入和资源所有权。提供者选择和资源租约由
+[构建时数据面提供者](build-time-data-plane-providers_zh.md)定义。重启接管、检查点
+所有权、休眠和可复用容量分别属于独立的可选合同，参见
+[提供者重启核对](provider-reconciliation_zh.md)、
+[提供者持有的检查点](provider-checkpoints_zh.md)、
+[提供者持有的休眠数据](provider-suspension_zh.md)和
+[提供者数据面容量](provider-capacity_zh.md)。

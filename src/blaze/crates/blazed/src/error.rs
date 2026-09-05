@@ -117,6 +117,7 @@ impl BlazeDaemonError {
             BlazeDaemonError::Conflict(_) => 409,
             BlazeDaemonError::ServiceUnavailable(_) => 503,
             BlazeDaemonError::DataPlane(blaze_provider_api::ProviderError::Unsupported) => 501,
+            BlazeDaemonError::DataPlane(blaze_provider_api::ProviderError::NotFound) => 404,
             BlazeDaemonError::DataPlane(blaze_provider_api::ProviderError::Conflict) => 409,
             BlazeDaemonError::DataPlane(blaze_provider_api::ProviderError::Unavailable) => 503,
             BlazeDaemonError::PayloadTooLarge { .. } => 413,

@@ -14,11 +14,13 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use blaze_core::backend::BackendKind;
 use blaze_core::checkpoint::ProviderCheckpointRecord;
 use blaze_core::data_plane::{
     BackendProcessIdentity, DataPlaneLeaseRecord, DataPlaneLeaseState, DataPlaneSuspensionRecord,
 };
 use blaze_core::storage::{StorageSlot, TemplateStorage};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -621,6 +623,103 @@ pub struct RetireSuspensionResult {
     pub retired: bool,
 }
 
+/// Provider-independent requirements shared by every resource in one class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CapacityClass {
+    /// Largest logical root filesystem one resource in this class can serve.
+    pub root_filesystem_capacity_bytes: u64,
+    /// Largest logical guest-memory image one resource in this class can serve.
+    pub guest_memory_capacity_bytes: u64,
+}
+
+impl CapacityClass {
+    /// Derive the stable public identity of this exact requirement pair.
+    ///
+    /// Domain separation and big-endian integers make the digest independent
+    /// of Rust layout, host endianness, and extension-defined labels.
+    pub fn digest(self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"blaze.data-plane-capacity.v1\0");
+        hasher.update(self.root_filesystem_capacity_bytes.to_be_bytes());
+        hasher.update(self.guest_memory_capacity_bytes.to_be_bytes());
+        hasher.finalize().into()
+    }
+}
+
+/// Public partition whose reusable data-plane capacity is being observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CapacityScope {
+    /// Runtime backend that will consume resources from this partition.
+    pub backend: BackendKind,
+    /// Digest of the provider-independent capacity requirements.
+    pub class_digest: [u8; 32],
+}
+
+/// Read-only request for one exact capacity partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityRequest {
+    /// Backend and resource-class partition selected by the caller.
+    pub scope: CapacityScope,
+}
+
+/// Mutually exclusive public states of reusable provider resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacitySnapshot {
+    /// Build-time provider instance that produced this snapshot.
+    pub provider_instance_id: Uuid,
+    /// Exact partition represented by every count below.
+    pub scope: CapacityScope,
+    /// Public requirements whose digest identifies the selected class.
+    pub class: CapacityClass,
+    /// Monotonic partition revision used to order observations.
+    pub revision: u64,
+    /// Idle resources that are safe to claim.
+    pub ready: u64,
+    /// Resources still being created or verified.
+    pub building: u64,
+    /// Resources exclusively held by active leases and not marked for drain.
+    pub in_use: u64,
+    /// Resources that cannot be reused and will be removed when safe.
+    pub draining: u64,
+    /// Resources retained outside allocation until an operator resolves them.
+    pub quarantined: u64,
+    /// Whether `prepare` may claim capacity from this partition.
+    pub accepting_allocations: bool,
+}
+
+impl CapacitySnapshot {
+    /// Return the total accounted resources, or `None` on integer overflow.
+    pub fn checked_total(self) -> Option<u64> {
+        self.ready
+            .checked_add(self.building)?
+            .checked_add(self.in_use)?
+            .checked_add(self.draining)?
+            .checked_add(self.quarantined)
+    }
+}
+
+/// Idempotent request to stop reusing and eventually remove one partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainRequest {
+    /// Partition to drain without affecting any other partition.
+    pub scope: CapacityScope,
+    /// Stable identity reused when a drain result is unknown.
+    pub operation_id: Uuid,
+}
+
+/// Provider-confirmed result of one drain request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainResult {
+    /// Stable request identity echoed by the provider.
+    pub operation_id: Uuid,
+    /// Idle resources removed before this call returned.
+    pub removed_ready: u64,
+    /// Active resources that will be removed only after their lease releases.
+    pub deferred_in_use: u64,
+    /// Capacity state after the provider accepted the drain request.
+    pub snapshot: CapacitySnapshot,
+}
+
 /// Provider-independent failures mapped into stable Blaze diagnostics.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderError {
@@ -636,6 +735,9 @@ pub enum ProviderError {
     /// Provider does not implement the requested generic operation.
     #[error("data-plane provider operation is unsupported")]
     Unsupported,
+    /// Provider does not own the selected generic resource.
+    #[error("data-plane provider resource was not found")]
+    NotFound,
     /// Provider returned a value that violates the public contract.
     #[error("data-plane provider returned an invalid response")]
     InvalidResponse,
@@ -763,6 +865,16 @@ pub trait DataPlaneSuspend: DataPlaneCheckpoint {
     ) -> Result<RetireSuspensionResult, ProviderError>;
 }
 
+/// Optional reporting and drain control for reusable data-plane resources.
+#[async_trait]
+pub trait DataPlaneCapacity: DataPlaneProvider {
+    /// Return one complete, mutually exclusive partition snapshot.
+    async fn capacity(&self, request: CapacityRequest) -> Result<CapacitySnapshot, ProviderError>;
+
+    /// Stop reusing a partition and remove each resource when it is safe.
+    async fn drain(&self, request: DrainRequest) -> Result<DrainResult, ProviderError>;
+}
+
 /// Source-level data-plane provider compiled into one Blaze daemon binary.
 #[async_trait]
 pub trait DataPlaneProvider: Send + Sync {
@@ -784,6 +896,11 @@ pub trait DataPlaneProvider: Send + Sync {
 
     /// Return hibernation support when provider-owned immutable content exists.
     fn suspension(&self) -> Option<&dyn DataPlaneSuspend> {
+        None
+    }
+
+    /// Return reusable-resource capacity support when this provider owns it.
+    fn capacity_control(&self) -> Option<&dyn DataPlaneCapacity> {
         None
     }
 
@@ -857,6 +974,31 @@ mod tests {
         assert_eq!(
             ProviderSuspensionRef::from_record(&suspension.to_record()),
             suspension
+        );
+    }
+
+    #[test]
+    fn capacity_class_digest_has_stable_canonical_encoding() {
+        let class = CapacityClass {
+            root_filesystem_capacity_bytes: 4 * 1024 * 1024 * 1024,
+            guest_memory_capacity_bytes: 512 * 1024 * 1024,
+        };
+
+        assert_eq!(
+            class.digest(),
+            [
+                0x4c, 0xa1, 0x71, 0x9d, 0x90, 0xeb, 0x4e, 0xa1, 0x06, 0xf4, 0x7e, 0xc8, 0x25, 0x87,
+                0xbb, 0xfe, 0x5a, 0xfc, 0x72, 0x63, 0x76, 0x66, 0x9d, 0xc1, 0xc0, 0xf1, 0xdc, 0xa5,
+                0xda, 0xc6, 0xcd, 0x68,
+            ]
+        );
+        assert_ne!(
+            class.digest(),
+            CapacityClass {
+                guest_memory_capacity_bytes: class.guest_memory_capacity_bytes + 1,
+                ..class
+            }
+            .digest()
         );
     }
 }

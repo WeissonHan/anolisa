@@ -174,8 +174,8 @@ Blaze exposes sandbox lifecycle and guest operations through `/v1/sandboxes`.
 | POST | `/v1/sandboxes/{id}/hibernate` | Persist VM state and release the live backend |
 | POST | `/v1/sandboxes/{id}/resume` | Resume a hibernated sandbox and wait for enabled guest transport |
 | GET | `/v1/pools` | Reserved; returns `501` |
-| GET | `/v1/pools/{backend}/{class}` | Reserved; returns `501` |
-| POST | `/v1/pools/{backend}/{class}/drain` | Reserved; returns `501` |
+| GET | `/v1/pools/{backend}/{class}` | Report a build-time provider's data-plane capacity partition; the standard file provider returns `501` |
+| POST | `/v1/pools/{backend}/{class}/drain` | Drain a build-time provider's data-plane capacity partition without evicting active sandboxes; the standard file provider returns `501` |
 | PUT | `/v1/pools/{backend}/{class}/sizing` | Reserved; returns `501` |
 | GET | `/v1/templates` | List published template names |
 | GET | `/v1/templates/{name}` | Inspect published template metadata |
@@ -184,6 +184,12 @@ Blaze exposes sandbox lifecycle and guest operations through `/v1/sandboxes`.
 | GET | `/v1/hooks` | List kernel hooks |
 | GET | `/v1/metrics` | Prometheus metrics |
 | POST | `/v1/admin/reload` | Hot-reload policies |
+
+For provider capacity routes, `{class}` is a 64-character lowercase digest of
+the public root-filesystem and guest-memory capacities, not a provider or
+workload-class name. See
+[Provider Data-plane Capacity](docs/design/provider-capacity.md) for the
+canonical digest, accounting, and drain contracts.
 
 Upgrade compatibility accepts and ignores only this exact daemon section:
 

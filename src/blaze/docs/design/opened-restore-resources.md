@@ -39,8 +39,11 @@ so cleanup cannot close a descriptor while Firecracker still depends on it.
 
 ## Scope
 
-This contract changes only Firecracker restore input and ownership. It does not
-select or configure a storage implementation, allocate resources, define a
-lease protocol, adopt resources after daemon restart, or change checkpoint and
-hibernation semantics. Those responsibilities belong to separate data-plane
-lifecycle contracts.
+This contract changes only Firecracker restore input and ownership. Provider
+selection and resource leases are defined by
+[Build-time Data-plane Providers](build-time-data-plane-providers.md). Restart
+adoption, checkpoint ownership, suspension, and reusable capacity are separate
+optional contracts described in [Provider Reconciliation](provider-reconciliation.md),
+[Provider-owned Checkpoints](provider-checkpoints.md),
+[Provider-owned Suspension](provider-suspension.md), and
+[Provider Data-plane Capacity](provider-capacity.md).

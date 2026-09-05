@@ -133,6 +133,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "blaze-core",
+ "sha2",
  "thiserror",
  "uuid",
 ]

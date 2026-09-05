@@ -12,13 +12,15 @@ use blaze_core::lifecycle::{BackendOwnership, OperationKind, SandboxInstance, Sa
 use blaze_core::policy::RuntimeDecision;
 use blaze_core::storage::{StorageProvider, StorageSlot};
 use blaze_provider_api::{
-    AbortRequest, BeginInventoryRequest, CommitRequest, DataPlaneProvider, FinalizeRequest,
-    InspectRequest, InventoryPageRequest, LeaseBinding, LeaseState, PrepareRequest, PrepareSource,
-    PreparedLease, PreparedResources, ProviderCheckpointRef, ProviderError, PublicTransitionRef,
-    ReconcileAction, ReconcileRequest, ReleaseRequest, RequestContext, StopRequest, TemplateSource,
+    AbortRequest, BeginInventoryRequest, CapacityRequest, CapacityScope, CapacitySnapshot,
+    CommitRequest, DataPlaneProvider, DrainRequest, DrainResult, FinalizeRequest, InspectRequest,
+    InventoryPageRequest, LeaseBinding, LeaseState, PrepareRequest, PrepareSource, PreparedLease,
+    PreparedResources, ProviderCheckpointRef, ProviderError, PublicTransitionRef, ReconcileAction,
+    ReconcileRequest, ReleaseRequest, RequestContext, StopRequest, TemplateSource,
 };
 use blaze_provider_conformance::{
-    validate_descriptor, validate_inventory_lease, validate_inventory_snapshot, validate_prepared,
+    validate_capacity_snapshot, validate_descriptor, validate_drain_result,
+    validate_inventory_lease, validate_inventory_snapshot, validate_prepared,
     validate_prepared_binding, validate_reconcile_result, validate_transition,
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
@@ -589,6 +591,55 @@ impl SandboxManager {
             .get(&id)
             .cloned()
             .ok_or_else(|| BlazeDaemonError::NotFound(format!("instance {id}")))
+    }
+
+    /// Return one validated reusable-resource capacity partition.
+    pub async fn provider_capacity(&self, scope: CapacityScope) -> Result<CapacitySnapshot> {
+        if scope.class_digest == [0; 32] {
+            return Err(BlazeDaemonError::BadRequest(
+                "capacity class digest must not be zero".to_string(),
+            ));
+        }
+        let extension = self.data_plane.capacity_control().ok_or_else(|| {
+            BlazeDaemonError::UnsupportedOperation(
+                "data-plane capacity management is not implemented".to_string(),
+            )
+        })?;
+        let descriptor = self.data_plane.descriptor();
+        validate_descriptor(descriptor).map_err(|_| {
+            BlazeDaemonError::Internal("data-plane descriptor is incompatible".to_string())
+        })?;
+        let request = CapacityRequest { scope };
+        let snapshot = extension.capacity(request).await?;
+        validate_capacity_snapshot(descriptor, request, snapshot)
+            .map_err(|_| BlazeDaemonError::DataPlane(ProviderError::InvalidResponse))?;
+        Ok(snapshot)
+    }
+
+    /// Drain one exact capacity partition using an idempotent operation identity.
+    pub async fn drain_provider_capacity(&self, request: DrainRequest) -> Result<DrainResult> {
+        if request.scope.class_digest == [0; 32] || request.operation_id.is_nil() {
+            return Err(BlazeDaemonError::BadRequest(
+                "capacity drain requires nonzero class and operation identities".to_string(),
+            ));
+        }
+        let extension = self.data_plane.capacity_control().ok_or_else(|| {
+            BlazeDaemonError::UnsupportedOperation(
+                "data-plane capacity management is not implemented".to_string(),
+            )
+        })?;
+        let descriptor = self.data_plane.descriptor();
+        validate_descriptor(descriptor).map_err(|_| {
+            BlazeDaemonError::Internal("data-plane descriptor is incompatible".to_string())
+        })?;
+        let first = extension.drain(request).await;
+        let result = match first {
+            Err(ProviderError::OutcomeUnknown) => extension.drain(request).await?,
+            result => result?,
+        };
+        validate_drain_result(descriptor, request, result)
+            .map_err(|_| BlazeDaemonError::DataPlane(ProviderError::InvalidResponse))?;
+        Ok(result)
     }
 
     /// Return every sandbox for which lifecycle cleanup still owns resources.

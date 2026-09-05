@@ -18,6 +18,7 @@ use blaze_core::lifecycle::{
     BackendOwnership, OperationJournal, SandboxInstance, SandboxState, StartPath,
 };
 use blaze_core::policy::{ImageMetadata, RuntimeDecision, WorkloadClass};
+use blaze_provider_api::{CapacityScope, CapacitySnapshot, DrainRequest, DrainResult};
 use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Incoming};
@@ -178,10 +179,13 @@ async fn dispatch(
         ("POST", ["v1", "sandboxes", id, "hibernate"]) => hibernate(state, id).await,
         ("POST", ["v1", "sandboxes", id, "resume"]) => resume(state, id).await,
         ("DELETE", ["v1", "sandboxes", id]) => destroy_sandbox(state, id).await,
-        ("GET", ["v1", "pools"])
-        | ("GET", ["v1", "pools", _, _])
-        | ("POST", ["v1", "pools", _, _, "drain"])
-        | ("PUT", ["v1", "pools", _, _, "sizing"]) => pool_operation_unavailable(),
+        ("GET", ["v1", "pools", backend, class]) => pool_capacity(state, backend, class).await,
+        ("POST", ["v1", "pools", backend, class, "drain"]) => {
+            drain_pool_capacity(state, backend, class, &body).await
+        }
+        ("GET", ["v1", "pools"]) | ("PUT", ["v1", "pools", _, _, "sizing"]) => {
+            pool_operation_unavailable()
+        }
         ("GET", ["v1", "templates"]) => list_templates(state).await,
         ("GET", ["v1", "templates", name]) => get_template(state, name).await,
         ("POST", ["v1", "templates", "import"]) => import_template(state, &body).await,
@@ -661,8 +665,165 @@ fn decode_guest_file(encoded: &str, limit: usize) -> Result<Vec<u8>> {
 
 fn pool_operation_unavailable() -> Result<Response<Full<Bytes>>> {
     Err(BlazeDaemonError::UnsupportedOperation(
-        "warm pool management is not implemented".to_string(),
+        "pool inventory or sizing is not implemented".to_string(),
     ))
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct PoolCapacityResp {
+    backend: BackendKind,
+    class_sha256: String,
+    root_filesystem_capacity_bytes: u64,
+    guest_memory_capacity_bytes: u64,
+    revision: u64,
+    ready: u64,
+    building: u64,
+    in_use: u64,
+    draining: u64,
+    quarantined: u64,
+    total: u64,
+    accepting_allocations: bool,
+}
+
+impl PoolCapacityResp {
+    fn from_snapshot(snapshot: CapacitySnapshot) -> Result<Self> {
+        Ok(Self {
+            backend: snapshot.scope.backend,
+            class_sha256: encode_capacity_class_digest(snapshot.scope.class_digest),
+            root_filesystem_capacity_bytes: snapshot.class.root_filesystem_capacity_bytes,
+            guest_memory_capacity_bytes: snapshot.class.guest_memory_capacity_bytes,
+            revision: snapshot.revision,
+            ready: snapshot.ready,
+            building: snapshot.building,
+            in_use: snapshot.in_use,
+            draining: snapshot.draining,
+            quarantined: snapshot.quarantined,
+            total: snapshot.checked_total().ok_or_else(|| {
+                BlazeDaemonError::DataPlane(blaze_provider_api::ProviderError::InvalidResponse)
+            })?,
+            accepting_allocations: snapshot.accepting_allocations,
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrainPoolCapacityReq {
+    #[serde(default)]
+    operation_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+struct DrainPoolCapacityResp {
+    operation_id: Uuid,
+    removed_ready: u64,
+    deferred_in_use: u64,
+    capacity: PoolCapacityResp,
+}
+
+fn parse_capacity_scope(state: &ServerState, backend: &str, class: &str) -> Result<CapacityScope> {
+    let backend = backend
+        .parse::<BackendKind>()
+        .map_err(|_| BlazeDaemonError::BadRequest(format!("unknown pool backend {backend}")))?;
+    if backend != state.active_backend {
+        return Err(BlazeDaemonError::NotFound(format!(
+            "pool backend {backend}"
+        )));
+    }
+    Ok(CapacityScope {
+        backend,
+        class_digest: decode_capacity_class_digest(class)?,
+    })
+}
+
+fn decode_capacity_class_digest(value: &str) -> Result<[u8; 32]> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return Err(BlazeDaemonError::BadRequest(
+            "pool class must be a 64-character lowercase SHA-256 digest".to_string(),
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, output) in digest.iter_mut().enumerate() {
+        let high = decode_lower_hex(bytes[index * 2]).ok_or_else(|| {
+            BlazeDaemonError::BadRequest(
+                "pool class must be a 64-character lowercase SHA-256 digest".to_string(),
+            )
+        })?;
+        let low = decode_lower_hex(bytes[index * 2 + 1]).ok_or_else(|| {
+            BlazeDaemonError::BadRequest(
+                "pool class must be a 64-character lowercase SHA-256 digest".to_string(),
+            )
+        })?;
+        *output = (high << 4) | low;
+    }
+    if digest == [0; 32] {
+        return Err(BlazeDaemonError::BadRequest(
+            "pool class must not be the all-zero digest".to_string(),
+        ));
+    }
+    Ok(digest)
+}
+
+const fn decode_lower_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn encode_capacity_class_digest(digest: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+async fn pool_capacity(
+    state: &Arc<ServerState>,
+    backend: &str,
+    class: &str,
+) -> Result<Response<Full<Bytes>>> {
+    let scope = parse_capacity_scope(state, backend, class)?;
+    let snapshot = state.manager.provider_capacity(scope).await?;
+    json_ok(&PoolCapacityResp::from_snapshot(snapshot)?)
+}
+
+async fn drain_pool_capacity(
+    state: &Arc<ServerState>,
+    backend: &str,
+    class: &str,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>> {
+    let scope = parse_capacity_scope(state, backend, class)?;
+    let request = if body.is_empty() {
+        DrainPoolCapacityReq::default()
+    } else {
+        serde_json::from_slice(body).map_err(|error| {
+            BlazeDaemonError::BadRequest(format!("invalid pool drain body: {error}"))
+        })?
+    };
+    let result = state
+        .manager
+        .drain_provider_capacity(DrainRequest {
+            scope,
+            operation_id: request.operation_id.unwrap_or_else(Uuid::new_v4),
+        })
+        .await?;
+    drain_pool_capacity_response(result)
+}
+
+fn drain_pool_capacity_response(result: DrainResult) -> Result<Response<Full<Bytes>>> {
+    json_ok(&DrainPoolCapacityResp {
+        operation_id: result.operation_id,
+        removed_ready: result.removed_ready,
+        deferred_in_use: result.deferred_in_use,
+        capacity: PoolCapacityResp::from_snapshot(result.snapshot)?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -811,9 +972,10 @@ mod tests {
         AcquireOpts, PoolStatus, StorageAcquireError, StorageProvider, StorageSlot,
     };
     use blaze_provider_api::{
-        AbortRequest, AbortResult, BeginInventoryRequest, CheckpointSubmission, CommitRequest,
-        CommittedLease, DataPlaneCheckpoint, DataPlaneInventory, DataPlaneProvider,
-        DataPlaneSuspend, FinalizeRequest, FinalizedLease, InspectRequest, InventoryLease,
+        AbortRequest, AbortResult, BeginInventoryRequest, CapacityClass, CapacityRequest,
+        CapacitySnapshot, CheckpointSubmission, CommitRequest, CommittedLease, DataPlaneCapacity,
+        DataPlaneCheckpoint, DataPlaneInventory, DataPlaneProvider, DataPlaneSuspend, DrainRequest,
+        DrainResult, FinalizeRequest, FinalizedLease, InspectRequest, InventoryLease,
         InventoryPage, InventoryPageRequest, InventorySnapshot, LeaseBinding, LeaseState,
         ObservedLease, PrepareRequest, PreparedLease, PreparedResources, ProviderCapabilities,
         ProviderCheckpointRef, ProviderCheckpointRequest, ProviderDescriptor, ProviderError,
@@ -1051,6 +1213,173 @@ mod tests {
             request: ReleaseRequest,
         ) -> std::result::Result<ReleaseResult, ProviderError> {
             self.inner.release(request).await
+        }
+    }
+
+    struct CapacityTestProvider {
+        inner: crate::data_plane::FileDataPlaneProvider,
+        capacity: std::sync::Mutex<CapacitySnapshot>,
+        drains: std::sync::Mutex<HashMap<Uuid, DrainResult>>,
+    }
+
+    impl CapacityTestProvider {
+        fn new(storage: Arc<dyn StorageProvider>) -> Self {
+            let inner = crate::data_plane::FileDataPlaneProvider::new(storage);
+            let provider_instance_id = inner.descriptor().provider_instance_id;
+            let class = CapacityClass {
+                root_filesystem_capacity_bytes: 4 * 1024 * 1024 * 1024,
+                guest_memory_capacity_bytes: 512 * 1024 * 1024,
+            };
+            Self {
+                inner,
+                capacity: std::sync::Mutex::new(CapacitySnapshot {
+                    provider_instance_id,
+                    scope: CapacityScope {
+                        backend: BackendKind::Mock,
+                        class_digest: class.digest(),
+                    },
+                    class,
+                    revision: 1,
+                    ready: 3,
+                    building: 1,
+                    in_use: 2,
+                    draining: 0,
+                    quarantined: 1,
+                    accepting_allocations: true,
+                }),
+                drains: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DataPlaneProvider for CapacityTestProvider {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn capacity_control(&self) -> Option<&dyn DataPlaneCapacity> {
+            Some(self)
+        }
+
+        async fn probe(&self) -> std::result::Result<(), ProviderError> {
+            self.inner.probe().await
+        }
+
+        async fn prepare(
+            &self,
+            request: PrepareRequest,
+        ) -> std::result::Result<PreparedLease, ProviderError> {
+            self.inner.prepare(request).await
+        }
+
+        async fn inspect(
+            &self,
+            request: InspectRequest,
+        ) -> std::result::Result<ObservedLease, ProviderError> {
+            self.inner.inspect(request).await
+        }
+
+        async fn commit(
+            &self,
+            request: CommitRequest,
+        ) -> std::result::Result<CommittedLease, ProviderError> {
+            self.inner.commit(request).await
+        }
+
+        async fn finalize(
+            &self,
+            request: FinalizeRequest,
+        ) -> std::result::Result<FinalizedLease, ProviderError> {
+            self.inner.finalize(request).await
+        }
+
+        async fn abort(
+            &self,
+            request: AbortRequest,
+        ) -> std::result::Result<AbortResult, ProviderError> {
+            self.inner.abort(request).await
+        }
+
+        async fn stop(
+            &self,
+            request: StopRequest,
+        ) -> std::result::Result<StoppedLease, ProviderError> {
+            self.inner.stop(request).await
+        }
+
+        async fn release(
+            &self,
+            request: ReleaseRequest,
+        ) -> std::result::Result<ReleaseResult, ProviderError> {
+            self.inner.release(request).await
+        }
+    }
+
+    #[async_trait]
+    impl DataPlaneCapacity for CapacityTestProvider {
+        async fn capacity(
+            &self,
+            request: CapacityRequest,
+        ) -> std::result::Result<CapacitySnapshot, ProviderError> {
+            let snapshot = *self.capacity.lock().expect("provider capacity");
+            if snapshot.scope != request.scope {
+                return Err(ProviderError::NotFound);
+            }
+            Ok(snapshot)
+        }
+
+        async fn drain(
+            &self,
+            request: DrainRequest,
+        ) -> std::result::Result<DrainResult, ProviderError> {
+            if request.operation_id.is_nil() {
+                return Err(ProviderError::Conflict);
+            }
+            if let Some(result) = self
+                .drains
+                .lock()
+                .expect("provider drain results")
+                .get(&request.operation_id)
+                .copied()
+            {
+                return Ok(result);
+            }
+
+            let mut snapshot = self.capacity.lock().expect("provider capacity");
+            if snapshot.scope != request.scope {
+                return Err(ProviderError::NotFound);
+            }
+            let removed_ready = snapshot.ready;
+            let deferred_in_use = snapshot.in_use;
+            snapshot.revision = snapshot
+                .revision
+                .checked_add(1)
+                .ok_or(ProviderError::InvalidResponse)?;
+            snapshot.draining = snapshot
+                .draining
+                .checked_add(snapshot.building)
+                .and_then(|count| count.checked_add(snapshot.in_use))
+                .ok_or(ProviderError::InvalidResponse)?;
+            snapshot.ready = 0;
+            snapshot.building = 0;
+            snapshot.in_use = 0;
+            snapshot.accepting_allocations = false;
+            let result = DrainResult {
+                operation_id: request.operation_id,
+                removed_ready,
+                deferred_in_use,
+                snapshot: *snapshot,
+            };
+            self.drains
+                .lock()
+                .expect("provider drain results")
+                .insert(request.operation_id, result);
+            Ok(result)
         }
     }
 
@@ -2493,25 +2822,124 @@ mod tests {
             storage,
         );
 
+        let class = "2a".repeat(32);
         for (method, path) in [
-            (Method::GET, "/v1/pools"),
-            (Method::GET, "/v1/pools/mock/agent-tool"),
-            (Method::POST, "/v1/pools/mock/agent-tool/drain"),
-            (Method::PUT, "/v1/pools/mock/agent-tool/sizing"),
+            (Method::GET, "/v1/pools".to_string()),
+            (Method::GET, format!("/v1/pools/mock/{class}")),
+            (Method::POST, format!("/v1/pools/mock/{class}/drain")),
+            (Method::PUT, format!("/v1/pools/mock/{class}/sizing")),
         ] {
-            let (status, body) = handled_json(&state, method, path, Vec::new()).await;
+            let (status, body) = handled_json(&state, method, &path, Vec::new()).await;
             assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{path}");
             assert_eq!(body["status"], 501, "{path}");
-            assert!(
-                body["error"]
-                    .as_str()
-                    .expect("error")
-                    .contains("warm pool management is not implemented"),
-                "{path}"
-            );
         }
 
         let (status, body) = handled_json(&state, Method::GET, "/v1/pools/mock", Vec::new()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["status"], 404);
+    }
+
+    #[tokio::test]
+    async fn provider_capacity_routes_report_and_idempotently_drain_one_partition() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(CapacityTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider,
+        );
+
+        let capacity_class = CapacityClass {
+            root_filesystem_capacity_bytes: 4 * 1024 * 1024 * 1024,
+            guest_memory_capacity_bytes: 512 * 1024 * 1024,
+        };
+        let class = encode_capacity_class_digest(capacity_class.digest());
+        let item = format!("/v1/pools/mock/{class}");
+        let (status, capacity) = handled_json(&state, Method::GET, &item, Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(capacity["backend"], "mock");
+        assert_eq!(capacity["class_sha256"], class);
+        assert_eq!(
+            capacity["root_filesystem_capacity_bytes"],
+            4_294_967_296_u64
+        );
+        assert_eq!(capacity["guest_memory_capacity_bytes"], 536_870_912_u64);
+        assert_eq!(capacity["revision"], 1);
+        assert_eq!(capacity["ready"], 3);
+        assert_eq!(capacity["building"], 1);
+        assert_eq!(capacity["in_use"], 2);
+        assert_eq!(capacity["draining"], 0);
+        assert_eq!(capacity["quarantined"], 1);
+        assert_eq!(capacity["total"], 7);
+        assert_eq!(capacity["accepting_allocations"], true);
+        assert!(capacity.get("provider_instance_id").is_none());
+
+        let operation_id = Uuid::new_v4();
+        let body =
+            serde_json::to_vec(&json!({"operation_id": operation_id})).expect("drain request");
+        for _ in 0..2 {
+            let (status, drained) =
+                handled_json(&state, Method::POST, &format!("{item}/drain"), body.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(drained["operation_id"], operation_id.to_string());
+            assert_eq!(drained["removed_ready"], 3);
+            assert_eq!(drained["deferred_in_use"], 2);
+            assert_eq!(drained["capacity"]["revision"], 2);
+            assert_eq!(drained["capacity"]["ready"], 0);
+            assert_eq!(drained["capacity"]["building"], 0);
+            assert_eq!(drained["capacity"]["in_use"], 0);
+            assert_eq!(drained["capacity"]["draining"], 3);
+            assert_eq!(drained["capacity"]["quarantined"], 1);
+            assert_eq!(drained["capacity"]["total"], 4);
+            assert_eq!(drained["capacity"]["accepting_allocations"], false);
+        }
+
+        let (status, body) = handled_json(
+            &state,
+            Method::GET,
+            &format!("/v1/pools/firecracker/{class}"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["status"], 404);
+
+        let (status, body) = handled_json(
+            &state,
+            Method::GET,
+            &format!("/v1/pools/not-a-backend/{class}"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+
+        let (status, body) = handled_json(
+            &state,
+            Method::GET,
+            "/v1/pools/mock/not-a-digest",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+
+        let unknown = "5a".repeat(32);
+        let (status, body) = handled_json(
+            &state,
+            Method::GET,
+            &format!("/v1/pools/mock/{unknown}"),
+            Vec::new(),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["status"], 404);
     }

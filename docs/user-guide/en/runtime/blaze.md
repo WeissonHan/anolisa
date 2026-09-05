@@ -176,7 +176,19 @@ all runtime owners, so an in-flight request may observe a closed connection.
 
 ## Reusable-Instance Management
 
-The four `/v1/pools` management routes also return HTTP 501. Blaze rejects
+`GET /v1/pools` and `PUT /v1/pools/{backend}/{class}/sizing` are reserved and
+always return HTTP 501. A daemon whose build-time provider implements
+`DataPlaneCapacity` additionally serves
+`GET /v1/pools/{backend}/{class}` and
+`POST /v1/pools/{backend}/{class}/drain`; the standard file provider returns
+HTTP 501 for these scoped routes. They report and drain provider-owned
+data-plane capacity only, not reusable sandboxes, backend processes, networks,
+or guest state. Drain stops new allocations, removes idle resources, and
+defers removal of resources held by active leases; it does not evict a sandbox.
+`{class}` is the canonical 64-character lowercase digest of root-filesystem and
+guest-memory requirements.
+
+Blaze rejects
 `storage.pool_size`, `storage.prefork`, and every `[pool]` section except the
 exact historical package defaults. During an upgrade, it temporarily accepts
 and ignores only those defaults from the older daemon configuration and two
