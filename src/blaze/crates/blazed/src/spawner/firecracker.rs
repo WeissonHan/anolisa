@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use blaze_core::backend::{
     BackendKind, RestoreCapability, RestoreRequest, SnapshotKind, SnapshotRequest, SpawnRequest,
 };
+use blaze_core::data_plane::{BackendProcessIdentity, BackendRuntimeRecord};
 use blaze_core::policy::{
     BackendConfigs, FirecrackerConfig, VmConfig, parse_memory_value, to_mib_ceil,
 };
@@ -701,6 +702,93 @@ impl BackendSpawner for FirecrackerSpawner {
         .await
     }
 
+    async fn adopt(
+        &self,
+        instance_id: Uuid,
+        runtime: &BackendRuntimeRecord,
+        run_dir: OwnedRunDir,
+        guest_memory_bytes: u64,
+    ) -> Result<Option<DynBackendInstance>> {
+        let process = runtime.process.ok_or_else(|| BlazeError::BackendError {
+            msg: format!("instance {instance_id} has no adoptable backend process identity"),
+        })?;
+        if !verify_live_process(instance_id, process).await? {
+            return Ok(None);
+        }
+
+        let files = configured_runtime_files(
+            runtime_files(
+                run_dir.path().join("api.sock"),
+                run_dir.path().join("vsock.uds"),
+                run_dir.path().join("firecracker.pid"),
+                stopped_marker(run_dir.path()),
+                run_dir.path().join("network.json"),
+            ),
+            runtime.guest_transport,
+        );
+        validate_pid_handoff_identity(&files.pid_file, process)?;
+        let capture = FirecrackerCapture::from_running(
+            files.api_socket.clone(),
+            self.api_timeout,
+            guest_memory_bytes,
+        )
+        .await?;
+        if runtime.version.as_deref() != Some(capture.backend_version.as_str()) {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "instance {instance_id} running backend version does not match durable state"
+                ),
+            });
+        }
+
+        let network = if runtime.network_slot {
+            let (recorded, _) = read_network_metadata(&files.network_file)?;
+            if recorded.owner() != instance_id {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "network record owner {} does not match instance {instance_id}",
+                        recorded.owner()
+                    ),
+                });
+            }
+            let observed = self
+                .network
+                .find_by_owner(instance_id)
+                .await?
+                .ok_or_else(|| BlazeError::BackendError {
+                    msg: format!("instance {instance_id} network namespace is missing"),
+                })?;
+            if observed != recorded {
+                return Err(BlazeError::BackendError {
+                    msg: format!("instance {instance_id} network identity does not match"),
+                });
+            }
+            Some(observed)
+        } else {
+            if files.network_file.exists()
+                || self.network.find_by_owner(instance_id).await?.is_some()
+            {
+                return Err(BlazeError::BackendError {
+                    msg: format!("instance {instance_id} has an unexpected retained network owner"),
+                });
+            }
+            None
+        };
+
+        let owner = FirecrackerInstance::new(
+            instance_id,
+            None,
+            Some(capture),
+            files,
+            network,
+            self.network.clone(),
+            runtime.console_log,
+        )
+        .with_run_dir(run_dir)
+        .with_adopted_process(process);
+        Ok(Some(Arc::new(owner)))
+    }
+
     async fn probe(&self, binary_path: &Path) -> Result<bool> {
         if !binary_path.is_file() || !firecracker_launch_tools_available(executable_in_path) {
             return Ok(false);
@@ -728,6 +816,8 @@ impl BackendSpawner for FirecrackerSpawner {
 struct FirecrackerInstance {
     instance_id: Uuid,
     child: Mutex<Option<Child>>,
+    /// Exact process retained across daemon restart, if this owner was adopted.
+    adopted_process: Option<BackendProcessIdentity>,
     exit_result: Mutex<Option<SpawnResult>>,
     /// API ownership plus the version frozen when this owner started.
     ///
@@ -804,6 +894,7 @@ impl FirecrackerInstance {
         Self {
             instance_id,
             child: Mutex::new(child),
+            adopted_process: None,
             exit_result: Mutex::new(None),
             capture,
             run_dir: None,
@@ -828,6 +919,11 @@ impl FirecrackerInstance {
         attachments: Option<ProviderRestoreAttachments>,
     ) -> Self {
         self._provider_attachments = attachments;
+        self
+    }
+
+    fn with_adopted_process(mut self, process: BackendProcessIdentity) -> Self {
+        self.adopted_process = Some(process);
         self
     }
 
@@ -916,6 +1012,23 @@ impl BackendInstance for FirecrackerInstance {
 
     fn records_console_log(&self) -> bool {
         self.records_console_log
+    }
+
+    fn runtime_record(&self) -> BackendRuntimeRecord {
+        let process = self.adopted_process.or_else(|| {
+            self.child
+                .try_lock()
+                .ok()
+                .and_then(|child| child.as_ref().and_then(Child::id))
+                .and_then(observe_process_identity)
+        });
+        BackendRuntimeRecord {
+            process,
+            version: self.version().map(str::to_owned),
+            guest_transport: !self.files.guest_socket.as_os_str().is_empty(),
+            network_slot: self.holds_network_slot,
+            console_log: self.records_console_log,
+        }
     }
 
     async fn pause(&self) -> Result<()> {
@@ -1024,6 +1137,11 @@ impl BackendInstance for FirecrackerInstance {
         let result = {
             let mut guard = self.child.lock().await;
             let Some(child) = guard.as_mut() else {
+                if let Some(process) = self.adopted_process
+                    && verify_live_process(self.instance_id, process).await?
+                {
+                    return Ok(None);
+                }
                 let result = self.exit_result.lock().await.unwrap_or(SpawnResult {
                     instance_id: self.instance_id,
                     exit_code: None,
@@ -1056,6 +1174,16 @@ impl BackendInstance for FirecrackerInstance {
         }
         if let Some(child) = guard.as_mut() {
             terminate_child(child, "firecracker").await?;
+        } else if let Some(process) = self.adopted_process
+            && verify_live_process(self.instance_id, process).await?
+        {
+            #[cfg(target_os = "linux")]
+            terminate_recorded_process(self.instance_id, &self.files.pid_file, "firecracker")
+                .await?;
+            #[cfg(not(target_os = "linux"))]
+            return Err(BlazeError::BackendError {
+                msg: "live Firecracker adoption is supported only on Linux".to_string(),
+            });
         }
         record_backend_stopped(&self.files.stopped_marker).await?;
         *guard = None;
@@ -2205,6 +2333,101 @@ fn parse_runtime_version(response: &[u8]) -> Result<String> {
     Ok(format!("Firecracker v{version}"))
 }
 
+#[cfg(target_os = "linux")]
+fn observe_process_identity(pid: u32) -> Option<BackendProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_process_start_time(&stat).map(|start_time_ticks| BackendProcessIdentity {
+        pid,
+        start_time_ticks,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn observe_process_identity(_pid: u32) -> Option<BackendProcessIdentity> {
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_process_start_time(stat: &str) -> Option<u64> {
+    // The command name is parenthesized and may itself contain spaces. Fields
+    // after its final ')' begin with process state (field 3); start time is
+    // field 22, therefore index 19 in that remaining sequence.
+    let close = stat.rfind(')')?;
+    stat.get(close + 1..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn validate_pid_handoff_identity(pid_file: &Path, expected: BackendProcessIdentity) -> Result<()> {
+    let actual: u32 = std::fs::read_to_string(pid_file)?
+        .trim()
+        .parse()
+        .map_err(|error| BlazeError::BackendError {
+            msg: format!(
+                "invalid Firecracker PID handoff {}: {error}",
+                pid_file.display()
+            ),
+        })?;
+    if actual != expected.pid {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "Firecracker PID handoff {} records {actual}, expected {}",
+                pid_file.display(),
+                expected.pid
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn verify_live_process(instance_id: Uuid, expected: BackendProcessIdentity) -> Result<bool> {
+    let process_dir = PathBuf::from(format!("/proc/{}", expected.pid));
+    let stat = match tokio::fs::read_to_string(process_dir.join("stat")).await {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let start_time_ticks =
+        parse_process_start_time(&stat).ok_or_else(|| BlazeError::BackendError {
+            msg: format!("cannot parse process identity for pid {}", expected.pid),
+        })?;
+    if start_time_ticks != expected.start_time_ticks {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "refusing to adopt pid {} because its start time changed",
+                expected.pid
+            ),
+        });
+    }
+    let environ = tokio::fs::read(process_dir.join("environ")).await?;
+    let owner = format!("BLAZE_INSTANCE_ID={instance_id}");
+    if !environ
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == owner.as_bytes())
+    {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "refusing to adopt pid {} because its sandbox identity differs",
+                expected.pid
+            ),
+        });
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn verify_live_process(
+    _instance_id: Uuid,
+    _expected: BackendProcessIdentity,
+) -> Result<bool> {
+    Err(BlazeError::BackendError {
+        msg: "live Firecracker adoption is supported only on Linux".to_string(),
+    })
+}
+
 async fn wait_for_socket(socket: &Path, child: &mut Child, timeout: Duration) -> Result<()> {
     let started = Instant::now();
     loop {
@@ -2476,6 +2699,19 @@ mod tests {
         assert!(message.contains("400 Bad Request"));
         assert!(!message.contains("must-not-appear"));
     }
+
+    #[test]
+    fn process_start_time_parser_handles_spaces_in_command_names() {
+        let mut fields = vec!["S".to_string()];
+        fields.extend((4_u64..=21).map(|value| value.to_string()));
+        fields.push("987654".to_string());
+        fields.push("23".to_string());
+        let stat = format!("42 (backend worker) {}", fields.join(" "));
+
+        assert_eq!(parse_process_start_time(&stat), Some(987654));
+        assert_eq!(parse_process_start_time("42 malformed"), None);
+    }
+
     #[test]
     fn an_owner_without_a_version_keeps_running_but_refuses_capture() {
         // A start whose VM answers on its API socket but not for its version stays

@@ -58,6 +58,13 @@ UUID 所属目录及其中的 `state.json` 都必须使用规范形式并且可�
 未能证明清理完成，daemon 会在打开 API 监听器前停止，并保留原条目供运维人员
 修复。
 
+如果构建时提供者实现 `DataPlaneInventory`，启动流程还会冻结并校验一份完整的
+提供者资源清单。只有状态干净的 `Running` 记录、准确的 `Committed` 或
+`Finalized` 租约以及存活后端身份三方一致时，Blaze 才会接管。提供者清单本身
+无效会阻止 API 监听；单个沙箱不一致则隔离资源并保留为
+`RecoveryRequired`。标准文件提供者以及没有该扩展的提供者不会静默接管存活
+后端。
+
 Blaze 只支持通过 `StateStore` 写入状态。生产 daemon 会一直持有 state root 的
 排他 advisory lock，启动扫描也会持有进程内 ownership map 锁直至发布，因此遵守
 这些锁的 Blaze 写入操作会被串行化。未参与 state root 锁、直接修改状态文件的

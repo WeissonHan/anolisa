@@ -11,9 +11,10 @@ use std::collections::HashSet;
 
 use blaze_provider_api::{
     AttachmentAccess, AttachmentRole, AttachmentSharing, CommitRequest, DataPlaneProvider,
-    FinalizeRequest, InspectRequest, LeaseBinding, LeaseState, PROVIDER_CONTRACT_VERSION,
-    PrepareRequest, PrepareSource, PreparedLease, PreparedResources, ProviderDescriptor,
-    ProviderError, PublicTransitionRef, ReleaseRequest, RequestContext, StopRequest,
+    FinalizeRequest, InspectRequest, InventorySnapshot, LeaseBinding, LeaseState,
+    PROVIDER_CONTRACT_VERSION, PrepareRequest, PrepareSource, PreparedLease, PreparedResources,
+    ProviderDescriptor, ProviderError, PublicTransitionRef, ReconcileAction, ReleaseRequest,
+    RequestContext, StopRequest,
 };
 use thiserror::Error;
 
@@ -32,6 +33,9 @@ pub enum ConformanceError {
     /// Prepared resources cannot satisfy the selected source.
     #[error("prepared provider resources are invalid")]
     InvalidResources,
+    /// Inventory snapshot or lease identity cannot be trusted.
+    #[error("provider inventory is invalid")]
+    InvalidInventory,
 }
 
 /// Failure reported by the reusable create-and-delete contract exercise.
@@ -155,6 +159,52 @@ pub fn validate_transition(
     Ok(())
 }
 
+/// Validate one frozen inventory identity before requesting any pages.
+pub fn validate_inventory_snapshot(
+    descriptor: ProviderDescriptor,
+    snapshot: InventorySnapshot,
+) -> Result<(), ConformanceError> {
+    validate_descriptor(descriptor)?;
+    if snapshot.provider_instance_id != descriptor.provider_instance_id
+        || snapshot.snapshot_id.is_nil()
+    {
+        return Err(ConformanceError::InvalidInventory);
+    }
+    Ok(())
+}
+
+/// Validate one lease returned by a provider inventory.
+pub fn validate_inventory_lease(
+    descriptor: ProviderDescriptor,
+    binding: LeaseBinding,
+) -> Result<(), ConformanceError> {
+    if binding.provider_instance_id != descriptor.provider_instance_id
+        || binding.context.instance_id.is_nil()
+        || binding.context.request_id.is_nil()
+        || binding.context.operation_id.is_nil()
+        || binding.context.lease_id.is_nil()
+        || binding.context.generation == 0
+        || binding.generation < binding.context.generation
+    {
+        return Err(ConformanceError::InvalidInventory);
+    }
+    Ok(())
+}
+
+/// Validate the exact transition required by one reconciliation action.
+pub fn validate_reconcile_result(
+    previous: LeaseBinding,
+    next: LeaseBinding,
+    action: ReconcileAction,
+) -> Result<(), ConformanceError> {
+    let expected = match action {
+        ReconcileAction::Adopt { .. } => LeaseState::Finalized,
+        ReconcileAction::Quarantine => LeaseState::Quarantined,
+        ReconcileAction::Release => LeaseState::Released,
+    };
+    validate_transition(previous, next, expected)
+}
+
 /// Map a conformance violation to the public provider error category.
 pub fn invalid_response(_: ConformanceError) -> ProviderError {
     ProviderError::InvalidResponse
@@ -273,6 +323,41 @@ mod tests {
         assert_eq!(
             validate_transition(previous, stale, LeaseState::Committed),
             Err(ConformanceError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn inventory_and_reconciliation_reject_identity_drift() {
+        let previous = binding(LeaseState::Finalized, 4);
+        let descriptor = ProviderDescriptor {
+            contract_version: PROVIDER_CONTRACT_VERSION,
+            provider_instance_id: previous.provider_instance_id,
+        };
+        validate_inventory_snapshot(
+            descriptor,
+            InventorySnapshot {
+                provider_instance_id: descriptor.provider_instance_id,
+                snapshot_id: Uuid::new_v4(),
+            },
+        )
+        .expect("snapshot");
+        validate_inventory_lease(descriptor, previous).expect("inventory lease");
+
+        let quarantined = LeaseBinding {
+            generation: 5,
+            state: LeaseState::Quarantined,
+            ..previous
+        };
+        validate_reconcile_result(previous, quarantined, ReconcileAction::Quarantine)
+            .expect("quarantine transition");
+
+        let wrong_provider = LeaseBinding {
+            provider_instance_id: Uuid::new_v4(),
+            ..previous
+        };
+        assert_eq!(
+            validate_inventory_lease(descriptor, wrong_provider),
+            Err(ConformanceError::InvalidInventory)
         );
     }
 }

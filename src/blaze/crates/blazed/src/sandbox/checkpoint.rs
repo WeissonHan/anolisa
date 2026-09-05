@@ -34,7 +34,7 @@ enum PublishBoundaryResult {
 
 enum HeadBoundaryResult {
     Updated {
-        instance: SandboxInstance,
+        instance: Box<SandboxInstance>,
         metadata: Box<CheckpointMetadata>,
     },
     KnownUnchanged {
@@ -428,13 +428,13 @@ impl SandboxManager {
                 return HeadBoundaryResult::RecoveryRequired { error };
             }
             HeadBoundaryResult::Updated {
-                instance,
+                instance: Box::new(instance),
                 metadata: Box::new(metadata),
             }
         })
         .await;
         let (mut instance, metadata) = match head {
-            Ok(HeadBoundaryResult::Updated { instance, metadata }) => (instance, *metadata),
+            Ok(HeadBoundaryResult::Updated { instance, metadata }) => (*instance, *metadata),
             Ok(HeadBoundaryResult::KnownUnchanged { error }) => {
                 return self
                     .finish_failed_published_checkpoint(id, &backend, error)

@@ -76,8 +76,12 @@ Startup follows this order:
    directory and `state.json` against the objects accepted by the first scan.
 5. Only after every check succeeds, publish the retained-owner map and return
    the instance map to `ServerState`.
-6. Reconcile the accepted sandbox records, then bind the configured Unix and
-   TCP API listeners.
+6. If the provider exposes `DataPlaneInventory`, freeze and validate one
+   complete provider snapshot before per-sandbox reconciliation. Adopt a clean
+   `Running` sandbox only when its durable record, exact provider lease, and
+   live backend identity agree; quarantine mismatches as `RecoveryRequired`.
+   A provider without that extension follows the standard cleanup path.
+7. Bind the configured Unix and TCP API listeners only after reconciliation.
 
 The name-set comparison must finish before object revalidation begins. This
 ordering prevents an early owner from being accepted while the final directory
@@ -96,11 +100,13 @@ operator inspection and repair. Existing cleanup of state-publication staging
 entries remains separate from rejected-record handling.
 
 After a complete inventory has been accepted, startup reconciliation processes
-each non-terminal sandbox independently. A cleanup failure for one sandbox can
-retain that sandbox in memory as `RecoveryRequired` without turning the already
-validated inventory into a partial one. Blaze attempts to persist the recovery
-state; if that write also fails, reconciliation reports the additional error
-and the durable record may still contain its previous state.
+each non-terminal sandbox independently. It may adopt a sandbox through the
+optional provider inventory contract or clean it through the standard path. An
+adoption mismatch or cleanup failure can retain that sandbox in memory as
+`RecoveryRequired` without turning the validated inventory into a partial one.
+Blaze attempts to persist the recovery state; if that write also fails,
+reconciliation reports the additional error and the durable record may still
+contain its previous state.
 
 ## Checkpoint lifecycle and recovery
 

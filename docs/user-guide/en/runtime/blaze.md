@@ -68,6 +68,15 @@ record does not prove cleanup completed. Blaze does not repair or delete the
 invalid owner directory or its `state.json`; it remains available for operator
 repair.
 
+If the compiled provider exposes `DataPlaneInventory`, startup also freezes and
+validates one complete provider inventory before reconciling individual
+sandboxes. Blaze adopts only a clean `Running` record whose exact `Committed`
+or `Finalized` lease and live backend identity agree with durable state. An
+invalid provider inventory prevents the API listeners from opening; a
+per-sandbox mismatch is quarantined and retained as `RecoveryRequired`. The
+standard file provider and providers without this extension never silently
+adopt a live backend.
+
 Blaze state writes are supported only through `StateStore`. A production daemon
 keeps an exclusive advisory lock on the state root, and the startup scan holds
 the in-process ownership-map lock until publication. These locks serialize

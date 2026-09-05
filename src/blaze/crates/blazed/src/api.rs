@@ -761,6 +761,7 @@ mod tests {
     #[cfg(feature = "test-failpoints")]
     use blaze_core::checkpoint::CommitCheckpoint;
     use blaze_core::config::DaemonConfig;
+    use blaze_core::data_plane::{BackendProcessIdentity, BackendRuntimeRecord};
     use blaze_core::kernel::HookRegistry;
     #[cfg(feature = "test-failpoints")]
     use blaze_core::lifecycle::OperationPhase;
@@ -771,6 +772,14 @@ mod tests {
     };
     use blaze_core::storage::{
         AcquireOpts, PoolStatus, StorageAcquireError, StorageProvider, StorageSlot,
+    };
+    use blaze_provider_api::{
+        AbortRequest, AbortResult, BeginInventoryRequest, CommitRequest, CommittedLease,
+        DataPlaneInventory, DataPlaneProvider, FinalizeRequest, FinalizedLease, InspectRequest,
+        InventoryLease, InventoryPage, InventoryPageRequest, InventorySnapshot, LeaseBinding,
+        LeaseState, ObservedLease, PrepareRequest, PreparedLease, ProviderCapabilities,
+        ProviderDescriptor, ProviderError, ReconcileAction, ReconcileRequest, ReconcileResult,
+        ReleaseRequest, ReleaseResult, StopRequest, StoppedLease,
     };
     use sha2::{Digest, Sha256};
 
@@ -891,6 +900,28 @@ mod tests {
                 registry,
                 active_backend,
                 storage,
+            )
+            .expect("state"),
+        )
+    }
+
+    fn build_test_state_with_provider(
+        config: DaemonConfig,
+        policy: PolicyFile,
+        registry: SpawnerRegistry,
+        active_backend: BackendKind,
+        storage: Arc<dyn StorageProvider>,
+        data_plane: Arc<dyn DataPlaneProvider>,
+    ) -> Arc<ServerState> {
+        Arc::new(
+            ServerState::build_with_provider(
+                config,
+                PolicyEngine::with_policies(vec![policy]),
+                HookRegistry::new(),
+                registry,
+                active_backend,
+                storage,
+                data_plane,
             )
             .expect("state"),
         )
@@ -1418,6 +1449,306 @@ mod tests {
         orphan_cleanup_count: Arc<AtomicUsize>,
     }
 
+    struct AdoptableOwner {
+        instance_id: Uuid,
+        process: BackendProcessIdentity,
+        running: AtomicBool,
+    }
+
+    #[async_trait]
+    impl BackendInstance for AdoptableOwner {
+        fn instance_id(&self) -> Uuid {
+            self.instance_id
+        }
+
+        fn backend(&self) -> BackendKind {
+            BackendKind::Mock
+        }
+
+        fn version(&self) -> Option<&str> {
+            Some("adoptable-mock-v1")
+        }
+
+        fn runtime_record(&self) -> BackendRuntimeRecord {
+            BackendRuntimeRecord {
+                process: Some(self.process),
+                version: self.version().map(str::to_owned),
+                guest_transport: false,
+                network_slot: false,
+                console_log: false,
+            }
+        }
+
+        async fn try_wait(&self) -> blaze_core::Result<Option<SpawnResult>> {
+            Ok(
+                (!self.running.load(Ordering::Acquire)).then_some(SpawnResult {
+                    instance_id: self.instance_id,
+                    exit_code: Some(0),
+                    signal: None,
+                }),
+            )
+        }
+
+        async fn kill(&self) -> blaze_core::Result<()> {
+            self.running.store(false, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct AdoptableSpawner {
+        owners: std::sync::Mutex<HashMap<Uuid, DynBackendInstance>>,
+    }
+
+    #[async_trait]
+    impl BackendSpawner for AdoptableSpawner {
+        async fn spawn(
+            &self,
+            request: BackendSpawnRequest,
+        ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
+            let pid = request.instance_id.as_u128() as u32 | 1;
+            let owner: DynBackendInstance = Arc::new(AdoptableOwner {
+                instance_id: request.instance_id,
+                process: BackendProcessIdentity {
+                    pid,
+                    start_time_ticks: 17,
+                },
+                running: AtomicBool::new(true),
+            });
+            self.owners
+                .lock()
+                .expect("adoptable owners")
+                .insert(request.instance_id, owner.clone());
+            Ok(owner)
+        }
+
+        async fn adopt(
+            &self,
+            instance_id: Uuid,
+            runtime: &BackendRuntimeRecord,
+            _run_dir: OwnedRunDir,
+            _guest_memory_bytes: u64,
+        ) -> blaze_core::Result<Option<DynBackendInstance>> {
+            let owner = self
+                .owners
+                .lock()
+                .expect("adoptable owners")
+                .get(&instance_id)
+                .cloned();
+            if owner
+                .as_ref()
+                .is_some_and(|owner| owner.runtime_record() != *runtime)
+            {
+                return Err(BlazeError::BackendError {
+                    msg: "durable mock identity changed".to_string(),
+                });
+            }
+            Ok(owner)
+        }
+
+        async fn probe(&self, _binary_path: &Path) -> blaze_core::Result<bool> {
+            Ok(true)
+        }
+
+        async fn cleanup_orphan(
+            &self,
+            instance_id: Uuid,
+            _run_dir: &OwnedRunDir,
+        ) -> blaze_core::Result<()> {
+            let owner = self
+                .owners
+                .lock()
+                .expect("adoptable owners")
+                .remove(&instance_id);
+            if let Some(owner) = owner {
+                owner.kill().await?;
+            }
+            Ok(())
+        }
+    }
+
+    struct InventoryTestProvider {
+        inner: crate::data_plane::FileDataPlaneProvider,
+        snapshot_id: Uuid,
+        bindings: std::sync::Mutex<HashMap<Uuid, LeaseBinding>>,
+    }
+
+    impl InventoryTestProvider {
+        fn new(storage: Arc<dyn StorageProvider>) -> Self {
+            Self {
+                inner: crate::data_plane::FileDataPlaneProvider::new(storage),
+                snapshot_id: Uuid::new_v4(),
+                bindings: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn record(&self, binding: LeaseBinding) {
+            self.bindings
+                .lock()
+                .expect("inventory bindings")
+                .insert(binding.context.lease_id, binding);
+        }
+
+        fn binding(&self, lease_id: Uuid) -> Option<LeaseBinding> {
+            self.bindings
+                .lock()
+                .expect("inventory bindings")
+                .get(&lease_id)
+                .copied()
+        }
+    }
+
+    #[async_trait]
+    impl DataPlaneProvider for InventoryTestProvider {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn inventory(&self) -> Option<&dyn DataPlaneInventory> {
+            Some(self)
+        }
+
+        async fn probe(&self) -> std::result::Result<(), ProviderError> {
+            self.inner.probe().await
+        }
+
+        async fn prepare(
+            &self,
+            request: PrepareRequest,
+        ) -> std::result::Result<PreparedLease, ProviderError> {
+            let prepared = self.inner.prepare(request).await?;
+            self.record(prepared.binding);
+            Ok(prepared)
+        }
+
+        async fn inspect(
+            &self,
+            request: InspectRequest,
+        ) -> std::result::Result<ObservedLease, ProviderError> {
+            self.inner.inspect(request).await
+        }
+
+        async fn commit(
+            &self,
+            request: CommitRequest,
+        ) -> std::result::Result<CommittedLease, ProviderError> {
+            let committed = self.inner.commit(request).await?;
+            self.record(committed.binding);
+            Ok(committed)
+        }
+
+        async fn finalize(
+            &self,
+            request: FinalizeRequest,
+        ) -> std::result::Result<FinalizedLease, ProviderError> {
+            let finalized = self.inner.finalize(request).await?;
+            self.record(finalized.binding);
+            Ok(finalized)
+        }
+
+        async fn abort(
+            &self,
+            request: AbortRequest,
+        ) -> std::result::Result<AbortResult, ProviderError> {
+            let aborted = self.inner.abort(request).await?;
+            self.bindings
+                .lock()
+                .expect("inventory bindings")
+                .remove(&request.binding.context.lease_id);
+            Ok(aborted)
+        }
+
+        async fn stop(
+            &self,
+            request: StopRequest,
+        ) -> std::result::Result<StoppedLease, ProviderError> {
+            let stopped = self.inner.stop(request).await?;
+            self.record(stopped.binding);
+            Ok(stopped)
+        }
+
+        async fn release(
+            &self,
+            request: ReleaseRequest,
+        ) -> std::result::Result<ReleaseResult, ProviderError> {
+            let released = self.inner.release(request).await?;
+            self.bindings
+                .lock()
+                .expect("inventory bindings")
+                .remove(&request.binding.context.lease_id);
+            Ok(released)
+        }
+    }
+
+    #[async_trait]
+    impl DataPlaneInventory for InventoryTestProvider {
+        async fn begin_inventory(
+            &self,
+            _request: BeginInventoryRequest,
+        ) -> std::result::Result<InventorySnapshot, ProviderError> {
+            Ok(InventorySnapshot {
+                provider_instance_id: self.descriptor().provider_instance_id,
+                snapshot_id: self.snapshot_id,
+            })
+        }
+
+        async fn inventory_page(
+            &self,
+            request: InventoryPageRequest,
+        ) -> std::result::Result<InventoryPage, ProviderError> {
+            if request.snapshot_id != self.snapshot_id || request.cursor.is_some() {
+                return Err(ProviderError::Conflict);
+            }
+            let leases = self
+                .bindings
+                .lock()
+                .expect("inventory bindings")
+                .values()
+                .copied()
+                .map(|binding| InventoryLease { binding })
+                .collect();
+            Ok(InventoryPage {
+                leases,
+                next_cursor: None,
+            })
+        }
+
+        async fn reconcile(
+            &self,
+            request: ReconcileRequest,
+        ) -> std::result::Result<ReconcileResult, ProviderError> {
+            let mut bindings = self.bindings.lock().expect("inventory bindings");
+            if bindings.get(&request.observed.context.lease_id) != Some(&request.observed) {
+                return Err(ProviderError::Conflict);
+            }
+            if matches!(request.action, ReconcileAction::Adopt { .. })
+                && request.expected != Some(request.observed)
+            {
+                return Err(ProviderError::Conflict);
+            }
+            let state = match request.action {
+                ReconcileAction::Adopt { .. } => LeaseState::Finalized,
+                ReconcileAction::Quarantine => LeaseState::Quarantined,
+                ReconcileAction::Release => LeaseState::Released,
+            };
+            let binding = LeaseBinding {
+                generation: request.observed.generation + 1,
+                state,
+                ..request.observed
+            };
+            if state == LeaseState::Released {
+                bindings.remove(&binding.context.lease_id);
+            } else {
+                bindings.insert(binding.context.lease_id, binding);
+            }
+            Ok(ReconcileResult { binding })
+        }
+    }
+
     #[async_trait]
     impl BackendSpawner for CountingSpawner {
         async fn spawn(
@@ -1669,6 +2000,18 @@ mod tests {
             .as_str()
             .expect("sandbox id")
             .to_string();
+        let durable = state
+            .manager
+            .get(Uuid::parse_str(&id).expect("sandbox UUID"))
+            .expect("durable sandbox");
+        assert!(
+            durable.data_plane_lease.is_some(),
+            "the response test must cover a durable provider lease"
+        );
+        assert!(
+            durable.backend_runtime.is_some(),
+            "the response test must cover a durable backend identity"
+        );
         let item = format!("/v1/sandboxes/{id}");
 
         let (status, sandboxes) =
@@ -2707,7 +3050,11 @@ mod tests {
         ] {
             assert!(hibernate_dir.join(name).is_file(), "{name} is missing");
         }
-        let report = state.manager.reconcile_startup().await;
+        let report = state
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
         assert_eq!(report.attempted, 0);
         assert!(report.failures.is_empty());
         drop(state);
@@ -2727,7 +3074,11 @@ mod tests {
             restarted.manager.get(uuid).expect("loaded state").state,
             SandboxState::Hibernated
         );
-        let report = restarted.manager.reconcile_startup().await;
+        let report = restarted
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
         assert_eq!(report.attempted, 0);
         assert!(report.failures.is_empty());
 
@@ -2896,7 +3247,11 @@ mod tests {
             storage,
         );
 
-        let report = state.manager.reconcile_startup().await;
+        let report = state
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
         assert_eq!(report.attempted, 0);
         assert!(report.failures.is_empty());
         let retained = state.manager.get(id).expect("retained lifecycle");
@@ -5219,7 +5574,11 @@ mod tests {
             );
             assert!(restarted.manager.backend_owner(restart_uuid).is_none());
 
-            let report = restarted.manager.reconcile_startup().await;
+            let report = restarted
+                .manager
+                .reconcile_startup()
+                .await
+                .expect("startup reconciliation");
             assert_eq!(report.attempted, 1);
             assert_eq!(report.completed, 1);
             assert!(report.failures.is_empty());
@@ -5743,6 +6102,193 @@ mod tests {
         assert!(observed.load(Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn restart_adopts_matching_provider_and_backend_ownership() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let spawner = Arc::new(AdoptableSpawner::default());
+        let state = build_test_state_with_provider(
+            config.clone(),
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, spawner.clone()),
+            BackendKind::Mock,
+            storage.clone(),
+            provider.clone(),
+        );
+
+        let created = created_json(&state, &test_request()).await;
+        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("sandbox id"))
+            .expect("sandbox UUID");
+        let before = SandboxInstance::load(&config.daemon.state_dir, id).expect("durable state");
+        assert_eq!(
+            before.data_plane_lease.map(|lease| lease.state),
+            Some(blaze_core::data_plane::DataPlaneLeaseState::Finalized)
+        );
+        assert!(
+            before
+                .backend_runtime
+                .and_then(|runtime| runtime.process)
+                .is_some()
+        );
+        drop(state);
+
+        let recovered = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, spawner),
+            BackendKind::Mock,
+            storage,
+            provider,
+        );
+        let report = recovered
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("restart reconciliation");
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.completed, 1);
+        assert!(report.failures.is_empty());
+        let adopted = recovered.manager.get(id).expect("adopted sandbox");
+        assert_eq!(adopted.state, SandboxState::Running);
+        assert_eq!(
+            adopted.data_plane_lease.map(|lease| lease.generation),
+            Some(4)
+        );
+        assert!(recovered.manager.backend_owner(id).is_some());
+    }
+
+    #[tokio::test]
+    async fn restart_completes_adoption_from_a_committed_lease() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let spawner = Arc::new(AdoptableSpawner::default());
+        let state = build_test_state_with_provider(
+            config.clone(),
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, spawner.clone()),
+            BackendKind::Mock,
+            storage.clone(),
+            provider.clone(),
+        );
+
+        let created = created_json(&state, &test_request()).await;
+        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("sandbox id"))
+            .expect("sandbox UUID");
+        let mut interrupted =
+            SandboxInstance::load(&config.daemon.state_dir, id).expect("durable finalized state");
+        let mut committed = interrupted.data_plane_lease.expect("durable lease");
+        committed.state = blaze_core::data_plane::DataPlaneLeaseState::Committed;
+        committed.generation -= 1;
+        interrupted.data_plane_lease = Some(committed);
+        interrupted
+            .persist(&config.daemon.state_dir)
+            .expect("persist committed crash boundary");
+        provider.record(LeaseBinding::from_record(id, committed));
+        drop(state);
+
+        let recovered = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, spawner),
+            BackendKind::Mock,
+            storage,
+            provider,
+        );
+        let report = recovered
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("restart reconciliation");
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.completed, 1);
+        assert!(report.failures.is_empty());
+        let adopted = recovered.manager.get(id).expect("adopted sandbox");
+        assert_eq!(
+            adopted.data_plane_lease.map(|lease| lease.state),
+            Some(blaze_core::data_plane::DataPlaneLeaseState::Finalized)
+        );
+        assert_eq!(
+            adopted.data_plane_lease.map(|lease| lease.generation),
+            Some(committed.generation + 1)
+        );
+        assert!(recovered.manager.backend_owner(id).is_some());
+    }
+
+    #[tokio::test]
+    async fn restart_quarantines_provider_identity_drift() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let spawner = Arc::new(AdoptableSpawner::default());
+        let state = build_test_state_with_provider(
+            config.clone(),
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, spawner.clone()),
+            BackendKind::Mock,
+            storage.clone(),
+            provider.clone(),
+        );
+
+        let created = created_json(&state, &test_request()).await;
+        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("sandbox id"))
+            .expect("sandbox UUID");
+        let mut corrupted =
+            SandboxInstance::load(&config.daemon.state_dir, id).expect("durable finalized state");
+        let mut durable = corrupted.data_plane_lease.expect("durable lease");
+        let lease_id = durable.lease_id;
+        durable.request_id = Uuid::new_v4();
+        corrupted.data_plane_lease = Some(durable);
+        corrupted
+            .persist(&config.daemon.state_dir)
+            .expect("persist identity drift");
+        drop(state);
+
+        let recovered = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, spawner),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let report = recovered
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("restart reconciliation");
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.completed, 0);
+        assert_eq!(report.failures.len(), 1);
+        let quarantined = recovered.manager.get(id).expect("quarantined sandbox");
+        assert_eq!(quarantined.state, SandboxState::RecoveryRequired);
+        assert_eq!(
+            quarantined.data_plane_lease.map(|lease| lease.state),
+            Some(blaze_core::data_plane::DataPlaneLeaseState::Quarantined)
+        );
+        assert_eq!(
+            provider.binding(lease_id).map(|binding| binding.state),
+            Some(LeaseState::Quarantined)
+        );
+        assert!(recovered.manager.backend_owner(id).is_none());
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn restart_reconciles_durable_starting_before_spawn() {
@@ -5824,7 +6370,11 @@ mod tests {
             recovered_storage,
         );
 
-        let report = recovered.manager.reconcile_startup().await;
+        let report = recovered
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
 
         assert_eq!(report.attempted, 1);
         assert_eq!(report.completed, 1);
@@ -5920,7 +6470,11 @@ mod tests {
             storage,
         );
 
-        let first = state.manager.reconcile_startup().await;
+        let first = state
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
 
         assert_eq!(first.attempted, 1);
         assert_eq!(first.completed, 0);
@@ -5945,7 +6499,11 @@ mod tests {
         assert!(state.state_store.run_dir(instance.id).is_ok());
 
         drop(handoff);
-        let retry = state.manager.reconcile_startup().await;
+        let retry = state
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
 
         assert_eq!(retry.attempted, 1);
         assert_eq!(retry.completed, 1);
@@ -6948,7 +7506,11 @@ mod tests {
             storage,
         );
 
-        let report = state.manager.reconcile_startup().await;
+        let report = state
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
 
         assert_eq!(report.attempted, 2);
         assert_eq!(report.completed, 1);
@@ -7048,7 +7610,11 @@ mod tests {
             storage,
         );
 
-        let report = state.manager.reconcile_startup().await;
+        let report = state
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
 
         assert_eq!(report.attempted, 2);
         assert_eq!(report.completed, 2);
@@ -7138,7 +7704,11 @@ mod tests {
             storage,
         );
 
-        let report = state.manager.reconcile_startup().await;
+        let report = state
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
 
         assert_eq!(report.attempted, 2);
         assert_eq!(report.completed, 2);

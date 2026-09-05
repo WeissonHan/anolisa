@@ -141,6 +141,42 @@ impl ServerState {
         )
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_provider(
+        config: DaemonConfig,
+        policy: PolicyEngine,
+        hook: HookRegistry,
+        spawners: SpawnerRegistry,
+        active_backend: BackendKind,
+        storage: Arc<dyn StorageProvider>,
+        data_plane: Arc<dyn DataPlaneProvider>,
+    ) -> Result<Self> {
+        let template_roots = validate_template_roots(
+            &config.template,
+            &config.storage.images_dir,
+            &config.storage.instances_dir,
+            &config.policy.dir,
+            &config.backends,
+            &config.daemon.state_dir,
+            &config.daemon.socket,
+            None,
+        )?;
+        let template_catalog = TemplateCatalog::open_validated(&config.template, template_roots)?;
+        let state_store = StateStore::new(config.daemon.state_dir.clone());
+        Self::assemble(
+            config,
+            policy,
+            hook,
+            spawners,
+            active_backend,
+            storage,
+            data_plane,
+            template_catalog,
+            state_store,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn assemble(
         config: DaemonConfig,

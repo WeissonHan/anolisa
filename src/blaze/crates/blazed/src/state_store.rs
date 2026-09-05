@@ -893,14 +893,18 @@ fn validate_terminal_record(instance: &SandboxInstance) -> Result<()> {
         instance.backend_ownership,
         BackendOwnership::NotStarted | BackendOwnership::Stopped
     ) && instance.operation.is_none()
+        && instance.data_plane_lease.is_none()
+        && instance.backend_runtime.is_none()
     {
         return Ok(());
     }
     Err(BlazeDaemonError::RecoveryRequired(format!(
-        "destroyed instance {} does not prove completed cleanup: backend ownership {:?}, active operation {:?}",
+        "destroyed instance {} does not prove completed cleanup: backend ownership {:?}, active operation {:?}, provider lease retained {}, backend identity retained {}",
         instance.id,
         instance.backend_ownership,
-        instance.operation.as_ref().map(|operation| operation.kind)
+        instance.operation.as_ref().map(|operation| operation.kind),
+        instance.data_plane_lease.is_some(),
+        instance.backend_runtime.is_some()
     )))
 }
 

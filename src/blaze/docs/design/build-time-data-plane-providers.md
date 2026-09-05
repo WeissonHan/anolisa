@@ -47,7 +47,7 @@ product identifiers and settings as part of the extension release.
 
 ## Lifecycle contract
 
-The first contract revision covers sandbox creation and deletion. Every
+The base contract revision covers sandbox creation and deletion. Every
 mutation is bound to a preselected sandbox, request, operation, lease, and
 generation. A successful lifecycle follows this sequence:
 
@@ -156,16 +156,18 @@ to provider-owned sandboxes.
 | Template creation with opened root-drive and guest-memory resources | Supported when declared |
 | Ordinary image creation with opened restore resources | Rejected before backend start |
 | Failed compiled-provider probe | Startup fails; no file fallback |
-| Provider lease adoption after daemon restart | Not supported |
+| Provider lease adoption after daemon restart | Requires the optional inventory contract and a backend that supports identity-based adoption |
 | Provider-owned checkpoint and rollback | Not supported |
 | Provider-owned hibernation and resume | Not supported |
 | Provider capacity and reusable-resource pools | Not supported |
 | Runtime dynamic-library or process plugin discovery | Not supported |
 
 A provider that does not support restart adoption must not be presented as
-production-ready for persistent workloads. Restart reconciliation, checkpoint,
-hibernation, and capacity require separate optional contracts rather than
-unused methods in the initial interface.
+production-ready for persistent workloads. The inventory contract and its
+fail-closed recovery rules are specified in
+[Provider Reconciliation](provider-reconciliation.md). Checkpoint, hibernation,
+and capacity still require separate optional contracts rather than unused
+methods in the base interface.
 
 ## Verification
 

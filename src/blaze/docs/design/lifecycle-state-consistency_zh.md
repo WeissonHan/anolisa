@@ -63,7 +63,11 @@ run-directory map lock 协调单个 daemon 内的 writer。
    接受的对象一致。
 5. 只有全部检查通过后，才发布 retained-owner map，并将 instance map 返回给
    `ServerState`。
-6. 处理已经接受的 sandbox 记录，随后绑定配置的 Unix 和 TCP API listener。
+6. 如果提供者实现 `DataPlaneInventory`，先冻结并校验一份完整的提供者清单，再逐个
+   核对沙箱。只有持久化记录、准确提供者租约和存活后端身份完全一致时，才接管状态
+   干净的 `Running` 沙箱；不一致时隔离资源并标记为 `RecoveryRequired`。没有该
+   扩展的提供者使用标准清理路径。
+7. 核对完成后才绑定配置的 Unix 和 TCP API listener。
 
 名称集合比较必须在对象复验开始前完成。这个顺序可以避免较早的 owner 已经通过
 检查，而最终目录枚举仍在处理后续 UUID 条目。
@@ -78,10 +82,11 @@ listener。
 Blaze 会保留被拒绝的 UUID 目录及其 `state.json`，供运维人员检查和修复。
 已有的状态发布 staging 条目清理流程与拒绝记录的处理相互独立。
 
-完整清单通过校验后，启动恢复会分别处理每个非终态 sandbox。单个 sandbox
-清理失败时可以在内存中保留为 `RecoveryRequired`，但不会把已经通过校验的清单
-变成部分清单。Blaze 会尝试持久化恢复状态；如果这次写入也失败，启动恢复会报告
-附加错误，持久化记录仍可能保留先前的状态。
+完整清单通过校验后，启动恢复会分别处理每个非终态 sandbox：可以通过可选提供者
+清单合同接管，也可以通过标准路径清理。接管不一致或清理失败时，单个 sandbox 可以
+在内存中保留为 `RecoveryRequired`，但不会把已经通过校验的清单变成部分清单。
+Blaze 会尝试持久化恢复状态；如果这次写入也失败，启动恢复会报告附加错误，持久化
+记录仍可能保留先前状态。
 
 ## 检查点生命周期与恢复
 

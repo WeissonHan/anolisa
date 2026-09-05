@@ -14,6 +14,7 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use blaze_core::data_plane::{BackendProcessIdentity, DataPlaneLeaseRecord, DataPlaneLeaseState};
 use blaze_core::storage::{StorageSlot, TemplateStorage};
 use thiserror::Error;
 use uuid::Uuid;
@@ -188,6 +189,8 @@ pub enum LeaseState {
     Stopped,
     /// Provider proved that all lease resources are absent.
     Released,
+    /// Resources are retained until an operator resolves an ownership conflict.
+    Quarantined,
 }
 
 /// Exact identity and state of one provider-owned resource lease.
@@ -201,6 +204,69 @@ pub struct LeaseBinding {
     pub generation: u64,
     /// Current provider-side state.
     pub state: LeaseState,
+}
+
+impl LeaseBinding {
+    /// Convert a provider response into the implementation-neutral durable ledger.
+    pub fn to_record(
+        self,
+        root_filesystem_bytes: u64,
+        guest_memory_bytes: u64,
+    ) -> DataPlaneLeaseRecord {
+        DataPlaneLeaseRecord {
+            provider_instance_id: self.provider_instance_id,
+            request_id: self.context.request_id,
+            operation_id: self.context.operation_id,
+            lease_id: self.context.lease_id,
+            initial_generation: self.context.generation,
+            generation: self.generation,
+            state: self.state.into(),
+            root_filesystem_bytes,
+            guest_memory_bytes,
+        }
+    }
+
+    /// Rebuild a provider binding from one sandbox's durable ledger record.
+    pub fn from_record(instance_id: Uuid, record: DataPlaneLeaseRecord) -> Self {
+        Self {
+            provider_instance_id: record.provider_instance_id,
+            context: RequestContext {
+                instance_id,
+                request_id: record.request_id,
+                operation_id: record.operation_id,
+                lease_id: record.lease_id,
+                generation: record.initial_generation,
+            },
+            generation: record.generation,
+            state: record.state.into(),
+        }
+    }
+}
+
+impl From<LeaseState> for DataPlaneLeaseState {
+    fn from(state: LeaseState) -> Self {
+        match state {
+            LeaseState::Prepared => Self::Prepared,
+            LeaseState::Committed => Self::Committed,
+            LeaseState::Finalized => Self::Finalized,
+            LeaseState::Stopped => Self::Stopped,
+            LeaseState::Released => Self::Released,
+            LeaseState::Quarantined => Self::Quarantined,
+        }
+    }
+}
+
+impl From<DataPlaneLeaseState> for LeaseState {
+    fn from(state: DataPlaneLeaseState) -> Self {
+        match state {
+            DataPlaneLeaseState::Prepared => Self::Prepared,
+            DataPlaneLeaseState::Committed => Self::Committed,
+            DataPlaneLeaseState::Finalized => Self::Finalized,
+            DataPlaneLeaseState::Stopped => Self::Stopped,
+            DataPlaneLeaseState::Released => Self::Released,
+            DataPlaneLeaseState::Quarantined => Self::Quarantined,
+        }
+    }
 }
 
 /// Prepared resources and their exact lease binding.
@@ -330,6 +396,86 @@ pub enum ProviderError {
     Incompatible,
 }
 
+/// Start one consistent, paged view of all leases owned by a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeginInventoryRequest {
+    /// Maximum entries Blaze will accept in one page.
+    pub page_size: u32,
+}
+
+/// Stable provider inventory frozen for one traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventorySnapshot {
+    /// Provider that owns this snapshot.
+    pub provider_instance_id: Uuid,
+    /// Opaque snapshot identity used only in follow-up page requests.
+    pub snapshot_id: Uuid,
+}
+
+/// Request one page from a previously frozen inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryPageRequest {
+    pub snapshot_id: Uuid,
+    pub cursor: Option<String>,
+    pub page_size: u32,
+}
+
+/// One provider lease visible in the frozen inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryLease {
+    pub binding: LeaseBinding,
+}
+
+/// Bounded inventory page. A missing cursor completes the traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryPage {
+    pub leases: Vec<InventoryLease>,
+    pub next_cursor: Option<String>,
+}
+
+/// Safe convergence action selected after comparing all ownership ledgers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileAction {
+    /// Retain an exact live lease and associate it with the proven backend.
+    Adopt {
+        backend_process: BackendProcessIdentity,
+    },
+    /// Retain resources without allowing them to serve traffic or be reused.
+    Quarantine,
+    /// Release resources whose public owner is terminal or absent.
+    Release,
+}
+
+/// Reconcile one observed provider lease against a public expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileRequest {
+    pub expected: Option<LeaseBinding>,
+    pub observed: LeaseBinding,
+    pub action: ReconcileAction,
+}
+
+/// Provider-confirmed convergence result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileResult {
+    pub binding: LeaseBinding,
+}
+
+/// Optional lease inventory and restart-convergence extension.
+#[async_trait]
+pub trait DataPlaneInventory: DataPlaneProvider {
+    async fn begin_inventory(
+        &self,
+        request: BeginInventoryRequest,
+    ) -> Result<InventorySnapshot, ProviderError>;
+
+    async fn inventory_page(
+        &self,
+        request: InventoryPageRequest,
+    ) -> Result<InventoryPage, ProviderError>;
+
+    async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResult, ProviderError>;
+}
+
 /// Source-level data-plane provider compiled into one Blaze daemon binary.
 #[async_trait]
 pub trait DataPlaneProvider: Send + Sync {
@@ -338,6 +484,11 @@ pub trait DataPlaneProvider: Send + Sync {
 
     /// Return optional operations implemented by this provider.
     fn capabilities(&self) -> ProviderCapabilities;
+
+    /// Return restart reconciliation support when this provider implements it.
+    fn inventory(&self) -> Option<&dyn DataPlaneInventory> {
+        None
+    }
 
     /// Check prerequisites without allocating sandbox resources.
     async fn probe(&self) -> Result<(), ProviderError>;
@@ -362,4 +513,32 @@ pub trait DataPlaneProvider: Send + Sync {
 
     /// Prove that all resources owned by a stopped lease are absent.
     async fn release(&self, request: ReleaseRequest) -> Result<ReleaseResult, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_lease_round_trip_preserves_every_identity() {
+        let instance_id = Uuid::new_v4();
+        let binding = LeaseBinding {
+            provider_instance_id: Uuid::new_v4(),
+            context: RequestContext {
+                instance_id,
+                request_id: Uuid::new_v4(),
+                operation_id: Uuid::new_v4(),
+                lease_id: Uuid::new_v4(),
+                generation: 7,
+            },
+            generation: 11,
+            state: LeaseState::Finalized,
+        };
+
+        let record = binding.to_record(64 * 1024 * 1024, 512 * 1024 * 1024);
+
+        assert_eq!(LeaseBinding::from_record(instance_id, record), binding);
+        assert_eq!(record.initial_generation, 7);
+        assert_eq!(record.generation, 11);
+    }
 }

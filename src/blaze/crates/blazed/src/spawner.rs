@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use blaze_core::backend::{
     BackendKind, RestoreCapability, RestoreRequest, SnapshotRequest, SpawnRequest,
 };
+use blaze_core::data_plane::BackendRuntimeRecord;
 #[cfg(test)]
 use blaze_core::guest_protocol::DEFAULT_MAX_RESPONSE_BYTES;
 use blaze_core::{BlazeError, Result};
@@ -106,6 +107,16 @@ pub trait BackendInstance: Send + Sync {
     /// same setting.
     fn records_console_log(&self) -> bool {
         false
+    }
+    /// Return the implementation-neutral identity needed for restart adoption.
+    fn runtime_record(&self) -> BackendRuntimeRecord {
+        BackendRuntimeRecord {
+            process: None,
+            version: self.version().map(str::to_owned),
+            guest_transport: !self.guest_socket_path().as_os_str().is_empty(),
+            network_slot: self.holds_network_slot(),
+            console_log: self.records_console_log(),
+        }
     }
     /// Report an observed backend exit without waiting.
     ///
@@ -234,6 +245,10 @@ impl BackendInstance for RuntimeOwnedBackend {
         self.inner.records_console_log()
     }
 
+    fn runtime_record(&self) -> BackendRuntimeRecord {
+        self.inner.runtime_record()
+    }
+
     async fn try_wait(&self) -> Result<Option<SpawnResult>> {
         self.inner.try_wait().await
     }
@@ -294,6 +309,20 @@ pub(crate) async fn spawn_with_runtime_directory(
             })
         }
     }
+}
+
+/// Adopt a live backend while retaining the reopened runtime-directory owner.
+pub(crate) async fn adopt_with_runtime_directory(
+    spawner: &dyn BackendSpawner,
+    instance_id: Uuid,
+    runtime: &BackendRuntimeRecord,
+    run_dir: OwnedRunDir,
+    guest_memory_bytes: u64,
+) -> Result<Option<DynBackendInstance>> {
+    let owner = spawner
+        .adopt(instance_id, runtime, run_dir.clone(), guest_memory_bytes)
+        .await?;
+    Ok(owner.map(|owner| bind_runtime_directory(owner, run_dir)))
 }
 
 /// A backend executable pinned by descriptor.
@@ -1032,6 +1061,20 @@ pub trait BackendSpawner: Send + Sync {
         Err(SpawnFailure::clean(BlazeError::BackendError {
             msg: "checkpoint restore is not supported by this backend".to_string(),
         }))
+    }
+
+    /// Adopt a backend that remained live across daemon restart.
+    ///
+    /// `None` means this backend does not support live adoption. An error means
+    /// adoption was attempted but the persisted identity could not be proved.
+    async fn adopt(
+        &self,
+        _instance_id: Uuid,
+        _runtime: &BackendRuntimeRecord,
+        _run_dir: OwnedRunDir,
+        _guest_memory_bytes: u64,
+    ) -> Result<Option<DynBackendInstance>> {
+        Ok(None)
     }
 
     /// Probe whether the configured backend executable is usable.

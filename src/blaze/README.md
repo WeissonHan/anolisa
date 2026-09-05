@@ -269,12 +269,15 @@ See the
 for writer coordination, inventory publication, reset rejection, legacy-state
 cleanup, and failure boundaries.
 
-The operation journal records create and destroy operations and the durable
-phase reached by checkpoint capture. An interrupted create is cleaned up rather
-than resumed, and an existing backend process is not adopted after restart.
-Startup recovery destroys an interrupted sandbox instead of restoring its
-checkpoint. Failed recovery does not run in a background retry loop. Reset
-remains unavailable and does not restore a checkpoint.
+The operation journal records the durable boundaries of create, destroy,
+checkpoint, restore, hibernate, and resume operations. An unfinished operation
+is never resumed or adopted after restart. With the standard file data plane,
+startup cleans non-terminal runtime ownership instead of adopting a live
+backend. A build-time provider may adopt a clean `Running` sandbox only through
+`DataPlaneInventory`, and only when the durable sandbox record, the exact
+`Committed` or `Finalized` provider lease, and the live backend identity all
+agree. A mismatch is quarantined and retained as `RecoveryRequired`. Reset
+remains unavailable and never restores a checkpoint.
 
 ### Checkpoint capture and history
 

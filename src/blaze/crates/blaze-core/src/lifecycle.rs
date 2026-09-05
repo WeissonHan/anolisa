@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::backend::BackendKind;
+use crate::data_plane::{BackendRuntimeRecord, DataPlaneLeaseRecord};
 use crate::error::{BlazeError, Result};
 use crate::policy::WorkloadClass;
 
@@ -295,6 +296,12 @@ pub struct SandboxInstance {
     /// Last checkpoint whose capture completed and returned the sandbox to running.
     #[serde(default)]
     pub last_checkpoint: Option<String>,
+    /// Provider-independent ownership identity used for restart reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_plane_lease: Option<DataPlaneLeaseRecord>,
+    /// Live backend identity captured with the provider lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_runtime: Option<BackendRuntimeRecord>,
 }
 
 impl SandboxInstance {
@@ -320,6 +327,8 @@ impl SandboxInstance {
             backend_ownership: BackendOwnership::NotStarted,
             operation: None,
             last_checkpoint: None,
+            data_plane_lease: None,
+            backend_runtime: None,
         }
     }
 

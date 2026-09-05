@@ -189,7 +189,7 @@ async fn run_loaded_config(
             state_store,
         )?,
     });
-    let reconciliation = state.manager.reconcile_startup().await;
+    let reconciliation = state.manager.reconcile_startup().await?;
     tracing::info!(
         attempted = reconciliation.attempted,
         completed = reconciliation.completed,
