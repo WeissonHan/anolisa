@@ -114,9 +114,12 @@ contain its previous state.
 `GET /v1/sandboxes/{id}/checkpoints` lists its committed history. Both
 operations hold the same per-sandbox operation lock used by lifecycle and
 guest requests. Capture requires a `Running` record with no unfinished
-operation, a live matching backend owner, and explicit capture support from
-both the backend and storage provider. An unsupported combination returns
-`501 Not Implemented` before the backend is paused or lifecycle state changes.
+operation, a live matching backend owner, and full capture support from the
+backend. The standard file path also requires storage capture support. A
+provider-backed path requires a finalized lease and `DataPlaneCheckpoint`; the
+current provider path owns both writable-root and guest-memory content. An
+unsupported combination returns `501 Not Implemented` before the backend is
+quiesced or lifecycle state changes.
 
 Capture uses this durable order:
 
@@ -124,12 +127,15 @@ Capture uses this durable order:
    directory.
 2. Persist checkpoint intent, including the generated checkpoint ID, before
    pausing the backend.
-3. Pause the backend, record that durable phase, capture backend state and the
-   provider-owned writable root, then publish an integrity-checked manifest by
-   a no-replace rename.
-4. Persist publication, atomically move the sandbox checkpoint HEAD, and
+3. Quiesce the backend and record that durable phase. Capture backend state;
+   then either capture the writable root through standard storage or ask
+   `DataPlaneCheckpoint` to freeze root and memory at the same boundary.
+4. Publish checkpoint format 3 by a no-replace rename. Provider content is
+   represented by an implementation-neutral durable reference that is omitted
+   from management responses.
+5. Persist publication, atomically move the sandbox checkpoint HEAD, and
    persist the HEAD-update phase.
-5. Resume and revalidate the backend, pass through `Checkpointed` back to
+6. Resume and revalidate the backend, pass through `Checkpointed` back to
    `Running`, record `last_checkpoint`, clear the operation, and persist the
    final lifecycle record.
 
@@ -191,9 +197,11 @@ instead of retried as an empty prune.
 `POST /v1/sandboxes/{id}/rollback/{checkpoint_id}` replaces a running sandbox
 from one verified full checkpoint. Before mutation, Blaze verifies the complete
 checkpoint ancestry and artifacts, matches the policy, image, backend, version,
-and snapshot kind, and requires explicit backend and storage restore
-capabilities. Unsupported combinations return `501 Not Implemented` while the
-current backend and lifecycle record remain unchanged.
+and snapshot kind, and requires an explicit backend restore capability. A file
+checkpoint also requires storage restore; a provider-managed checkpoint
+requires `DataPlaneCheckpoint` from the matching provider instance. Unsupported
+combinations return `501 Not Implemented` while the current backend and
+lifecycle record remain unchanged.
 
 Restore uses this durable order:
 

@@ -10,11 +10,12 @@ pub use example_provider::ExampleFileProvider;
 use std::collections::HashSet;
 
 use blaze_provider_api::{
-    AttachmentAccess, AttachmentRole, AttachmentSharing, CommitRequest, DataPlaneProvider,
-    FinalizeRequest, InspectRequest, InventorySnapshot, LeaseBinding, LeaseState,
-    PROVIDER_CONTRACT_VERSION, PrepareRequest, PrepareSource, PreparedLease, PreparedResources,
-    ProviderDescriptor, ProviderError, PublicTransitionRef, ReconcileAction, ReleaseRequest,
-    RequestContext, StopRequest,
+    AttachmentAccess, AttachmentRole, AttachmentSharing, CheckpointSubmission, CommitRequest,
+    DataPlaneProvider, FinalizeRequest, InspectRequest, InventorySnapshot, LeaseBinding,
+    LeaseState, PROVIDER_CONTRACT_VERSION, PrepareRequest, PrepareSource, PreparedLease,
+    PreparedResources, ProviderCheckpointRef, ProviderDescriptor, ProviderError,
+    PublicTransitionRef, ReconcileAction, ReleaseRequest, RequestContext, RetireCheckpointResult,
+    StopRequest,
 };
 use thiserror::Error;
 
@@ -36,6 +37,9 @@ pub enum ConformanceError {
     /// Inventory snapshot or lease identity cannot be trusted.
     #[error("provider inventory is invalid")]
     InvalidInventory,
+    /// Checkpoint identity, lineage, or provider content is invalid.
+    #[error("provider checkpoint response is invalid")]
+    InvalidCheckpoint,
 }
 
 /// Failure reported by the reusable create-and-delete contract exercise.
@@ -84,36 +88,13 @@ pub fn validate_prepared(
             restore_payload_dir,
             attachments,
         } => {
-            if !template_source
-                || restore_payload_dir.as_os_str().is_empty()
-                || attachments.len() != 2
-            {
+            if !template_source || restore_payload_dir.as_os_str().is_empty() {
                 return Err(ConformanceError::InvalidResources);
             }
-            let mut roles = HashSet::new();
-            for attachment in attachments {
-                if !roles.insert(attachment.role)
-                    || attachment.access != AttachmentAccess::ReadWrite
-                    || attachment.sharing != AttachmentSharing::Exclusive
-                    || attachment.logical_size_bytes == 0
-                    || !attachment.logical_size_bytes.is_multiple_of(4096)
-                {
-                    return Err(ConformanceError::InvalidResources);
-                }
-            }
-            let root = attachments
-                .iter()
-                .find(|attachment| attachment.role == AttachmentRole::RootDrive)
-                .ok_or(ConformanceError::InvalidResources)?;
-            let memory = attachments
-                .iter()
-                .find(|attachment| attachment.role == AttachmentRole::GuestMemory)
-                .ok_or(ConformanceError::InvalidResources)?;
-            if root.logical_size_bytes != root_filesystem_bytes
-                || memory.logical_size_bytes != guest_memory_bytes
-            {
-                return Err(ConformanceError::InvalidResources);
-            }
+            validate_opened_attachments(attachments, root_filesystem_bytes, guest_memory_bytes)?;
+        }
+        PreparedResources::CheckpointRestore { .. } => {
+            return Err(ConformanceError::InvalidResources);
         }
     }
     Ok(())
@@ -203,6 +184,111 @@ pub fn validate_reconcile_result(
         ReconcileAction::Release => LeaseState::Released,
     };
     validate_transition(previous, next, expected)
+}
+
+/// Validate one immutable provider capture and its active-lease generation.
+pub fn validate_checkpoint_submission(
+    previous: LeaseBinding,
+    checkpoint_id: uuid::Uuid,
+    parent: Option<&ProviderCheckpointRef>,
+    submission: &CheckpointSubmission,
+) -> Result<(), ConformanceError> {
+    validate_transition(previous, submission.binding, LeaseState::Finalized)?;
+    let checkpoint = &submission.checkpoint;
+    let digest = checkpoint.content_digest.strip_prefix("sha256:");
+    if checkpoint_id.is_nil()
+        || checkpoint.provider_instance_id != previous.provider_instance_id
+        || checkpoint.public_checkpoint_id != checkpoint_id
+        || checkpoint.reference_id.is_nil()
+        || checkpoint.source_lease_id != previous.context.lease_id
+        || checkpoint.source_generation != submission.binding.generation
+        || checkpoint.parent_reference_id != parent.map(|parent| parent.reference_id)
+        || (!checkpoint.root_filesystem && !checkpoint.guest_memory)
+        || !digest.is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err(ConformanceError::InvalidCheckpoint);
+    }
+    Ok(())
+}
+
+/// Validate resources prepared from one provider checkpoint.
+pub fn validate_checkpoint_restore(
+    context: RequestContext,
+    checkpoint: &ProviderCheckpointRef,
+    root_filesystem_bytes: u64,
+    guest_memory_bytes: u64,
+    prepared: &PreparedLease,
+) -> Result<(), ConformanceError> {
+    validate_prepared_binding(context, prepared.binding)?;
+    if prepared.binding.provider_instance_id != checkpoint.provider_instance_id {
+        return Err(ConformanceError::InvalidCheckpoint);
+    }
+    match &prepared.resources {
+        PreparedResources::CheckpointRestore {
+            storage: Some(storage),
+            attachments,
+        } if attachments.is_empty() && storage.id == context.instance_id.to_string() => {}
+        PreparedResources::CheckpointRestore {
+            storage: None,
+            attachments,
+        } => validate_opened_attachments(attachments, root_filesystem_bytes, guest_memory_bytes)?,
+        _ => return Err(ConformanceError::InvalidResources),
+    }
+    Ok(())
+}
+
+fn validate_opened_attachments(
+    attachments: &[blaze_provider_api::OpenedAttachment],
+    root_filesystem_bytes: u64,
+    guest_memory_bytes: u64,
+) -> Result<(), ConformanceError> {
+    if attachments.len() != 2 {
+        return Err(ConformanceError::InvalidResources);
+    }
+    let mut roles = HashSet::new();
+    for attachment in attachments {
+        if !roles.insert(attachment.role)
+            || attachment.access != AttachmentAccess::ReadWrite
+            || attachment.sharing != AttachmentSharing::Exclusive
+            || attachment.logical_size_bytes == 0
+            || !attachment.logical_size_bytes.is_multiple_of(4096)
+        {
+            return Err(ConformanceError::InvalidResources);
+        }
+    }
+    let root = attachments
+        .iter()
+        .find(|attachment| attachment.role == AttachmentRole::RootDrive)
+        .ok_or(ConformanceError::InvalidResources)?;
+    let memory = attachments
+        .iter()
+        .find(|attachment| attachment.role == AttachmentRole::GuestMemory)
+        .ok_or(ConformanceError::InvalidResources)?;
+    if root.logical_size_bytes != root_filesystem_bytes
+        || memory.logical_size_bytes != guest_memory_bytes
+    {
+        return Err(ConformanceError::InvalidResources);
+    }
+    Ok(())
+}
+
+/// Validate idempotent retirement of one exact provider reference.
+pub fn validate_checkpoint_retirement(
+    checkpoint: &ProviderCheckpointRef,
+    result: RetireCheckpointResult,
+) -> Result<(), ConformanceError> {
+    if checkpoint.reference_id.is_nil()
+        || result.public_checkpoint_id != checkpoint.public_checkpoint_id
+        || result.reference_id != Some(checkpoint.reference_id)
+    {
+        return Err(ConformanceError::InvalidCheckpoint);
+    }
+    Ok(())
 }
 
 /// Map a conformance violation to the public provider error category.

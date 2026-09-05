@@ -281,14 +281,17 @@ remains unavailable and never restores a checkpoint.
 
 ### Checkpoint capture and history
 
-`POST /v1/sandboxes/{id}/checkpoint` captures a running sandbox when both its
-backend and storage provider advertise full-capture support. A successful
-request pauses the backend, captures VM state, guest memory, and the writable
-root filesystem, publishes a self-contained integrity manifest, moves the
-sandbox checkpoint HEAD, and resumes the backend. The response includes the
-complete manifest plus the `checkpoint_id` and `instance_id` fields.
-Unsupported backend or storage combinations return HTTP 501 before changing
-sandbox state.
+`POST /v1/sandboxes/{id}/checkpoint` requires full snapshot support from the
+selected backend. A standard file-backed sandbox also requires storage
+checkpoint support and stores the writable root in the Blaze checkpoint
+directory. A sandbox with a finalized provider lease instead requires the
+optional `DataPlaneCheckpoint` extension. The current provider path freezes
+both writable-root and guest-memory content, while Blaze retains the backend
+snapshot artifacts and an implementation-neutral durable reference.
+Unsupported combinations return HTTP 501 before the backend is quiesced or
+sandbox state changes. New captures publish checkpoint format 3; formats 1 and
+2 remain readable when their original backend and storage requirements are
+available.
 
 `GET /v1/sandboxes/{id}/checkpoints` returns committed history summaries,
 including parentage, logical size, current-HEAD status, and HEAD reachability.
@@ -304,8 +307,9 @@ running sandbox with no unfinished operation; every other lifecycle state
 returns HTTP 409.
 
 Prune records its operation before changing the catalog and moves each selected
-checkpoint to a uniquely named tombstone before recursively deleting its
-version-2 payload tree. HTTP 200 is returned only after every tombstone created
+checkpoint to a uniquely named tombstone before recursively deleting the
+payload-subtree layout used by checkpoint formats 2 and 3. HTTP 200 is returned
+only after every tombstone created
 by the request has been removed and the checkpoint namespace has been
 synchronized. A partial or uncertain cleanup marks the sandbox
 `RecoveryRequired`; another prune request then returns HTTP 409 without changing
@@ -330,9 +334,11 @@ preflight reads every stored artifact, so prune time and storage input/output
 grow with the total checkpoint history. Operators should investigate storage
 corruption instead of repeatedly calling prune.
 
-`POST /v1/sandboxes/{id}/rollback/{checkpoint_id}` is available only when the
-current storage provider and checkpoint backend advertise compatible restore
-capabilities. The daemon verifies the selected checkpoint, its parent chain,
+`POST /v1/sandboxes/{id}/rollback/{checkpoint_id}` requires a compatible
+backend restore adapter. A file-backed checkpoint also requires storage
+restore support; a provider-managed checkpoint requires the current build-time
+provider to expose `DataPlaneCheckpoint` and to match the recorded provider
+identity. The daemon verifies the selected checkpoint, its parent chain,
 runtime identity, and all artifact hashes before changing runtime state.
 
 The file provider stages a separate rootfs copy while the current backend is
@@ -347,6 +353,15 @@ failing or the daemon being unable to confirm the old backend actually
 stopped — retains the resources that actually exist and marks the sandbox
 `RecoveryRequired`, so a later destroy can finish cleanup without losing
 process ownership.
+
+For a provider-managed checkpoint, Blaze prepares a distinct replacement lease
+from the immutable reference while the current backend remains running; it
+never reuses the active lease. After the stop boundary, Blaze starts the
+replacement from the daemon-owned backend payload and provider resources,
+validates readiness, commits the replacement, publishes `Running`, finalizes
+provider ownership, and releases the predecessor lease. A failure after the
+stop boundary retains the ownership records required for cleanup and enters
+`RecoveryRequired`.
 
 `last_checkpoint` continues to mean the most recent completed capture. Restore
 moves catalog HEAD but does not rewrite capture history.

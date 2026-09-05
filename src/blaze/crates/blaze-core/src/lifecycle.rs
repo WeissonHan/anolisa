@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::backend::BackendKind;
+use crate::checkpoint::ProviderCheckpointRecord;
 use crate::data_plane::{BackendRuntimeRecord, DataPlaneLeaseRecord};
 use crate::error::{BlazeError, Result};
 use crate::policy::WorkloadClass;
@@ -299,6 +300,14 @@ pub struct SandboxInstance {
     /// Provider-independent ownership identity used for restart reconciliation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_plane_lease: Option<DataPlaneLeaseRecord>,
+    /// Replacement lease staged while an in-place checkpoint restore keeps
+    /// the current lease available for compensation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_data_plane_lease: Option<DataPlaneLeaseRecord>,
+    /// Provider checkpoint content removed from the public catalog but not yet
+    /// confirmed retired by its owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_provider_retirements: Vec<ProviderCheckpointRecord>,
     /// Live backend identity captured with the provider lease.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_runtime: Option<BackendRuntimeRecord>,
@@ -328,6 +337,8 @@ impl SandboxInstance {
             operation: None,
             last_checkpoint: None,
             data_plane_lease: None,
+            replacement_data_plane_lease: None,
+            pending_provider_retirements: Vec::new(),
             backend_runtime: None,
         }
     }

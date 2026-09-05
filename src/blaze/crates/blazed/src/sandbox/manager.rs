@@ -14,8 +14,8 @@ use blaze_core::storage::{StorageProvider, StorageSlot};
 use blaze_provider_api::{
     AbortRequest, BeginInventoryRequest, CommitRequest, DataPlaneProvider, FinalizeRequest,
     InspectRequest, InventoryPageRequest, LeaseBinding, LeaseState, PrepareRequest, PrepareSource,
-    PreparedLease, PreparedResources, ProviderError, PublicTransitionRef, ReconcileAction,
-    ReconcileRequest, ReleaseRequest, RequestContext, StopRequest, TemplateSource,
+    PreparedLease, PreparedResources, ProviderCheckpointRef, ProviderError, PublicTransitionRef,
+    ReconcileAction, ReconcileRequest, ReleaseRequest, RequestContext, StopRequest, TemplateSource,
 };
 use blaze_provider_conformance::{
     validate_descriptor, validate_inventory_lease, validate_inventory_snapshot, validate_prepared,
@@ -135,7 +135,7 @@ pub struct SandboxManager {
     spawners: Arc<SpawnerRegistry>,
     active_backend: BackendKind,
     pub(super) storage: Arc<dyn StorageProvider>,
-    data_plane: Arc<dyn DataPlaneProvider>,
+    pub(super) data_plane: Arc<dyn DataPlaneProvider>,
     data_plane_leases: Mutex<HashMap<Uuid, LeaseBinding>>,
     state_store: StateStore,
     pub(super) checkpoints: CheckpointStore,
@@ -398,7 +398,7 @@ impl SandboxManager {
         }
     }
 
-    async fn commit_data_plane(&self, binding: LeaseBinding) -> Result<LeaseBinding> {
+    pub(super) async fn commit_data_plane(&self, binding: LeaseBinding) -> Result<LeaseBinding> {
         match self.data_plane.commit(CommitRequest { binding }).await {
             Ok(committed) => {
                 validate_transition(binding, committed.binding, LeaseState::Committed).map_err(
@@ -430,7 +430,7 @@ impl SandboxManager {
         }
     }
 
-    fn persist_data_plane_binding(
+    pub(super) fn persist_data_plane_binding(
         &self,
         instance: &mut SandboxInstance,
         binding: LeaseBinding,
@@ -470,7 +470,43 @@ impl SandboxManager {
         self.retain_data_plane_lease(instance.id, binding)
     }
 
-    fn retain_data_plane_lease(&self, id: Uuid, binding: LeaseBinding) -> Result<()> {
+    pub(super) fn persist_replacement_data_plane_binding(
+        &self,
+        instance: &mut SandboxInstance,
+        binding: LeaseBinding,
+        extents: Option<(u64, u64)>,
+    ) -> Result<()> {
+        let (root_filesystem_bytes, guest_memory_bytes) = match extents {
+            Some(extents) => extents,
+            None => {
+                let record = instance.replacement_data_plane_lease.ok_or_else(|| {
+                    BlazeDaemonError::RecoveryRequired(format!(
+                        "sandbox {} has no durable replacement lease to advance",
+                        instance.id
+                    ))
+                })?;
+                (record.root_filesystem_bytes, record.guest_memory_bytes)
+            }
+        };
+        if let Some(previous) = instance.replacement_data_plane_lease
+            && (previous.provider_instance_id != binding.provider_instance_id
+                || previous.lease_id != binding.context.lease_id
+                || previous.request_id != binding.context.request_id
+                || previous.operation_id != binding.context.operation_id
+                || previous.initial_generation != binding.context.generation
+                || binding.generation < previous.generation)
+        {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {} replacement lease identity or generation changed unexpectedly",
+                instance.id
+            )));
+        }
+        instance.replacement_data_plane_lease =
+            Some(binding.to_record(root_filesystem_bytes, guest_memory_bytes));
+        self.persist_and_retain(instance.clone())
+    }
+
+    pub(super) fn retain_data_plane_lease(&self, id: Uuid, binding: LeaseBinding) -> Result<()> {
         let mut leases = self
             .data_plane_leases
             .lock()
@@ -495,7 +531,7 @@ impl SandboxManager {
             .copied())
     }
 
-    fn remove_data_plane_lease(&self, id: Uuid) -> Result<()> {
+    pub(super) fn remove_data_plane_lease(&self, id: Uuid) -> Result<()> {
         self.data_plane_leases
             .lock()
             .map_err(|_| poisoned("data_plane_leases"))?
@@ -932,6 +968,20 @@ impl SandboxManager {
                     )
                     .await);
             }
+            (PreparedResources::CheckpointRestore { .. }, _) => {
+                return Err(self
+                    .cleanup_failed_create(
+                        &mut instance,
+                        binding,
+                        None,
+                        false,
+                        BlazeDaemonError::Internal(
+                            "data-plane provider returned checkpoint resources for creation"
+                                .to_string(),
+                        ),
+                    )
+                    .await);
+            }
         };
         crate::failpoint::pause("create-after-storage-acquire").await;
 
@@ -1299,6 +1349,9 @@ impl SandboxManager {
             )));
         }
         let mut data_plane_binding = self.data_plane_lease(id)?;
+        let replacement_binding = original
+            .replacement_data_plane_lease
+            .map(|record| LeaseBinding::from_record(id, record));
         let mut data_plane_released = false;
 
         let backend = self
@@ -1347,6 +1400,90 @@ impl SandboxManager {
             )));
         }
         original.backend_ownership = BackendOwnership::Stopped;
+
+        if let Some(mut binding) = replacement_binding {
+            match binding.state {
+                LeaseState::Prepared | LeaseState::Committed => {
+                    let aborted = self
+                        .data_plane
+                        .abort(AbortRequest { binding })
+                        .await
+                        .map_err(|error| {
+                            BlazeDaemonError::RecoveryRequired(format!(
+                                "destroy {id}: replacement lease abort failed: {error}"
+                            ))
+                        })?;
+                    validate_transition(binding, aborted.binding, LeaseState::Released).map_err(
+                        |_| {
+                            BlazeDaemonError::RecoveryRequired(format!(
+                                "destroy {id}: replacement lease abort returned an invalid transition"
+                            ))
+                        },
+                    )?;
+                }
+                LeaseState::Finalized => {
+                    let stopped = self
+                        .data_plane
+                        .stop(StopRequest { binding })
+                        .await
+                        .map_err(|error| {
+                            BlazeDaemonError::RecoveryRequired(format!(
+                                "destroy {id}: replacement lease stop failed: {error}"
+                            ))
+                        })?;
+                    validate_transition(binding, stopped.binding, LeaseState::Stopped).map_err(
+                        |_| {
+                            BlazeDaemonError::RecoveryRequired(format!(
+                                "destroy {id}: replacement lease stop returned an invalid transition"
+                            ))
+                        },
+                    )?;
+                    binding = stopped.binding;
+                    let released = self
+                        .data_plane
+                        .release(ReleaseRequest { binding })
+                        .await
+                        .map_err(|error| {
+                            BlazeDaemonError::RecoveryRequired(format!(
+                                "destroy {id}: replacement lease release failed: {error}"
+                            ))
+                        })?;
+                    validate_transition(binding, released.binding, LeaseState::Released).map_err(
+                        |_| {
+                            BlazeDaemonError::RecoveryRequired(format!(
+                                "destroy {id}: replacement lease release returned an invalid transition"
+                            ))
+                        },
+                    )?;
+                }
+                LeaseState::Stopped => {
+                    let released = self
+                        .data_plane
+                        .release(ReleaseRequest { binding })
+                        .await
+                        .map_err(|error| {
+                            BlazeDaemonError::RecoveryRequired(format!(
+                                "destroy {id}: replacement lease release failed: {error}"
+                            ))
+                        })?;
+                    validate_transition(binding, released.binding, LeaseState::Released).map_err(
+                        |_| {
+                            BlazeDaemonError::RecoveryRequired(format!(
+                                "destroy {id}: replacement lease release returned an invalid transition"
+                            ))
+                        },
+                    )?;
+                }
+                LeaseState::Released => {}
+                LeaseState::Quarantined => {
+                    return Err(BlazeDaemonError::RecoveryRequired(format!(
+                        "destroy {id}: quarantined replacement resources require operator resolution"
+                    )));
+                }
+            }
+            original.replacement_data_plane_lease = None;
+            self.persist_and_retain(original.clone())?;
+        }
 
         if let Some(binding) = data_plane_binding {
             match binding.state {
@@ -1421,6 +1558,45 @@ impl SandboxManager {
             )));
         }
 
+        let metadata_store = self.checkpoints.clone();
+        let checkpoint_metadata =
+            crate::failpoint::spawn_blocking(move || metadata_store.list_metadata(id))
+                .await
+                .map_err(|error| {
+                    BlazeDaemonError::RecoveryRequired(format!(
+                        "destroy {id}: checkpoint inventory task failed: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    BlazeDaemonError::RecoveryRequired(format!(
+                        "destroy {id}: checkpoint inventory failed: {error}"
+                    ))
+                })?;
+        for record in checkpoint_metadata
+            .into_iter()
+            .filter_map(|metadata| metadata.provider_checkpoint)
+        {
+            if !original
+                .pending_provider_retirements
+                .iter()
+                .any(|pending| pending.reference_id == record.reference_id)
+            {
+                original.pending_provider_retirements.push(record);
+            }
+        }
+        if !original.pending_provider_retirements.is_empty() {
+            if self.data_plane.checkpoints().is_none() {
+                let recovery = self.mark_instance_recovery(original).err();
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "destroy {id}: provider checkpoint retirement is unavailable{}",
+                    recovery
+                        .map(|error| format!("; recovery state persistence failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+            self.persist_and_retain(original.clone())?;
+        }
+
         let checkpoints = self.checkpoints.clone();
         let checkpoint_cleanup = crate::failpoint::spawn_blocking(move || {
             crate::failpoint::pause_blocking("checkpoint-before-store-remove");
@@ -1441,6 +1617,23 @@ impl SandboxManager {
                     .map(|error| format!("; recovery state persistence failed: {error}"))
                     .unwrap_or_default()
             )));
+        }
+
+        for record in original.pending_provider_retirements.clone() {
+            let checkpoint = ProviderCheckpointRef::from_record(&record);
+            if let Err(error) = self.retire_provider_checkpoint(&checkpoint).await {
+                let recovery = self.mark_instance_recovery(original).err();
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "destroy {id}: provider checkpoint retirement failed: {error}{}",
+                    recovery
+                        .map(|error| format!("; recovery state persistence failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+            original
+                .pending_provider_retirements
+                .retain(|pending| pending.reference_id != record.reference_id);
+            self.persist_and_retain(original.clone())?;
         }
 
         if let Err(error) = self.cleanup_hibernate_artifacts(id).await {
@@ -1573,7 +1766,6 @@ impl SandboxManager {
         }
 
         let mut observed_by_lease = HashMap::new();
-        let mut owner_by_instance = HashMap::new();
         let mut seen_cursors = HashSet::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -1606,12 +1798,9 @@ impl SandboxManager {
                 if observed_by_lease
                     .insert(binding.context.lease_id, binding)
                     .is_some()
-                    || owner_by_instance
-                        .insert(binding.context.instance_id, binding.context.lease_id)
-                        .is_some()
                 {
                     return Err(BlazeDaemonError::RecoveryRequired(
-                        "data-plane inventory contains duplicate ownership".to_string(),
+                        "data-plane inventory contains a duplicate lease".to_string(),
                     ));
                 }
                 if observed_by_lease.len() > MAX_INVENTORY_LEASES {
@@ -1650,6 +1839,8 @@ impl SandboxManager {
                 && instance.operation.is_none()
                 && instance.backend_ownership == BackendOwnership::Running
                 && instance.backend_runtime.is_some()
+                && instance.replacement_data_plane_lease.is_none()
+                && instance.pending_provider_retirements.is_empty()
                 && expected.is_some()
                 && expected == observed
                 && expected.is_some_and(|binding| {
@@ -2276,6 +2467,8 @@ fn is_clean_terminal(instance: &SandboxInstance) -> bool {
     instance.state == SandboxState::Destroyed
         && instance.operation.is_none()
         && instance.data_plane_lease.is_none()
+        && instance.replacement_data_plane_lease.is_none()
+        && instance.pending_provider_retirements.is_empty()
         && instance.backend_runtime.is_none()
         && matches!(
             instance.backend_ownership,
@@ -2315,7 +2508,7 @@ fn validate_template_boot_args(
     )))
 }
 
-fn provider_restore_attachments(
+pub(super) fn provider_restore_attachments(
     binding: LeaseBinding,
     attachments: Vec<blaze_provider_api::OpenedAttachment>,
 ) -> crate::spawner::ProviderRestoreAttachments {

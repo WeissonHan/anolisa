@@ -129,10 +129,11 @@ Transport endpoints, resource mappings, and provider-specific settings stay in
 the provider package and its own operator documentation so the Blaze
 configuration remains portable across independent implementations.
 
-Blaze uses an explicit management representation for sandboxes. It contains
-the documented lifecycle, policy, and backend fields, but not data-plane lease
-or recovery records. Selecting a provider at build time therefore does not
-silently extend the HTTP response schema.
+Blaze uses explicit management representations for sandboxes and checkpoint
+manifests. They contain the documented lifecycle, policy, backend, and artifact
+fields, but not data-plane leases, recovery records, or provider checkpoint
+references. Selecting a provider at build time therefore does not silently
+extend the HTTP response schema.
 
 Contributions to Blaze itself follow the same reusable-contract rule. Public
 types, comments, examples, fixtures, and diagnostics describe observable
@@ -141,11 +142,11 @@ must be understandable and executable from the tracked Blaze sources alone.
 Provider-specific resource topology and configuration are defined and
 documented by the provider that owns them.
 
-The existing `[storage]` file directories remain required in the first
-revision. Blaze still uses the file `StorageProvider` for legacy checkpoint,
-hibernation, and periodic synchronization paths. Injecting a primary provider
-changes create and delete only; it does not silently extend those legacy paths
-to provider-owned sandboxes.
+The existing `[storage]` file directories remain required for file-backed
+sandboxes and daemon-owned catalogs. A primary provider changes creation and
+deletion through the base contract and may separately opt into provider-owned
+checkpoint handling. It does not silently acquire optional behavior merely by
+implementing the base contract.
 
 ## Supported and deferred behavior
 
@@ -157,7 +158,8 @@ to provider-owned sandboxes.
 | Ordinary image creation with opened restore resources | Rejected before backend start |
 | Failed compiled-provider probe | Startup fails; no file fallback |
 | Provider lease adoption after daemon restart | Requires the optional inventory contract and a backend that supports identity-based adoption |
-| Provider-owned checkpoint and rollback | Not supported |
+| Provider-owned checkpoint and rollback | Requires the optional checkpoint contract and full backend snapshot and restore support |
+| Create a new sandbox from a provider checkpoint | Deferred; no public endpoint or policy contract |
 | Provider-owned hibernation and resume | Not supported |
 | Provider capacity and reusable-resource pools | Not supported |
 | Runtime dynamic-library or process plugin discovery | Not supported |
@@ -165,9 +167,11 @@ to provider-owned sandboxes.
 A provider that does not support restart adoption must not be presented as
 production-ready for persistent workloads. The inventory contract and its
 fail-closed recovery rules are specified in
-[Provider Reconciliation](provider-reconciliation.md). Checkpoint, hibernation,
-and capacity still require separate optional contracts rather than unused
-methods in the base interface.
+[Provider Reconciliation](provider-reconciliation.md). Provider checkpoint
+ownership and compensation are specified in
+[Provider-owned Checkpoints](provider-checkpoints.md). Hibernation and capacity
+still require separate optional contracts rather than unused methods in the
+base interface.
 
 ## Verification
 

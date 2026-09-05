@@ -231,13 +231,14 @@ the
 Blaze captures a running sandbox through
 `POST /v1/sandboxes/{id}/checkpoint`.
 
-Capture requires both the selected backend and the storage provider to
-advertise full-checkpoint support. The built-in file provider captures the
-writable root filesystem. Firecracker captures guest memory and device state
-through its own snapshot API, and the built-in mock backend supplies a complete
-development implementation. Bubblewrap and the other process backends do not
-advertise capture support in this release. An unsupported combination returns
-HTTP 501 before the sandbox is paused or its lifecycle record is changed.
+Capture always requires full snapshot support from the selected backend. The
+standard file path also requires storage checkpoint support and captures the
+writable root filesystem through the configured storage provider. A sandbox
+with a finalized provider lease instead requires `DataPlaneCheckpoint`; the
+current provider path must own both the writable-root and guest-memory content.
+Firecracker and the built-in mock backend support full capture, while
+Bubblewrap and the other process backends do not. An unsupported combination
+returns HTTP 501 before the backend is quiesced or its lifecycle record changes.
 
 A Firecracker checkpoint records the exact version of the running virtual machine
 monitor, because a snapshot can only be loaded back by that same version. Keep
@@ -263,7 +264,14 @@ sandbox checkpoint HEAD, and returns the workload to execution. Guest
 operations and other lifecycle changes wait for the same operation lock while
 capture is in progress.
 
-A successful response contains the complete published manifest. The existing
+For a finalized provider-backed lease, Blaze still stores backend artifacts
+under `backend/`, while `DataPlaneCheckpoint` freezes immutable writable-root
+and guest-memory content at the same quiescent boundary. The durable manifest
+stores an implementation-neutral reference and digest instead of requiring
+`storage/rootfs.snap`; the management response omits that ownership record.
+
+A successful response contains the public management view of the published
+manifest. The existing
 `checkpoint_id` and `instance_id` fields identify the same checkpoint and
 sandbox as `id` and `sandbox_id`:
 
@@ -271,7 +279,7 @@ sandbox as `id` and `sandbox_id`:
 {
   "checkpoint_id": "ckpt-11111111-1111-4111-8111-111111111111",
   "instance_id": "22222222-2222-4222-8222-222222222222",
-  "format_version": 2,
+  "format_version": 3,
   "id": "ckpt-11111111-1111-4111-8111-111111111111",
   "parent": null,
   "sandbox_id": "22222222-2222-4222-8222-222222222222",
@@ -305,13 +313,17 @@ The `artifacts` inventory lists every captured file under its slash-separated
 path relative to the checkpoint, sorted lexicographically. Its exact contents
 belong to the backend that produced the checkpoint: the example above shows
 the built-in mock backend, while a container-shaped backend may record a whole
-image directory. Checkpoints written before this format (`format_version: 1`)
-remain restorable, but new captures always publish version 2.
+image directory. Formats 1 and 2 remain readable and restorable when their
+original backend and storage requirements are available. New captures always
+publish format 3. Format 3 can retain an implementation-neutral provider
+ownership record in durable state, but the management response omits that
+record and its opaque identifier.
 
 Use `GET /v1/sandboxes/{id}/checkpoints` to list committed history. Each list
-entry contains `id`, `parent`, `created_at`, total logical `size_bytes`,
-`is_head`, and `on_head_chain`. The list is a summary and does not repeat the
-complete artifact manifest returned by capture.
+entry contains `id`, `parent`, `created_at`, the logical `size_bytes` of
+artifacts in the Blaze checkpoint directory, `is_head`, `on_head_chain`, and
+`provider_managed`. The list is a summary and does not repeat the complete
+artifact manifest returned by capture.
 
 A failure known to occur before publication removes its temporary data,
 resumes the backend, and leaves the sandbox running. If Blaze cannot prove the
@@ -388,11 +400,11 @@ POST /v1/sandboxes/{id}/rollback/{checkpoint_id}
 ```
 
 Restore requires a verified full checkpoint, an exact match for the sandbox's
-policy, image, backend, and backend version, plus explicit restore support from
-both the backend adapter and storage provider. The Firecracker adapter, the
-built-in mock adapter, and the file provider implement this contract. Other
-backend adapters return HTTP 501 before stopping the current runtime until they
-implement restore.
+policy, image, backend, and backend version, and a compatible backend restore
+adapter. A file-backed checkpoint also requires storage restore support. A
+provider-managed checkpoint requires `DataPlaneCheckpoint` from the matching
+provider instance. Unsupported combinations return HTTP 501 before stopping
+the current runtime.
 
 Restoring a Firecracker sandbox replaces its virtual machine monitor with a new
 process that loads the captured memory and device state, so the process
@@ -422,6 +434,13 @@ or Blaze being unable to confirm the old backend actually stopped — retains th
 resources that actually exist and marks the sandbox `RecoveryRequired` so
 destruction can finish cleanup. Restore moves checkpoint HEAD but does not
 rewrite `last_checkpoint` or capture history.
+
+For a provider-managed checkpoint, Blaze prepares a fresh exclusive lease from
+the immutable reference while the old backend remains running. It records that
+replacement before the stop boundary, starts the backend from Blaze-owned
+artifacts plus the prepared provider resources, and publishes the replacement
+only after identity and readiness checks. Blaze then commits and finalizes the
+new lease and releases the predecessor; it never reuses the active lease.
 
 ## Hibernation and Resume
 

@@ -14,6 +14,7 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use blaze_core::checkpoint::ProviderCheckpointRecord;
 use blaze_core::data_plane::{BackendProcessIdentity, DataPlaneLeaseRecord, DataPlaneLeaseState};
 use blaze_core::storage::{StorageSlot, TemplateStorage};
 use thiserror::Error;
@@ -172,6 +173,14 @@ pub enum PreparedResources {
         /// Provider-owned directory containing backend VM-state payload.
         restore_payload_dir: PathBuf,
         /// Root-drive and guest-memory descriptors transferred to Blaze.
+        attachments: Vec<OpenedAttachment>,
+    },
+    /// Resources for an in-place restore whose backend payload remains in the
+    /// daemon checkpoint catalog.
+    CheckpointRestore {
+        /// Path-backed replacement slot, when the provider exposes files.
+        storage: Option<StorageSlot>,
+        /// Opened root-drive and guest-memory attachments otherwise.
         attachments: Vec<OpenedAttachment>,
     },
 }
@@ -373,6 +382,118 @@ pub struct ReleaseResult {
     pub binding: LeaseBinding,
 }
 
+/// Opaque, immutable provider content paired with one public checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCheckpointRef {
+    /// Build-time provider instance that owns the immutable content.
+    pub provider_instance_id: Uuid,
+    /// UUID portion of the public checkpoint that owns this reference.
+    pub public_checkpoint_id: Uuid,
+    /// Opaque provider-local immutable content reference.
+    pub reference_id: Uuid,
+    /// SHA-256 identity of the provider's canonical content manifest.
+    pub content_digest: String,
+    /// Opaque provider reference of the public parent checkpoint.
+    pub parent_reference_id: Option<Uuid>,
+    /// Finalized lease frozen by this capture.
+    pub source_lease_id: Uuid,
+    /// Source lease generation after the provider accepted capture.
+    pub source_generation: u64,
+    /// Whether this reference owns the writable root-filesystem view.
+    pub root_filesystem: bool,
+    /// Whether this reference owns the guest-memory view.
+    pub guest_memory: bool,
+}
+
+impl ProviderCheckpointRef {
+    /// Convert the result into an implementation-neutral durable ownership record.
+    pub fn to_record(&self) -> ProviderCheckpointRecord {
+        ProviderCheckpointRecord {
+            provider_instance_id: self.provider_instance_id,
+            public_checkpoint_id: self.public_checkpoint_id,
+            reference_id: self.reference_id,
+            content_digest: self.content_digest.clone(),
+            parent_reference_id: self.parent_reference_id,
+            source_lease_id: self.source_lease_id,
+            source_generation: self.source_generation,
+            root_filesystem: self.root_filesystem,
+            guest_memory: self.guest_memory,
+        }
+    }
+
+    /// Reconstruct the source-level provider reference from a validated ledger.
+    pub fn from_record(record: &ProviderCheckpointRecord) -> Self {
+        Self {
+            provider_instance_id: record.provider_instance_id,
+            public_checkpoint_id: record.public_checkpoint_id,
+            reference_id: record.reference_id,
+            content_digest: record.content_digest.clone(),
+            parent_reference_id: record.parent_reference_id,
+            source_lease_id: record.source_lease_id,
+            source_generation: record.source_generation,
+            root_filesystem: record.root_filesystem,
+            guest_memory: record.guest_memory,
+        }
+    }
+}
+
+/// Freeze provider-owned state while the backend is quiesced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCheckpointRequest {
+    /// Finalized active lease captured while backend writes are stopped.
+    pub binding: LeaseBinding,
+    /// UUID portion of the already allocated public `ckpt-...` identity.
+    pub checkpoint_id: Uuid,
+    /// Exact parent reference selected from the public checkpoint head.
+    pub parent: Option<ProviderCheckpointRef>,
+}
+
+/// Provider result for one immutable checkpoint capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointSubmission {
+    /// Active lease advanced by exactly one generation and still finalized.
+    pub binding: LeaseBinding,
+    /// Immutable content reference paired with daemon-owned backend artifacts.
+    pub checkpoint: ProviderCheckpointRef,
+}
+
+/// Prepare an independent replacement lease from immutable checkpoint data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreCheckpointRequest {
+    /// Fresh identity for the independent replacement lease.
+    pub context: RequestContext,
+    /// Immutable provider content selected by the verified public catalog.
+    pub checkpoint: ProviderCheckpointRef,
+    /// Required writable root-filesystem extent.
+    pub root_filesystem_bytes: u64,
+    /// Required guest-memory extent.
+    pub guest_memory_bytes: u64,
+}
+
+/// Retire provider content after the public catalog no longer references it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireCheckpointRequest {
+    /// Build-time provider instance expected to own the content.
+    pub provider_instance_id: Uuid,
+    /// Public checkpoint identity used to make unknown captures idempotent.
+    pub public_checkpoint_id: Uuid,
+    /// Absent only when capture had an unknown outcome before a reference was returned.
+    pub reference_id: Option<Uuid>,
+    /// Idempotency identity chosen by Blaze for this retirement attempt.
+    pub operation_id: Uuid,
+}
+
+/// Confirm that a provider checkpoint reference no longer owns content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetireCheckpointResult {
+    /// Public checkpoint identity accepted by the provider.
+    pub public_checkpoint_id: Uuid,
+    /// Exact opaque reference retired, or absent for an unknown capture.
+    pub reference_id: Option<Uuid>,
+    /// True when content was removed by this call, false when already absent.
+    pub retired: bool,
+}
+
 /// Provider-independent failures mapped into stable Blaze diagnostics.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderError {
@@ -476,6 +597,28 @@ pub trait DataPlaneInventory: DataPlaneProvider {
     async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResult, ProviderError>;
 }
 
+/// Optional immutable checkpoint capture, restore, and retirement extension.
+#[async_trait]
+pub trait DataPlaneCheckpoint: DataPlaneProvider {
+    /// Freeze immutable provider content at the backend's capture boundary.
+    async fn checkpoint(
+        &self,
+        request: ProviderCheckpointRequest,
+    ) -> Result<CheckpointSubmission, ProviderError>;
+
+    /// Prepare a new exclusive lease from immutable checkpoint content.
+    async fn restore_checkpoint(
+        &self,
+        request: RestoreCheckpointRequest,
+    ) -> Result<PreparedLease, ProviderError>;
+
+    /// Idempotently release content after its public owner is removed.
+    async fn retire_checkpoint(
+        &self,
+        request: RetireCheckpointRequest,
+    ) -> Result<RetireCheckpointResult, ProviderError>;
+}
+
 /// Source-level data-plane provider compiled into one Blaze daemon binary.
 #[async_trait]
 pub trait DataPlaneProvider: Send + Sync {
@@ -487,6 +630,11 @@ pub trait DataPlaneProvider: Send + Sync {
 
     /// Return restart reconciliation support when this provider implements it.
     fn inventory(&self) -> Option<&dyn DataPlaneInventory> {
+        None
+    }
+
+    /// Return checkpoint support when provider-owned immutable content exists.
+    fn checkpoints(&self) -> Option<&dyn DataPlaneCheckpoint> {
         None
     }
 

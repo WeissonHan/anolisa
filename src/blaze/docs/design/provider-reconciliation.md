@@ -36,12 +36,17 @@ from that snapshot and rejects:
 
 - a snapshot from another provider instance;
 - nil or changed identities;
-- duplicate lease or sandbox ownership;
+- a duplicate lease identity;
 - an oversized page, repeated cursor, or more than the global safety bound;
 - a generation older than the initial generation.
 
 Invalid inventory is a startup error. Blaze does not open its API socket with
 an incomplete or self-contradictory provider view.
+
+More than one lease may temporarily name the same sandbox during a durably
+recorded replacement transaction. Such leases are not interchangeable: only
+the exact active or replacement lease in the public ledger can be matched;
+every unexplained extra lease is quarantined.
 
 ## Adoption and quarantine
 

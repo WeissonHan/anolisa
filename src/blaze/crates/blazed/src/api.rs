@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use blaze_core::backend::{BackendKind, BackendStatus, select_backend};
-use blaze_core::checkpoint::CheckpointMetadata;
+use blaze_core::backend::{BackendKind, BackendStatus, SnapshotKind, select_backend};
+use blaze_core::checkpoint::{CheckpointArtifact, CheckpointMetadata};
 use blaze_core::lifecycle::{
     BackendOwnership, OperationJournal, SandboxInstance, SandboxState, StartPath,
 };
@@ -308,7 +308,44 @@ struct CheckpointResp {
     checkpoint_id: String,
     instance_id: Uuid,
     #[serde(flatten)]
-    checkpoint: CheckpointMetadata,
+    checkpoint: CheckpointMetadataResp,
+}
+
+/// Stable management representation of committed checkpoint metadata.
+///
+/// Provider ownership records remain durable state and are intentionally not
+/// part of the management response.
+#[derive(Debug, Serialize)]
+struct CheckpointMetadataResp {
+    format_version: u32,
+    id: String,
+    parent: Option<String>,
+    sandbox_id: Uuid,
+    policy_name: String,
+    image_digest: String,
+    backend: BackendKind,
+    backend_version: Option<String>,
+    created_at: DateTime<Utc>,
+    snapshot_kind: SnapshotKind,
+    artifacts: Vec<CheckpointArtifact>,
+}
+
+impl From<CheckpointMetadata> for CheckpointMetadataResp {
+    fn from(checkpoint: CheckpointMetadata) -> Self {
+        Self {
+            format_version: checkpoint.format_version,
+            id: checkpoint.id,
+            parent: checkpoint.parent,
+            sandbox_id: checkpoint.sandbox_id,
+            policy_name: checkpoint.policy_name,
+            image_digest: checkpoint.image_digest,
+            backend: checkpoint.backend,
+            backend_version: checkpoint.backend_version,
+            created_at: checkpoint.created_at,
+            snapshot_kind: checkpoint.snapshot_kind,
+            artifacts: checkpoint.artifacts,
+        }
+    }
 }
 
 fn list_sandboxes(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
@@ -420,7 +457,7 @@ async fn checkpoint(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<
     json_ok(&CheckpointResp {
         checkpoint_id: checkpoint.id.clone(),
         instance_id: checkpoint.sandbox_id,
-        checkpoint,
+        checkpoint: CheckpointMetadataResp::from(checkpoint),
     })
 }
 
@@ -774,12 +811,15 @@ mod tests {
         AcquireOpts, PoolStatus, StorageAcquireError, StorageProvider, StorageSlot,
     };
     use blaze_provider_api::{
-        AbortRequest, AbortResult, BeginInventoryRequest, CommitRequest, CommittedLease,
-        DataPlaneInventory, DataPlaneProvider, FinalizeRequest, FinalizedLease, InspectRequest,
-        InventoryLease, InventoryPage, InventoryPageRequest, InventorySnapshot, LeaseBinding,
-        LeaseState, ObservedLease, PrepareRequest, PreparedLease, ProviderCapabilities,
-        ProviderDescriptor, ProviderError, ReconcileAction, ReconcileRequest, ReconcileResult,
-        ReleaseRequest, ReleaseResult, StopRequest, StoppedLease,
+        AbortRequest, AbortResult, BeginInventoryRequest, CheckpointSubmission, CommitRequest,
+        CommittedLease, DataPlaneCheckpoint, DataPlaneInventory, DataPlaneProvider,
+        FinalizeRequest, FinalizedLease, InspectRequest, InventoryLease, InventoryPage,
+        InventoryPageRequest, InventorySnapshot, LeaseBinding, LeaseState, ObservedLease,
+        PrepareRequest, PreparedLease, PreparedResources, ProviderCapabilities,
+        ProviderCheckpointRef, ProviderCheckpointRequest, ProviderDescriptor, ProviderError,
+        ReconcileAction, ReconcileRequest, ReconcileResult, ReleaseRequest, ReleaseResult,
+        RestoreCheckpointRequest, RetireCheckpointRequest, RetireCheckpointResult, StopRequest,
+        StoppedLease,
     };
     use sha2::{Digest, Sha256};
 
@@ -925,6 +965,92 @@ mod tests {
             )
             .expect("state"),
         )
+    }
+
+    struct ManagedStorageToggleProvider {
+        inner: crate::data_plane::FileDataPlaneProvider,
+        daemon_managed_storage: AtomicBool,
+    }
+
+    impl ManagedStorageToggleProvider {
+        fn new(storage: Arc<dyn StorageProvider>) -> Self {
+            Self {
+                inner: crate::data_plane::FileDataPlaneProvider::new(storage),
+                daemon_managed_storage: AtomicBool::new(true),
+            }
+        }
+
+        fn set_daemon_managed_storage(&self, enabled: bool) {
+            self.daemon_managed_storage
+                .store(enabled, Ordering::Release);
+        }
+    }
+
+    #[async_trait]
+    impl DataPlaneProvider for ManagedStorageToggleProvider {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                daemon_managed_storage: self.daemon_managed_storage.load(Ordering::Acquire),
+                ..self.inner.capabilities()
+            }
+        }
+
+        async fn probe(&self) -> std::result::Result<(), ProviderError> {
+            self.inner.probe().await
+        }
+
+        async fn prepare(
+            &self,
+            request: PrepareRequest,
+        ) -> std::result::Result<PreparedLease, ProviderError> {
+            self.inner.prepare(request).await
+        }
+
+        async fn inspect(
+            &self,
+            request: InspectRequest,
+        ) -> std::result::Result<ObservedLease, ProviderError> {
+            self.inner.inspect(request).await
+        }
+
+        async fn commit(
+            &self,
+            request: CommitRequest,
+        ) -> std::result::Result<CommittedLease, ProviderError> {
+            self.inner.commit(request).await
+        }
+
+        async fn finalize(
+            &self,
+            request: FinalizeRequest,
+        ) -> std::result::Result<FinalizedLease, ProviderError> {
+            self.inner.finalize(request).await
+        }
+
+        async fn abort(
+            &self,
+            request: AbortRequest,
+        ) -> std::result::Result<AbortResult, ProviderError> {
+            self.inner.abort(request).await
+        }
+
+        async fn stop(
+            &self,
+            request: StopRequest,
+        ) -> std::result::Result<StoppedLease, ProviderError> {
+            self.inner.stop(request).await
+        }
+
+        async fn release(
+            &self,
+            request: ReleaseRequest,
+        ) -> std::result::Result<ReleaseResult, ProviderError> {
+            self.inner.release(request).await
+        }
     }
 
     fn mock_state(temp: &tempfile::TempDir) -> Arc<ServerState> {
@@ -1085,6 +1211,7 @@ mod tests {
                         backend: instance.backend,
                         backend_version: Some("mock-v1".to_string()),
                         snapshot_kind: SnapshotKind::Full,
+                        provider_checkpoint: None,
                     },
                 )
                 .expect("published checkpoint");
@@ -1571,6 +1698,7 @@ mod tests {
         inner: crate::data_plane::FileDataPlaneProvider,
         snapshot_id: Uuid,
         bindings: std::sync::Mutex<HashMap<Uuid, LeaseBinding>>,
+        checkpoints: std::sync::Mutex<HashMap<Uuid, ProviderCheckpointRef>>,
     }
 
     impl InventoryTestProvider {
@@ -1579,6 +1707,7 @@ mod tests {
                 inner: crate::data_plane::FileDataPlaneProvider::new(storage),
                 snapshot_id: Uuid::new_v4(),
                 bindings: std::sync::Mutex::new(HashMap::new()),
+                checkpoints: std::sync::Mutex::new(HashMap::new()),
             }
         }
 
@@ -1596,6 +1725,33 @@ mod tests {
                 .get(&lease_id)
                 .copied()
         }
+
+        fn checkpoint_count(&self) -> usize {
+            self.checkpoints.lock().expect("provider checkpoints").len()
+        }
+
+        fn transition(
+            &self,
+            binding: LeaseBinding,
+            state: LeaseState,
+            remove: bool,
+        ) -> std::result::Result<LeaseBinding, ProviderError> {
+            let mut bindings = self.bindings.lock().expect("inventory bindings");
+            if bindings.get(&binding.context.lease_id) != Some(&binding) {
+                return Err(ProviderError::Conflict);
+            }
+            let next = LeaseBinding {
+                generation: binding.generation + 1,
+                state,
+                ..binding
+            };
+            if remove {
+                bindings.remove(&binding.context.lease_id);
+            } else {
+                bindings.insert(binding.context.lease_id, next);
+            }
+            Ok(next)
+        }
     }
 
     #[async_trait]
@@ -1609,6 +1765,10 @@ mod tests {
         }
 
         fn inventory(&self) -> Option<&dyn DataPlaneInventory> {
+            Some(self)
+        }
+
+        fn checkpoints(&self) -> Option<&dyn DataPlaneCheckpoint> {
             Some(self)
         }
 
@@ -1629,58 +1789,55 @@ mod tests {
             &self,
             request: InspectRequest,
         ) -> std::result::Result<ObservedLease, ProviderError> {
-            self.inner.inspect(request).await
+            self.binding(request.context.lease_id)
+                .filter(|binding| binding.context == request.context)
+                .map(|binding| ObservedLease { binding })
+                .ok_or(ProviderError::Conflict)
         }
 
         async fn commit(
             &self,
             request: CommitRequest,
         ) -> std::result::Result<CommittedLease, ProviderError> {
-            let committed = self.inner.commit(request).await?;
-            self.record(committed.binding);
-            Ok(committed)
+            Ok(CommittedLease {
+                binding: self.transition(request.binding, LeaseState::Committed, false)?,
+            })
         }
 
         async fn finalize(
             &self,
             request: FinalizeRequest,
         ) -> std::result::Result<FinalizedLease, ProviderError> {
-            let finalized = self.inner.finalize(request).await?;
-            self.record(finalized.binding);
-            Ok(finalized)
+            Ok(FinalizedLease {
+                binding: self.transition(request.binding, LeaseState::Finalized, false)?,
+            })
         }
 
         async fn abort(
             &self,
             request: AbortRequest,
         ) -> std::result::Result<AbortResult, ProviderError> {
-            let aborted = self.inner.abort(request).await?;
-            self.bindings
-                .lock()
-                .expect("inventory bindings")
-                .remove(&request.binding.context.lease_id);
-            Ok(aborted)
+            Ok(AbortResult {
+                binding: self.transition(request.binding, LeaseState::Released, true)?,
+            })
         }
 
         async fn stop(
             &self,
             request: StopRequest,
         ) -> std::result::Result<StoppedLease, ProviderError> {
-            let stopped = self.inner.stop(request).await?;
-            self.record(stopped.binding);
-            Ok(stopped)
+            Ok(StoppedLease {
+                binding: self.transition(request.binding, LeaseState::Stopped, false)?,
+            })
         }
 
         async fn release(
             &self,
             request: ReleaseRequest,
         ) -> std::result::Result<ReleaseResult, ProviderError> {
-            let released = self.inner.release(request).await?;
-            self.bindings
-                .lock()
-                .expect("inventory bindings")
-                .remove(&request.binding.context.lease_id);
-            Ok(released)
+            Ok(ReleaseResult {
+                binding: self.transition(request.binding, LeaseState::Released, true)?,
+            })
         }
     }
 
@@ -1746,6 +1903,112 @@ mod tests {
                 bindings.insert(binding.context.lease_id, binding);
             }
             Ok(ReconcileResult { binding })
+        }
+    }
+
+    #[async_trait]
+    impl DataPlaneCheckpoint for InventoryTestProvider {
+        async fn checkpoint(
+            &self,
+            request: ProviderCheckpointRequest,
+        ) -> std::result::Result<CheckpointSubmission, ProviderError> {
+            if request.binding.state != LeaseState::Finalized
+                || self.binding(request.binding.context.lease_id) != Some(request.binding)
+                || request.parent.as_ref().is_some_and(|parent| {
+                    parent.provider_instance_id != request.binding.provider_instance_id
+                })
+            {
+                return Err(ProviderError::Conflict);
+            }
+            let binding = self.transition(request.binding, LeaseState::Finalized, false)?;
+            let checkpoint = ProviderCheckpointRef {
+                provider_instance_id: binding.provider_instance_id,
+                public_checkpoint_id: request.checkpoint_id,
+                reference_id: Uuid::new_v4(),
+                content_digest: format!(
+                    "sha256:{:x}",
+                    Sha256::digest(request.checkpoint_id.as_bytes())
+                ),
+                parent_reference_id: request.parent.map(|parent| parent.reference_id),
+                source_lease_id: binding.context.lease_id,
+                source_generation: binding.generation,
+                root_filesystem: true,
+                guest_memory: true,
+            };
+            self.checkpoints
+                .lock()
+                .expect("provider checkpoints")
+                .insert(checkpoint.public_checkpoint_id, checkpoint.clone());
+            Ok(CheckpointSubmission {
+                binding,
+                checkpoint,
+            })
+        }
+
+        async fn restore_checkpoint(
+            &self,
+            request: RestoreCheckpointRequest,
+        ) -> std::result::Result<PreparedLease, ProviderError> {
+            if self
+                .checkpoints
+                .lock()
+                .expect("provider checkpoints")
+                .get(&request.checkpoint.public_checkpoint_id)
+                != Some(&request.checkpoint)
+            {
+                return Err(ProviderError::Conflict);
+            }
+            let binding = LeaseBinding {
+                provider_instance_id: self.descriptor().provider_instance_id,
+                context: request.context,
+                generation: request.context.generation,
+                state: LeaseState::Prepared,
+            };
+            self.record(binding);
+            let id = request.context.instance_id.to_string();
+            Ok(PreparedLease {
+                binding,
+                resources: PreparedResources::CheckpointRestore {
+                    storage: Some(StorageSlot {
+                        id,
+                        rootfs_path: PathBuf::new(),
+                        mem_path: PathBuf::new(),
+                        mem_diff_path: PathBuf::new(),
+                        rootfs_diff_path: PathBuf::new(),
+                        instance_dir: PathBuf::new(),
+                    }),
+                    attachments: Vec::new(),
+                },
+            })
+        }
+
+        async fn retire_checkpoint(
+            &self,
+            request: RetireCheckpointRequest,
+        ) -> std::result::Result<RetireCheckpointResult, ProviderError> {
+            if request.provider_instance_id != self.descriptor().provider_instance_id
+                || request.public_checkpoint_id.is_nil()
+                || request
+                    .reference_id
+                    .is_some_and(|reference_id| reference_id.is_nil())
+                || request.operation_id.is_nil()
+            {
+                return Err(ProviderError::Conflict);
+            }
+            let mut checkpoints = self.checkpoints.lock().expect("provider checkpoints");
+            if let (Some(expected), Some(actual)) = (
+                request.reference_id,
+                checkpoints.get(&request.public_checkpoint_id),
+            ) && expected != actual.reference_id
+            {
+                return Err(ProviderError::Conflict);
+            }
+            let retired = checkpoints.remove(&request.public_checkpoint_id);
+            Ok(RetireCheckpointResult {
+                public_checkpoint_id: request.public_checkpoint_id,
+                reference_id: request.reference_id,
+                retired: retired.is_some(),
+            })
         }
     }
 
@@ -2343,6 +2606,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_rejects_unmanaged_storage_without_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(ManagedStorageToggleProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        write_checkpoint_fixture(&state, id).await;
+        let state_path = configured_state_dir(&state).join(id).join("state.json");
+        let persisted_before = std::fs::read(&state_path).expect("persisted state");
+        provider.set_daemon_managed_storage(false);
+
+        let error = state
+            .manager
+            .checkpoint(uuid)
+            .await
+            .expect_err("unmanaged storage must not use the standard checkpoint path");
+
+        assert!(matches!(error, BlazeDaemonError::UnsupportedOperation(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("does not use daemon-managed storage for checkpoint capture")
+        );
+        let lifecycle = state.manager.get(uuid).expect("lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::Running);
+        assert!(lifecycle.operation.is_none());
+        assert_eq!(
+            std::fs::read(state_path).expect("persisted state"),
+            persisted_before
+        );
+        assert!(state.manager.backend_owner(uuid).is_some());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restore_rejects_unmanaged_storage_without_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(ManagedStorageToggleProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        write_checkpoint_fixture(&state, id).await;
+        let checkpoint = state
+            .manager
+            .checkpoint(uuid)
+            .await
+            .expect("standard checkpoint");
+        let state_path = configured_state_dir(&state).join(id).join("state.json");
+        let persisted_before = std::fs::read(&state_path).expect("persisted state");
+        let owner = state.manager.backend_owner(uuid).expect("backend owner");
+        provider.set_daemon_managed_storage(false);
+
+        let error = state
+            .manager
+            .restore(
+                uuid,
+                RestoreSandbox {
+                    checkpoint_id: checkpoint.id.clone(),
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect_err("unmanaged storage must not use the standard restore path");
+
+        assert!(matches!(error, BlazeDaemonError::UnsupportedOperation(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("does not use daemon-managed storage for checkpoint restore")
+        );
+        let lifecycle = state.manager.get(uuid).expect("lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::Running);
+        assert!(lifecycle.operation.is_none());
+        assert_eq!(
+            lifecycle.last_checkpoint.as_deref(),
+            Some(checkpoint.id.as_str())
+        );
+        assert_eq!(
+            std::fs::read(state_path).expect("persisted state"),
+            persisted_before
+        );
+        let retained = state.manager.backend_owner(uuid).expect("retained backend");
+        assert!(Arc::ptr_eq(&owner, &retained));
+    }
+
+    #[tokio::test]
     async fn checkpoint_rejects_unsupported_backend_without_mutation() {
         let temp = tempfile::tempdir().expect("temp");
         let config = test_config(&temp);
@@ -2483,6 +2857,268 @@ mod tests {
                 .exists(),
             "destroy must remove the complete checkpoint namespace"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_checkpoint_pairs_backend_artifacts_with_an_opaque_reference() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config.clone(),
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("sandbox id"))
+            .expect("sandbox UUID");
+
+        let checkpoint = state
+            .manager
+            .checkpoint(id)
+            .await
+            .expect("provider checkpoint");
+
+        let provider_record = checkpoint
+            .provider_checkpoint
+            .as_ref()
+            .expect("provider checkpoint record");
+        assert_eq!(
+            format!("ckpt-{}", provider_record.public_checkpoint_id),
+            checkpoint.id
+        );
+        assert!(provider_record.root_filesystem);
+        assert!(provider_record.guest_memory);
+        assert_eq!(provider.checkpoint_count(), 1);
+        assert!(
+            checkpoint
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.name.starts_with("backend/"))
+        );
+        assert!(
+            !configured_state_dir(&state)
+                .join("checkpoints")
+                .join(id.to_string())
+                .join(&checkpoint.id)
+                .join("storage/rootfs.snap")
+                .exists()
+        );
+        let lifecycle = state.manager.get(id).expect("lifecycle");
+        assert!(lifecycle.pending_provider_retirements.is_empty());
+        assert_eq!(
+            lifecycle.data_plane_lease.map(|lease| lease.generation),
+            Some(provider_record.source_generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_checkpoint_response_omits_provider_ownership_record() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let (status, created) =
+            dispatched_json(&state, Method::POST, "/v1/sandboxes", test_request()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["instance"]["id"].as_str().expect("sandbox id");
+
+        let (status, checkpoint) = dispatched_json(
+            &state,
+            Method::POST,
+            &format!("/v1/sandboxes/{id}/checkpoint"),
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            checkpoint.get("provider_checkpoint").is_none(),
+            "provider ownership must not extend the checkpoint response"
+        );
+        assert_eq!(
+            provider.checkpoint_count(),
+            1,
+            "the test must exercise a provider-owned checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_checkpoint_restore_replaces_the_lease_after_backend_readiness() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("sandbox id"))
+            .expect("sandbox UUID");
+        let checkpoint = state
+            .manager
+            .checkpoint(id)
+            .await
+            .expect("provider checkpoint");
+        let old_lease = state
+            .manager
+            .get(id)
+            .expect("before restore")
+            .data_plane_lease
+            .expect("old lease")
+            .lease_id;
+
+        let restored = state
+            .manager
+            .restore(
+                id,
+                RestoreSandbox {
+                    checkpoint_id: checkpoint.id.clone(),
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect("provider restore");
+
+        let replacement = restored
+            .instance
+            .data_plane_lease
+            .expect("replacement lease");
+        assert_ne!(replacement.lease_id, old_lease);
+        assert_eq!(
+            replacement.state,
+            blaze_core::data_plane::DataPlaneLeaseState::Finalized
+        );
+        assert_eq!(replacement.generation, 3);
+        assert!(restored.instance.replacement_data_plane_lease.is_none());
+        assert_eq!(restored.instance.state, SandboxState::Running);
+        assert!(state.manager.backend_owner(id).is_some());
+        assert!(provider.binding(old_lease).is_none());
+        assert_eq!(
+            provider
+                .binding(replacement.lease_id)
+                .map(|binding| binding.state),
+            Some(LeaseState::Finalized)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_checkpoint_prune_retires_content_after_catalog_removal() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("sandbox id"))
+            .expect("sandbox UUID");
+        let root = state.manager.checkpoint(id).await.expect("root checkpoint");
+        let unreachable = state
+            .manager
+            .checkpoint(id)
+            .await
+            .expect("child checkpoint");
+        state
+            .manager
+            .restore(
+                id,
+                RestoreSandbox {
+                    checkpoint_id: root.id.clone(),
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect("restore root");
+
+        let removed = state
+            .manager
+            .prune_checkpoints(id)
+            .await
+            .expect("provider prune");
+
+        assert_eq!(removed, vec![unreachable.id]);
+        assert_eq!(provider.checkpoint_count(), 1);
+        assert!(
+            state
+                .manager
+                .get(id)
+                .expect("lifecycle")
+                .pending_provider_retirements
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn provider_checkpoint_publication_failure_retires_unpublished_content() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = Uuid::parse_str(created["instance"]["id"].as_str().expect("sandbox id"))
+            .expect("sandbox UUID");
+        let hook = crate::failpoint::TestFailpoint::new(&["checkpoint-publish"]);
+
+        let error = hook
+            .run(state.manager.checkpoint(id))
+            .await
+            .expect_err("publication failure");
+
+        assert!(!matches!(error, BlazeDaemonError::RecoveryRequired(_)));
+        assert_eq!(provider.checkpoint_count(), 0);
+        let lifecycle = state.manager.get(id).expect("compensated lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::Running);
+        assert!(lifecycle.operation.is_none());
+        assert!(lifecycle.pending_provider_retirements.is_empty());
+        assert!(state.manager.backend_owner(id).is_some());
     }
 
     #[tokio::test]
