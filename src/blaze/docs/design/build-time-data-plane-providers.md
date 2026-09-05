@@ -30,6 +30,113 @@ provider binary must pin compatible revisions of:
 obvious contract mismatch, but it does not replace source and dependency
 pinning.
 
+## Lifecycle-state namespace
+
+The configured `daemon.state_dir` remains the process-coordination root. The
+standard `blazed` binary stores lifecycle records directly below that root and
+keeps its existing layout unchanged. A daemon composed with
+`BlazeDaemonBuilder` instead uses this stable default state root:
+
+```text
+<daemon.state_dir>/.provider-state-v<contract_version>-<provider_instance_id>
+```
+
+The provider identity is written as a canonical, lowercase, hyphenated UUID.
+The derived directory is a direct child whose complete name cannot itself be a
+UUID. A standard daemon, including an older release that scans only immediate
+UUID children of `daemon.state_dir`, therefore does not load, rewrite, or clean
+provider-backed lifecycle records. Downgrade safety relies on this directory
+boundary, not on how an older serializer handles fields it does not recognize.
+
+Blaze validates the configured outer root first, validates the derived root
+again before creating owned directories, and retains exclusive locks on both
+the opened outer root and the selected namespace. The namespace is created and
+opened relative to the retained outer-directory descriptor without following
+a namespace symbolic link. The outer lock excludes two cooperating daemons
+while the configured root's directory entry continues to name the retained
+object.
+
+The configured state root and its parent are therefore part of the daemon's
+trusted host configuration. They must not be renamed or replaced while the
+daemon is running, and an untrusted user must not be able to modify the parent
+directory. Directory locks are attached to opened filesystem objects rather
+than path strings: replacing the complete root can create a different object
+with a different lock. The retained descriptors still prevent existing state
+I/O from being redirected, but they cannot turn a replaceable path into a
+host-wide singleton. Service supervision and directory permissions must enforce
+this existing deployment requirement.
+
+Before accepting a custom provider, startup inspects the standard root and
+every other provider namespace without cleaning them. A non-terminal record,
+an unfinished state publication, a malformed ownership record, or a concurrent
+change stops startup. Another provider identity is accepted only when every
+retained lifecycle record is a valid `Destroyed` record with no remaining
+ownership. This check prevents changing `provider_instance_id` from silently
+adopting or bypassing live state.
+
+Composition authors must keep `provider_instance_id` stable for the lifetime
+of the provider's ownership domain. Changing the identity or contract revision
+selects a different namespace; Blaze neither migrates nor copies records
+between namespaces. Complete cleanup with the original provider before an
+intentional identity change. Likewise, running the standard binary after a
+downgrade will not clean resources represented only in an extension namespace;
+finish those lifecycles with a compatible extension binary first.
+
+This namespace contains Blaze lifecycle records. It does not replace the
+provider's own durable resource ledger, whose location and recovery rules
+remain part of the extension's configuration and documentation.
+
+The standard file provider keeps its ownership ledger in a protected sibling
+directory below the configured instances root, outside every removable sandbox
+directory. It writes a complete prepare identity before creating a slot, marks
+the record ready only after the artifacts are durable, and marks it deleting
+before recursive removal. The record is removed only after the empty slot and
+its parent have been synchronized. Startup therefore can resume every
+interrupted allocation or removal without treating a same-named, unrecorded
+directory as owned. It also removes only strictly named, unpublished temporary
+records left by an interrupted atomic ledger update; other ledger entries are
+not treated as disposable.
+
+The file provider's `provider_instance_id` is a deterministic UUID derived from
+the canonical instances-root object, including its filesystem device and inode.
+Reconstructing the provider over the same root preserves its identity, while
+selecting a different or replaced root produces a different identity. An old
+binding therefore conflicts before lookup or deletion instead of being reported
+as released merely because the newly configured root is empty. This
+root-derived descriptor follows the same stability rule that the build-time
+lifecycle-state namespace mechanism requires from composition providers.
+
+Each ready ledger claim records the device and inode read from the opened slot
+directory. Allocation never treats a random token or the slot pathname as
+ownership evidence. If another directory wins the final name before `mkdir`,
+the preparing claim remains unidentified and cleanup refuses to touch that
+directory. A crash between `mkdir` and identity publication similarly retains
+the ambiguous directory for operator investigation. Inspection and cleanup
+compare the linked directory with the recorded object before reading or
+removing it.
+
+Restart lookup scans every canonical ownership manifest so reuse of either an
+instance identifier or lease identifier with a different complete context is a
+typed provider conflict. Exact idempotent preparation also compares source
+fingerprint, logical root-filesystem and memory extents, and template VM-state
+length. Before a ready claim is accepted, the provider verifies rootfs and
+memory logical lengths; template claims additionally require a plain `backend`
+directory with `vmstate.snap` and `memory.snap` of the recorded lengths.
+Ordinary base-image copies must already match the requested logical extent.
+
+Initial generations must leave room for the complete create-to-release
+sequence. Subsequent transitions compute their next generation before any
+cleanup begins, so overflow is a conflict with retained resources rather than
+an unrepeatable deletion outcome.
+
+The file provider retains a non-blocking exclusive lock on the opened instances
+root. This is a cooperative single-writer contract, not protection from a
+privileged host administrator: every writer to that root must use the same
+lock, and deployment permissions must prevent unrelated processes from
+changing the root, ledger, or slot trees while Blaze is running.
+The instances root itself is rejected when group or other users can write it;
+the ownership-ledger directory permits only owner access.
+
 ## Reproducible and privacy-preserving builds
 
 Rust toolchains may retain absolute source paths in diagnostics and metadata.
@@ -144,9 +251,10 @@ documented by the provider that owns them.
 
 The existing `[storage]` file directories remain required for file-backed
 sandboxes and daemon-owned catalogs. A primary provider changes creation and
-deletion through the base contract and may separately opt into provider-owned
-checkpoint handling. It does not silently acquire optional behavior merely by
-implementing the base contract.
+deletion through the base contract. It may declare `daemon_managed_storage` to
+use the configured storage provider for checkpoint, hibernation, and restore,
+or separately opt into provider-owned lifecycle extensions. A provider lease
+alone does not require or silently acquire either optional extension.
 
 ## Supported and deferred behavior
 
@@ -154,7 +262,7 @@ implementing the base contract.
 |---|---|
 | Ordinary image creation with path-backed resources | Supported |
 | Template creation with path-backed resources | Supported |
-| Template creation with opened root-drive and guest-memory resources | Supported when declared |
+| Template creation with opened root-drive and guest-memory resources | Requires both a provider declaration and the Firecracker restore adapter, which is currently the only consumer |
 | Ordinary image creation with opened restore resources | Rejected before backend start |
 | Failed compiled-provider probe | Startup fails; no file fallback |
 | Provider lease adoption after daemon restart | Requires the optional inventory contract and a backend that supports identity-based adoption |

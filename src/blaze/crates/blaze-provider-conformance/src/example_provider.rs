@@ -199,7 +199,7 @@ impl DataPlaneProvider for ExampleFileProvider {
             .map_err(|_| ProviderError::OutcomeUnknown)?;
         let lease = leases
             .get(&request.context.lease_id)
-            .ok_or(ProviderError::Conflict)?;
+            .ok_or(ProviderError::NotFound)?;
         if lease.binding.context != request.context {
             return Err(ProviderError::Conflict);
         }

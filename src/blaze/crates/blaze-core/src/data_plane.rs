@@ -8,6 +8,60 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Durable form of the stable identity chosen before a provider call.
+///
+/// Keeping the complete context in the public lifecycle record lets restart
+/// recovery repeat an inspection without inventing a new idempotency key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataPlaneRequestContextRecord {
+    /// Public sandbox that owns the provider operation.
+    pub instance_id: Uuid,
+    /// Idempotency key for the provider call sequence.
+    pub request_id: Uuid,
+    /// Public lifecycle operation that owns the transition.
+    pub operation_id: Uuid,
+    /// Lease identity selected before the provider may create resources.
+    pub lease_id: Uuid,
+    /// Expected first lease generation.
+    pub generation: u64,
+}
+
+/// Provider mutation whose result must remain recoverable across restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PendingProviderOperationKind {
+    /// Prepare a fresh provider lease.
+    PrepareLease,
+    /// Capture immutable content for a public checkpoint.
+    CheckpointCapture,
+    /// Capture immutable content for hibernation.
+    SuspensionCapture {
+        /// Identity selected before suspension content may be created.
+        suspension_id: Uuid,
+    },
+}
+
+/// Write-ahead identity for one provider mutation.
+///
+/// This record intentionally contains only provider-independent identities and
+/// logical extents. Provider-specific resource topology remains behind the
+/// source-level provider contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingProviderOperationRecord {
+    /// Provider instance expected to inspect or compensate the operation.
+    pub provider_instance_id: Uuid,
+    /// Complete request identity used by inspection and idempotent retries.
+    pub context: DataPlaneRequestContextRecord,
+    /// Last accepted lease generation before the provider call started.
+    pub generation_before_call: u64,
+    /// Logical root-filesystem extent involved in the mutation.
+    pub root_filesystem_bytes: u64,
+    /// Logical guest-memory extent involved in the mutation.
+    pub guest_memory_bytes: u64,
+    /// Generic mutation being attempted.
+    pub kind: PendingProviderOperationKind,
+}
+
 /// Durable lifecycle phase of one provider-owned resource lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -48,7 +102,9 @@ pub struct DataPlaneLeaseRecord {
 ///
 /// Extension implementations map retained content into the opaque identity and
 /// integrity fields below. Blaze can therefore resume or retire the same object
-/// without depending on one implementation's storage model.
+/// without depending on one implementation's storage model. The presence of
+/// this record denotes provider ownership of the complete writable-root and
+/// guest-memory image; partial provider ownership is not supported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataPlaneSuspensionRecord {
     /// Build-time provider instance that owns the immutable content.
@@ -63,10 +119,6 @@ pub struct DataPlaneSuspensionRecord {
     pub source_lease_id: Uuid,
     /// Source lease generation after the provider accepted suspension.
     pub source_generation: u64,
-    /// Whether the provider owns the retained root-filesystem view.
-    pub root_filesystem: bool,
-    /// Whether the provider owns the retained guest-memory view.
-    pub guest_memory: bool,
     /// Logical root-filesystem extent required by a fresh resume lease.
     pub root_filesystem_bytes: u64,
     /// Logical guest-memory extent required by a fresh resume lease.
@@ -95,4 +147,28 @@ pub struct BackendRuntimeRecord {
     pub network_slot: bool,
     /// Whether console output is retained in the runtime directory.
     pub console_log: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suspension_record_serializes_one_complete_owner() {
+        let record = DataPlaneSuspensionRecord {
+            provider_instance_id: Uuid::new_v4(),
+            suspension_id: Uuid::new_v4(),
+            reference_id: Uuid::new_v4(),
+            content_digest: format!("sha256:{}", "a".repeat(64)),
+            source_lease_id: Uuid::new_v4(),
+            source_generation: 4,
+            root_filesystem_bytes: 4096,
+            guest_memory_bytes: 8192,
+        };
+
+        let encoded = serde_json::to_value(record).expect("serialize suspension record");
+
+        assert!(encoded.get("root_filesystem").is_none());
+        assert!(encoded.get("guest_memory").is_none());
+    }
 }

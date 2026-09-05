@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Daemon runtime: bind UDS, accept connections, wire signal handlers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +32,7 @@ use crate::spawner::{
 };
 use crate::state::ServerState;
 use crate::state_store::StateStore;
+use crate::{build_time_provider_state_dir, build_time_provider_state_namespace};
 
 /// Boot the daemon: load config + policies, prepare state directories,
 /// bind the API socket, and run the accept loop until SIGTERM/SIGINT.
@@ -45,8 +46,9 @@ pub(crate) async fn run_with_provider(
     config_path: &Path,
     provider: Arc<dyn DataPlaneProvider>,
 ) -> Result<()> {
-    let loaded = load_daemon_config(config_path)?;
-    validate_descriptor(provider.descriptor()).map_err(|_| {
+    let mut loaded = load_daemon_config(config_path)?;
+    let descriptor = provider.descriptor();
+    validate_descriptor(descriptor).map_err(|_| {
         BlazeDaemonError::Internal("build-time data-plane provider is incompatible".to_string())
     })?;
     provider.probe().await.map_err(|error| {
@@ -54,7 +56,36 @@ pub(crate) async fn run_with_provider(
             "build-time data-plane provider probe failed: {error}"
         ))
     })?;
-    run_loaded_config(loaded, Some(provider)).await
+    if provider.descriptor() != descriptor {
+        return Err(BlazeDaemonError::Internal(
+            "build-time data-plane provider identity changed during startup".to_string(),
+        ));
+    }
+    let configured_state_root = loaded.config.daemon.state_dir.clone();
+    loaded.config.daemon.state_dir =
+        build_time_provider_state_dir(&configured_state_root, descriptor);
+    tracing::info!(
+        provider = %descriptor.provider_instance_id,
+        contract_version = descriptor.contract_version,
+        configured_root = %configured_state_root.display(),
+        state_root = %loaded.config.daemon.state_dir.display(),
+        "selected isolated build-time provider state namespace"
+    );
+    run_loaded_config(
+        loaded,
+        Some(BuildTimeProvider {
+            provider,
+            descriptor,
+            configured_state_root,
+        }),
+    )
+    .await
+}
+
+struct BuildTimeProvider {
+    provider: Arc<dyn DataPlaneProvider>,
+    descriptor: blaze_provider_api::ProviderDescriptor,
+    configured_state_root: PathBuf,
 }
 
 struct LoadedDaemonConfig {
@@ -90,7 +121,7 @@ fn absolutize_backend_paths(config: &mut DaemonConfig) -> Result<()> {
 
 async fn run_loaded_config(
     loaded: LoadedDaemonConfig,
-    build_time_provider: Option<Arc<dyn DataPlaneProvider>>,
+    build_time_provider: Option<BuildTimeProvider>,
 ) -> Result<()> {
     let LoadedDaemonConfig { config, source } = loaded;
     let sync_schedule = config.storage.sync_schedule()?;
@@ -98,7 +129,7 @@ async fn run_loaded_config(
     if !matches!(sync_schedule, StorageSyncSchedule::Disabled)
         && build_time_provider
             .as_ref()
-            .is_some_and(|provider| !provider.capabilities().daemon_managed_storage)
+            .is_some_and(|selection| !selection.provider.capabilities().daemon_managed_storage)
     {
         return Err(BlazeDaemonError::UnsupportedOperation(
             "periodic storage synchronization requires a provider that uses daemon-managed storage"
@@ -119,10 +150,21 @@ async fn run_loaded_config(
     )?;
     let policy_load = template_roots.policy_load_disposition();
     let template_catalog = TemplateCatalog::open_validated(&config.template, template_roots)?;
-    ensure_dirs(&config)?;
+    if let Some(selection) = build_time_provider.as_ref() {
+        ensure_dirs_with_state_root(&config, &selection.configured_state_root)?;
+    } else {
+        ensure_dirs(&config)?;
+    }
     // Retain the accepted state-root object before policy, backend, and
     // storage initialization so later code cannot reopen a replacement path.
-    let state_store = StateStore::open(config.daemon.state_dir.clone())?;
+    let state_store = if let Some(selection) = build_time_provider.as_ref() {
+        StateStore::open_provider_namespace(
+            selection.configured_state_root.clone(),
+            &build_time_provider_state_namespace(selection.descriptor),
+        )?
+    } else {
+        StateStore::open(config.daemon.state_dir.clone())?
+    };
     let policy = load_policy_engine(&config, policy_load)?;
     let hook = HookRegistry::new();
     let network_required = policy.policies().iter().any(|policy| {
@@ -167,14 +209,14 @@ async fn run_loaded_config(
     let socket_path = config.daemon.socket.clone();
     let http_addr = config.listen.http_addr.clone();
     let state = Arc::new(match build_time_provider {
-        Some(data_plane) => ServerState::build_with_store_and_provider(
+        Some(selection) => ServerState::build_with_store_and_provider(
             config,
             policy,
             hook,
             spawners,
             active_backend,
             storage,
-            data_plane,
+            selection.provider,
             template_catalog,
             state_store,
         )?,
@@ -228,8 +270,12 @@ async fn run_loaded_config(
 }
 
 fn ensure_dirs(cfg: &DaemonConfig) -> Result<()> {
+    ensure_dirs_with_state_root(cfg, &cfg.daemon.state_dir)
+}
+
+fn ensure_dirs_with_state_root(cfg: &DaemonConfig, state_root: &Path) -> Result<()> {
     cfg.validate()?;
-    std::fs::create_dir_all(&cfg.daemon.state_dir)?;
+    std::fs::create_dir_all(state_root)?;
     // TemplateCatalog::open_validated creates and retains the accepted catalog
     // object. Reopening its configured path here would discard that binding.
     std::fs::create_dir_all(&cfg.storage.images_dir)?;
@@ -767,6 +813,54 @@ backend_priority = ["bubblewrap"]
         ] {
             assert!(!path.exists(), "{} must remain absent", path.display());
         }
+    }
+
+    #[tokio::test]
+    async fn build_time_provider_revalidates_the_derived_state_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = DaemonConfig::default();
+        config.template.import_root = Some(temp.path().join("imports"));
+        config.storage.images_dir = temp.path().join("images");
+        config.storage.instances_dir = temp.path().join("instances");
+        config.policy.dir = temp.path().join("policies");
+        config.daemon.state_dir = temp.path().join("state");
+        config.daemon.socket = temp.path().join("run/api.sock");
+        for directory in [
+            &config.storage.images_dir,
+            &config.storage.instances_dir,
+            config.template.import_root.as_ref().expect("import root"),
+            &config.policy.dir,
+        ] {
+            std::fs::create_dir(directory).expect("provider storage directory");
+        }
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(FileDataPlaneProvider::new(storage));
+        config.template.dir =
+            build_time_provider_state_dir(&config.daemon.state_dir, provider.descriptor());
+        config
+            .validate()
+            .expect("configured outer state boundary accepts a non-UUID child");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let error = run_with_provider(&config_path, provider)
+            .await
+            .expect_err("derived state root must be revalidated");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("template.dir"),
+            "unexpected startup error: {message}"
+        );
+        assert!(message.contains("daemon.state_dir"));
+        assert!(!config.template.dir.exists());
     }
 
     #[tokio::test]

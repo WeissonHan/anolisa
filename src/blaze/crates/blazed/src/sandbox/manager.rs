@@ -8,21 +8,31 @@ use std::time::Duration;
 
 use blaze_core::BlazeError;
 use blaze_core::backend::{BackendKind, RestoreRequest, SpawnRequest};
-use blaze_core::lifecycle::{BackendOwnership, OperationKind, SandboxInstance, SandboxState};
+use blaze_core::checkpoint::{CheckpointMetadata, validate_checkpoint_id};
+use blaze_core::data_plane::{
+    BackendProcessIdentity, DataPlaneLeaseState, PendingProviderOperationKind,
+    PendingProviderOperationRecord,
+};
+use blaze_core::lifecycle::{
+    BackendOwnership, OperationKind, PendingProviderTransitionRecord, ProviderLeaseSlot,
+    ProviderPublicTransitionRecord, ProviderTransitionKind, SandboxInstance, SandboxState,
+};
 use blaze_core::policy::RuntimeDecision;
 use blaze_core::storage::{StorageProvider, StorageSlot};
 use blaze_provider_api::{
     AbortRequest, BeginInventoryRequest, CapacityRequest, CapacityScope, CapacitySnapshot,
     CommitRequest, DataPlaneProvider, DrainRequest, DrainResult, FinalizeRequest, InspectRequest,
-    InventoryPageRequest, LeaseBinding, LeaseState, PrepareRequest, PrepareSource, PreparedLease,
-    PreparedResources, ProviderCheckpointRef, ProviderError, PublicTransitionRef, ReconcileAction,
-    ReconcileRequest, ReleaseRequest, RequestContext, StopRequest, TemplateSource,
+    InventoryPageRequest, LeaseBinding, LeaseState, MAX_INVENTORY_PAGES, PrepareRequest,
+    PrepareSource, PreparedLease, PreparedResources, ProviderCheckpointRef, ProviderError,
+    PublicTransitionRef, ReconcileAction, ReconcileRequest, ReleaseRequest, RequestContext,
+    StopRequest, TemplateSource,
 };
 use blaze_provider_conformance::{
     validate_capacity_snapshot, validate_descriptor, validate_drain_result,
-    validate_inventory_lease, validate_inventory_snapshot, validate_prepared,
-    validate_prepared_binding, validate_reconcile_result, validate_transition,
+    validate_inventory_lease, validate_inventory_page, validate_inventory_snapshot,
+    validate_prepared, validate_prepared_binding, validate_reconcile_result, validate_transition,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -288,11 +298,43 @@ impl SandboxManager {
         self.storage.sync_artifacts(slot).await.map_err(Into::into)
     }
 
-    async fn prepare_data_plane(&self, request: PrepareRequest) -> Result<PreparedLease> {
+    async fn prepare_data_plane(
+        &self,
+        instance: &SandboxInstance,
+        request: PrepareRequest,
+    ) -> Result<PreparedLease> {
         let descriptor = self.data_plane.descriptor();
         validate_descriptor(descriptor).map_err(|_| {
             BlazeDaemonError::Internal("data-plane descriptor is incompatible".to_string())
         })?;
+        instance.validate_provider_operation().map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "create {} has an invalid provider write-ahead identity: {error}",
+                instance.id
+            ))
+        })?;
+        let pending = instance
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.provider_operation)
+            .ok_or_else(|| {
+                BlazeDaemonError::RecoveryRequired(format!(
+                    "create {} has no durable provider write-ahead identity",
+                    instance.id
+                ))
+            })?;
+        let durable_context = RequestContext::from(pending.context);
+        if pending.provider_instance_id != descriptor.provider_instance_id
+            || pending.kind != PendingProviderOperationKind::PrepareLease
+            || durable_context != request.context
+            || pending.root_filesystem_bytes != request.root_filesystem_bytes
+            || pending.guest_memory_bytes != request.guest_memory_bytes
+        {
+            return Err(self.retain_unresolved_prepare(
+                instance,
+                "provider request does not match its durable write-ahead identity".to_string(),
+            ));
+        }
         let capabilities = self.data_plane.capabilities();
         let supported = match &request.source {
             PrepareSource::Image { .. } => capabilities.images,
@@ -303,34 +345,29 @@ impl SandboxManager {
                 "configured data plane does not support the requested source".to_string(),
             ));
         }
-        let context = request.context;
+        let context = durable_context;
         let template_source = matches!(&request.source, PrepareSource::Template(_));
         let root_filesystem_bytes = request.root_filesystem_bytes;
         let guest_memory_bytes = request.guest_memory_bytes;
         match self.data_plane.prepare(request).await {
             Ok(prepared) => {
                 let validation = validate_prepared(
+                    capabilities,
                     context,
                     template_source,
                     root_filesystem_bytes,
                     guest_memory_bytes,
                     &prepared,
                 );
-                let undeclared_opened_resources =
-                    matches!(&prepared.resources, PreparedResources::OpenedRestore { .. })
-                        && !capabilities.opened_restore_resources;
-                if validation.is_err() || undeclared_opened_resources {
-                    let violation = if undeclared_opened_resources {
-                        "data plane returned opened resources without declaring the capability"
-                    } else {
-                        "data-plane prepare returned an invalid response"
-                    };
+                if validation.is_err() {
+                    let violation = "data-plane prepare returned an invalid response";
                     if validate_prepared_binding(context, prepared.binding).is_err()
                         || prepared.binding.provider_instance_id != descriptor.provider_instance_id
                     {
-                        return Err(BlazeDaemonError::RecoveryRequired(format!(
-                            "{violation}; returned binding is not safe to compensate"
-                        )));
+                        return Err(self.retain_unresolved_prepare(
+                            instance,
+                            format!("{violation}; returned binding is not safe to compensate"),
+                        ));
                     }
                     return match self
                         .data_plane
@@ -349,46 +386,40 @@ impl SandboxManager {
                         {
                             Err(BlazeDaemonError::Internal(violation.to_string()))
                         }
-                        Ok(_) => {
-                            let retained = self
-                                .retain_data_plane_lease(context.instance_id, prepared.binding)
-                                .err();
-                            Err(BlazeDaemonError::RecoveryRequired(format!(
-                                "{violation}; provider compensation returned an invalid transition{}",
-                                retained
-                                    .map(|error| format!("; lease retention also failed: {error}"))
-                                    .unwrap_or_default()
-                            )))
-                        }
-                        Err(error) => {
-                            let retained = self
-                                .retain_data_plane_lease(context.instance_id, prepared.binding)
-                                .err();
-                            Err(BlazeDaemonError::RecoveryRequired(format!(
-                                "{violation}; provider compensation failed: {error}{}",
-                                retained
-                                    .map(|error| format!("; lease retention also failed: {error}"))
-                                    .unwrap_or_default()
-                            )))
-                        }
+                        Ok(_) => Err(self.retain_unresolved_prepare(
+                            instance,
+                            format!(
+                                "{violation}; provider compensation returned an invalid transition"
+                            ),
+                        )),
+                        Err(error) => Err(self.retain_unresolved_prepare(
+                            instance,
+                            format!("{violation}; provider compensation failed: {error}"),
+                        )),
                     };
                 }
                 Ok(prepared)
             }
-            Err(ProviderError::OutcomeUnknown) => {
-                let observed = self
-                    .data_plane
-                    .inspect(InspectRequest { context })
-                    .await
-                    .map_err(|error| {
-                        BlazeDaemonError::RecoveryRequired(format!(
-                            "data-plane preparation outcome is unknown and inspection failed: {error}"
-                        ))
-                    })?;
+            Err(original) => {
+                let observed = match self.data_plane.inspect(InspectRequest { context }).await {
+                    Ok(observed) => observed,
+                    Err(ProviderError::NotFound) => {
+                        return Err(BlazeDaemonError::DataPlane(original));
+                    }
+                    Err(error) => {
+                        return Err(self.retain_unresolved_prepare(
+                            instance,
+                            format!(
+                                "data-plane preparation failed with {original}; inspection failed: {error}"
+                            ),
+                        ));
+                    }
+                };
                 if validate_prepared_binding(context, observed.binding).is_err()
                     || observed.binding.provider_instance_id != descriptor.provider_instance_id
                 {
-                    return Err(BlazeDaemonError::RecoveryRequired(
+                    return Err(self.retain_unresolved_prepare(
+                        instance,
                         "data-plane preparation inspection returned an unsafe state".to_string(),
                     ));
                 }
@@ -401,66 +432,365 @@ impl SandboxManager {
                 {
                     Ok(aborted) => aborted,
                     Err(error) => {
-                        let retained = self
-                            .retain_data_plane_lease(context.instance_id, observed.binding)
-                            .err();
-                        return Err(BlazeDaemonError::RecoveryRequired(format!(
-                            "data-plane preparation was observed but compensation failed: {error}{}",
-                            retained
-                                .map(|error| format!("; lease retention also failed: {error}"))
-                                .unwrap_or_default()
-                        )));
+                        return Err(self.retain_unresolved_prepare(
+                            instance,
+                            format!(
+                                "data-plane preparation was observed but compensation failed: {error}"
+                            ),
+                        ));
                     }
                 };
                 if validate_transition(observed.binding, aborted.binding, LeaseState::Released)
                     .is_err()
                 {
-                    let retained = self
-                        .retain_data_plane_lease(context.instance_id, observed.binding)
-                        .err();
-                    return Err(BlazeDaemonError::RecoveryRequired(format!(
-                        "data-plane preparation compensation returned an invalid transition{}",
-                        retained
-                            .map(|error| format!("; lease retention also failed: {error}"))
-                            .unwrap_or_default()
-                    )));
+                    return Err(self.retain_unresolved_prepare(
+                        instance,
+                        "data-plane preparation compensation returned an invalid transition"
+                            .to_string(),
+                    ));
                 }
-                Err(BlazeDaemonError::DataPlane(ProviderError::OutcomeUnknown))
+                Err(BlazeDaemonError::DataPlane(original))
             }
-            Err(error) => Err(error.into()),
         }
     }
 
-    pub(super) async fn commit_data_plane(&self, binding: LeaseBinding) -> Result<LeaseBinding> {
-        match self.data_plane.commit(CommitRequest { binding }).await {
-            Ok(committed) => {
-                validate_transition(binding, committed.binding, LeaseState::Committed).map_err(
-                    |_| {
-                        BlazeDaemonError::Internal(
-                            "data-plane commit returned an invalid transition".to_string(),
-                        )
-                    },
-                )?;
-                Ok(committed.binding)
+    fn retain_unresolved_prepare(
+        &self,
+        instance: &SandboxInstance,
+        message: String,
+    ) -> BlazeDaemonError {
+        self.retain_unresolved_provider_operation(instance, message)
+    }
+
+    fn retain_unresolved_provider_operation(
+        &self,
+        instance: &SandboxInstance,
+        message: String,
+    ) -> BlazeDaemonError {
+        let recovery = self.mark_instance_recovery(instance.clone()).err();
+        BlazeDaemonError::RecoveryRequired(format!(
+            "{message}; provider write-ahead identity retained{}",
+            recovery
+                .map(|error| format!("; recovery state persistence failed: {error}"))
+                .unwrap_or_default()
+        ))
+    }
+
+    /// Execute one provider transition behind a durable before-image.
+    pub(super) async fn transition_data_plane(
+        &self,
+        instance: &mut SandboxInstance,
+        lease_slot: ProviderLeaseSlot,
+        kind: ProviderTransitionKind,
+        public_transition: Option<PublicTransitionRef>,
+        backend_process: Option<BackendProcessIdentity>,
+    ) -> Result<LeaseBinding> {
+        let before = match lease_slot {
+            ProviderLeaseSlot::Active => instance.data_plane_lease,
+            ProviderLeaseSlot::Replacement => instance.replacement_data_plane_lease,
+        }
+        .ok_or_else(|| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {} has no {:?} lease for provider {kind:?}",
+                instance.id, lease_slot
+            ))
+        })?;
+        let target_state = match kind {
+            ProviderTransitionKind::Commit => DataPlaneLeaseState::Committed,
+            ProviderTransitionKind::Finalize | ProviderTransitionKind::Adopt => {
+                DataPlaneLeaseState::Finalized
             }
-            Err(ProviderError::OutcomeUnknown) => {
-                let observed = self
+            ProviderTransitionKind::Abort | ProviderTransitionKind::Release => {
+                DataPlaneLeaseState::Released
+            }
+            ProviderTransitionKind::Stop => DataPlaneLeaseState::Stopped,
+        };
+        let pending = PendingProviderTransitionRecord {
+            kind,
+            lease_slot,
+            before,
+            target_state,
+            public_transition: public_transition.map(|public| ProviderPublicTransitionRecord {
+                instance_id: public.instance_id,
+                operation_id: public.operation_id,
+            }),
+            backend_process,
+        };
+        instance.begin_provider_transition(pending)?;
+        if let Err(error) = self.persist_and_retain(instance.clone()) {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "provider {kind:?} intent could not be persisted: {error}; provider was not called"
+            )));
+        }
+        self.settle_pending_provider_transition(instance).await
+    }
+
+    pub(super) async fn settle_pending_provider_transition(
+        &self,
+        instance: &mut SandboxInstance,
+    ) -> Result<LeaseBinding> {
+        instance.validate_provider_transition().map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "provider transition WAL is inconsistent: {error}"
+            ))
+        })?;
+        let pending = instance.provider_transition.ok_or_else(|| {
+            BlazeDaemonError::RecoveryRequired(
+                "provider transition settlement has no durable WAL".to_string(),
+            )
+        })?;
+        let before = LeaseBinding::from_record(instance.id, pending.before);
+        if before.provider_instance_id != self.data_plane.descriptor().provider_instance_id {
+            return Err(BlazeDaemonError::RecoveryRequired(
+                "provider transition belongs to another provider instance; WAL retained"
+                    .to_string(),
+            ));
+        }
+        let target = LeaseState::from(pending.target_state);
+
+        let observed = match self
+            .data_plane
+            .inspect(InspectRequest {
+                context: before.context,
+            })
+            .await
+        {
+            Ok(observed) => observed.binding,
+            Err(ProviderError::NotFound) if target == LeaseState::Released => {
+                let released = provider_transition_target(before, target)?;
+                return self.accept_provider_transition(instance, pending, released);
+            }
+            Err(error) => {
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "provider {:?} inspection failed: {error}; WAL retained",
+                    pending.kind
+                )));
+            }
+        };
+        if validate_transition(before, observed, target).is_ok() {
+            return self.accept_provider_transition(instance, pending, observed);
+        }
+        if observed != before {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "provider {:?} observed neither its before-image nor exact successor; WAL retained",
+                pending.kind
+            )));
+        }
+
+        let result = self.invoke_provider_transition(pending, before).await;
+        match result {
+            Ok(next) if validate_transition(before, next, target).is_ok() => {
+                self.accept_provider_transition(instance, pending, next)
+            }
+            Ok(_) => Err(BlazeDaemonError::RecoveryRequired(format!(
+                "provider {:?} returned an invalid transition; WAL retained",
+                pending.kind
+            ))),
+            Err(original) => {
+                let after = self
                     .data_plane
                     .inspect(InspectRequest {
-                        context: binding.context,
+                        context: before.context,
                     })
-                    .await?;
-                validate_transition(binding, observed.binding, LeaseState::Committed).map_err(
-                    |_| {
-                        BlazeDaemonError::RecoveryRequired(
-                            "data-plane commit outcome cannot be proved safe".to_string(),
-                        )
-                    },
-                )?;
-                Ok(observed.binding)
+                    .await;
+                match after {
+                    Ok(after) if validate_transition(before, after.binding, target).is_ok() => {
+                        self.accept_provider_transition(instance, pending, after.binding)
+                    }
+                    Err(ProviderError::NotFound) if target == LeaseState::Released => {
+                        let released = provider_transition_target(before, target)?;
+                        self.accept_provider_transition(instance, pending, released)
+                    }
+                    Ok(after) if after.binding == before => {
+                        let mut cleared = instance.clone();
+                        cleared.finish_provider_transition();
+                        self.commit_instance_update(instance, cleared)?;
+                        Err(BlazeDaemonError::DataPlane(original))
+                    }
+                    Ok(_) => Err(BlazeDaemonError::RecoveryRequired(format!(
+                        "provider {:?} failed with {original} and advanced to an unsafe state; WAL retained",
+                        pending.kind
+                    ))),
+                    Err(error) => Err(BlazeDaemonError::RecoveryRequired(format!(
+                        "provider {:?} failed with {original}; outcome inspection failed with {error}; WAL retained",
+                        pending.kind
+                    ))),
+                }
             }
-            Err(error) => Err(error.into()),
         }
+    }
+
+    async fn invoke_provider_transition(
+        &self,
+        pending: PendingProviderTransitionRecord,
+        before: LeaseBinding,
+    ) -> std::result::Result<LeaseBinding, ProviderError> {
+        match pending.kind {
+            ProviderTransitionKind::Commit => self
+                .data_plane
+                .commit(CommitRequest { binding: before })
+                .await
+                .map(|result| result.binding),
+            ProviderTransitionKind::Finalize => {
+                let public = pending
+                    .public_transition
+                    .ok_or(ProviderError::InvalidResponse)?;
+                self.data_plane
+                    .finalize(FinalizeRequest {
+                        binding: before,
+                        public_transition: PublicTransitionRef {
+                            instance_id: public.instance_id,
+                            operation_id: public.operation_id,
+                        },
+                    })
+                    .await
+                    .map(|result| result.binding)
+            }
+            ProviderTransitionKind::Abort => self
+                .data_plane
+                .abort(AbortRequest { binding: before })
+                .await
+                .map(|result| result.binding),
+            ProviderTransitionKind::Stop => self
+                .data_plane
+                .stop(StopRequest { binding: before })
+                .await
+                .map(|result| result.binding),
+            ProviderTransitionKind::Release => self
+                .data_plane
+                .release(ReleaseRequest { binding: before })
+                .await
+                .map(|result| result.binding),
+            ProviderTransitionKind::Adopt => {
+                let inventory = self
+                    .data_plane
+                    .inventory()
+                    .ok_or(ProviderError::Unsupported)?;
+                let backend_process = pending
+                    .backend_process
+                    .ok_or(ProviderError::InvalidResponse)?;
+                inventory
+                    .reconcile(ReconcileRequest {
+                        expected: Some(before),
+                        observed: before,
+                        action: ReconcileAction::Adopt { backend_process },
+                    })
+                    .await
+                    .map(|result| result.binding)
+            }
+        }
+    }
+
+    fn accept_provider_transition(
+        &self,
+        instance: &mut SandboxInstance,
+        pending: PendingProviderTransitionRecord,
+        next: LeaseBinding,
+    ) -> Result<LeaseBinding> {
+        let mut settled = instance.clone();
+        let record = next.to_record(
+            pending.before.root_filesystem_bytes,
+            pending.before.guest_memory_bytes,
+        );
+        match pending.lease_slot {
+            ProviderLeaseSlot::Active => settled.data_plane_lease = Some(record),
+            ProviderLeaseSlot::Replacement => {
+                settled.replacement_data_plane_lease = Some(record);
+            }
+        }
+        settled.finish_provider_transition();
+        self.commit_instance_update(instance, settled)?;
+        if pending.lease_slot == ProviderLeaseSlot::Active {
+            self.retain_data_plane_lease(instance.id, next)?;
+        }
+        Ok(next)
+    }
+
+    fn accept_prepared_data_plane_binding(
+        &self,
+        instance: &mut SandboxInstance,
+        binding: LeaseBinding,
+        extents: (u64, u64),
+    ) -> Result<()> {
+        let pending = instance
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.provider_operation)
+            .ok_or_else(|| {
+                BlazeDaemonError::RecoveryRequired(format!(
+                    "sandbox {} has no provider write-ahead identity for the prepared lease",
+                    instance.id
+                ))
+            })?;
+        let context = RequestContext::from(pending.context);
+        if pending.kind != PendingProviderOperationKind::PrepareLease
+            || pending.provider_instance_id != binding.provider_instance_id
+            || context != binding.context
+            || pending.root_filesystem_bytes != extents.0
+            || pending.guest_memory_bytes != extents.1
+            || validate_prepared_binding(context, binding).is_err()
+        {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {} prepared lease does not match its provider write-ahead identity",
+                instance.id
+            )));
+        }
+
+        let mut accepted = instance.clone();
+        accepted.data_plane_lease = Some(binding.to_record(extents.0, extents.1));
+        accepted.finish_provider_operation();
+        self.commit_instance_update(instance, accepted)?;
+        self.retain_data_plane_lease(instance.id, binding)
+    }
+
+    pub(super) fn accept_prepared_replacement_data_plane_binding(
+        &self,
+        instance: &mut SandboxInstance,
+        binding: LeaseBinding,
+        extents: (u64, u64),
+    ) -> Result<()> {
+        let pending = instance
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.provider_operation)
+            .ok_or_else(|| {
+                BlazeDaemonError::RecoveryRequired(format!(
+                    "sandbox {} has no provider write-ahead identity for the replacement lease",
+                    instance.id
+                ))
+            })?;
+        let context = RequestContext::from(pending.context);
+        if pending.kind != PendingProviderOperationKind::PrepareLease
+            || pending.provider_instance_id != binding.provider_instance_id
+            || context != binding.context
+            || pending.root_filesystem_bytes != extents.0
+            || pending.guest_memory_bytes != extents.1
+            || validate_prepared_binding(context, binding).is_err()
+        {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {} replacement lease does not match its provider write-ahead identity",
+                instance.id
+            )));
+        }
+
+        let mut accepted = instance.clone();
+        accepted.replacement_data_plane_lease = Some(binding.to_record(extents.0, extents.1));
+        accepted.finish_provider_operation();
+        self.commit_instance_update(instance, accepted)
+    }
+
+    fn commit_instance_update(
+        &self,
+        instance: &mut SandboxInstance,
+        next: SandboxInstance,
+    ) -> Result<()> {
+        self.state_store.persist(&next)?;
+        let retained = self.retain_instance(next.clone());
+        *instance = next;
+        if let Some(error) = retained {
+            return Err(BlazeDaemonError::RecoveryRequired(error));
+        }
+        Ok(())
     }
 
     pub(super) fn persist_data_plane_binding(
@@ -501,42 +831,6 @@ impl SandboxManager {
             return Err(BlazeDaemonError::RecoveryRequired(error));
         }
         self.retain_data_plane_lease(instance.id, binding)
-    }
-
-    pub(super) fn persist_replacement_data_plane_binding(
-        &self,
-        instance: &mut SandboxInstance,
-        binding: LeaseBinding,
-        extents: Option<(u64, u64)>,
-    ) -> Result<()> {
-        let (root_filesystem_bytes, guest_memory_bytes) = match extents {
-            Some(extents) => extents,
-            None => {
-                let record = instance.replacement_data_plane_lease.ok_or_else(|| {
-                    BlazeDaemonError::RecoveryRequired(format!(
-                        "sandbox {} has no durable replacement lease to advance",
-                        instance.id
-                    ))
-                })?;
-                (record.root_filesystem_bytes, record.guest_memory_bytes)
-            }
-        };
-        if let Some(previous) = instance.replacement_data_plane_lease
-            && (previous.provider_instance_id != binding.provider_instance_id
-                || previous.lease_id != binding.context.lease_id
-                || previous.request_id != binding.context.request_id
-                || previous.operation_id != binding.context.operation_id
-                || previous.initial_generation != binding.context.generation
-                || binding.generation < previous.generation)
-        {
-            return Err(BlazeDaemonError::RecoveryRequired(format!(
-                "sandbox {} replacement lease identity or generation changed unexpectedly",
-                instance.id
-            )));
-        }
-        instance.replacement_data_plane_lease =
-            Some(binding.to_record(root_filesystem_bytes, guest_memory_bytes));
-        self.persist_and_retain(instance.clone())
     }
 
     pub(super) fn retain_data_plane_lease(&self, id: Uuid, binding: LeaseBinding) -> Result<()> {
@@ -647,12 +941,13 @@ impl SandboxManager {
     /// Shutdown uses this snapshot to start cleanup concurrently while all
     /// mutations remain serialized by the manager's per-sandbox locks.
     pub(crate) fn owned_instance_ids(&self) -> Result<BTreeSet<Uuid>> {
+        let daemon_managed_storage = self.data_plane.capabilities().daemon_managed_storage;
         let mut ids = self
             .instances
             .lock()
             .map_err(|_| poisoned("instances"))?
             .values()
-            .filter(|instance| requires_automatic_cleanup(instance))
+            .filter(|instance| requires_automatic_cleanup(instance, daemon_managed_storage))
             .map(|instance| instance.id)
             .collect::<BTreeSet<_>>();
         ids.extend(
@@ -725,7 +1020,8 @@ impl SandboxManager {
                 request.decision.policy_name
             )));
         }
-        if !self.data_plane.capabilities().templates {
+        let data_plane_capabilities = self.data_plane.capabilities();
+        if !data_plane_capabilities.templates {
             return Err(BlazeDaemonError::UnsupportedOperation(
                 "configured data plane does not support templates".to_string(),
             ));
@@ -823,6 +1119,14 @@ impl SandboxManager {
                 "template {name} is incompatible with the current restore adapter"
             )));
         }
+        if data_plane_capabilities.opened_template_restore_resources
+            && !capability.consumes_typed_opened_attachments
+        {
+            return Err(BlazeDaemonError::UnsupportedOperation(format!(
+                "template {name} may use typed opened restore attachments, but backend {} cannot consume them",
+                resolved.backend
+            )));
+        }
 
         Ok(Some(TemplateCreate {
             resolved,
@@ -839,6 +1143,11 @@ impl SandboxManager {
 
     /// Create a sandbox from a fresh runtime allocation or a published template.
     pub async fn create(&self, request: CreateSandbox) -> Result<CreateSandboxResult> {
+        if request.template.is_none() && !self.data_plane.capabilities().images {
+            return Err(BlazeDaemonError::UnsupportedOperation(
+                "configured data plane does not support ordinary images".to_string(),
+            ));
+        }
         let template = self.prepare_template_create(&request).await?;
         let mut instance = SandboxInstance::new(
             request.runtime_backend,
@@ -853,8 +1162,27 @@ impl SandboxManager {
         let _operation = operation_lock.lock().await;
         instance.transition(SandboxState::Creating)?;
         instance.begin_operation(OperationKind::Create);
+        let context = RequestContext {
+            instance_id: instance.id,
+            request_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let (root_filesystem_bytes, guest_memory_bytes) = template
+            .as_ref()
+            .map(|template| (template.resolved.rootfs_size, template.resolved.memory_size))
+            .unwrap_or((self.rootfs_size, self.mem_size));
+        instance.begin_provider_operation(PendingProviderOperationRecord {
+            provider_instance_id: self.data_plane.descriptor().provider_instance_id,
+            context: context.into(),
+            generation_before_call: 0,
+            root_filesystem_bytes,
+            guest_memory_bytes,
+            kind: PendingProviderOperationKind::PrepareLease,
+        })?;
 
-        // Publish the stable identity and create intent before allocation.
+        // Publish the complete provider identity and create intent before allocation.
         if let Err(error) = self.state_store.persist(&instance) {
             match self.state_store.has_run_dir_residual(instance.id) {
                 Ok(true) => {}
@@ -884,13 +1212,6 @@ impl SandboxManager {
             )));
         }
 
-        let context = RequestContext {
-            instance_id: instance.id,
-            request_id: Uuid::new_v4(),
-            operation_id: Uuid::new_v4(),
-            lease_id: Uuid::new_v4(),
-            generation: 1,
-        };
         let (prepare_request, template_plan, template) = match template {
             Some(TemplateCreate {
                 resolved,
@@ -948,8 +1269,9 @@ impl SandboxManager {
             prepare_request.root_filesystem_bytes,
             prepare_request.guest_memory_bytes,
         );
-        let prepared = match self.prepare_data_plane(prepare_request).await {
+        let prepared = match self.prepare_data_plane(&instance, prepare_request).await {
             Ok(prepared) => prepared,
+            Err(error @ BlazeDaemonError::RecoveryRequired(_)) => return Err(error),
             Err(error) => {
                 match self.data_plane_lease(instance.id) {
                     Ok(Some(binding)) => {
@@ -991,7 +1313,7 @@ impl SandboxManager {
         };
         let binding = prepared.binding;
         if let Err(error) =
-            self.persist_data_plane_binding(&mut instance, binding, Some(lease_extents))
+            self.accept_prepared_data_plane_binding(&mut instance, binding, lease_extents)
         {
             return Err(self
                 .cleanup_failed_create(&mut instance, binding, None, false, error)
@@ -1332,20 +1654,26 @@ impl SandboxManager {
                 .await);
         }
 
-        lease_binding = match self.commit_data_plane(lease_binding).await {
+        lease_binding = match self
+            .transition_data_plane(
+                &mut instance,
+                ProviderLeaseSlot::Active,
+                ProviderTransitionKind::Commit,
+                None,
+                None,
+            )
+            .await
+        {
             Ok(binding) => binding,
             Err(error) => {
+                if instance.provider_transition.is_some() {
+                    return Err(error);
+                }
                 return Err(self
                     .cleanup_failed_create(&mut instance, lease_binding, None, true, error)
                     .await);
             }
         };
-        if let Err(error) = self.persist_data_plane_binding(&mut instance, lease_binding, None) {
-            return Err(self
-                .cleanup_failed_create(&mut instance, lease_binding, None, true, error)
-                .await);
-        }
-
         if let Err(error) = instance.transition(SandboxState::Running) {
             return Err(self
                 .cleanup_failed_create(&mut instance, lease_binding, None, true, error.into())
@@ -1370,29 +1698,21 @@ impl SandboxManager {
                 )
                 .await);
         }
-        lease_binding = match self
-            .data_plane
-            .finalize(FinalizeRequest {
-                binding: lease_binding,
-                public_transition: PublicTransitionRef {
-                    instance_id: instance.id,
+        let public_instance_id = instance.id;
+        let finalized = match self
+            .transition_data_plane(
+                &mut instance,
+                ProviderLeaseSlot::Active,
+                ProviderTransitionKind::Finalize,
+                Some(PublicTransitionRef {
+                    instance_id: public_instance_id,
                     operation_id: lease_binding.context.operation_id,
-                },
-            })
+                }),
+                None,
+            )
             .await
         {
-            Ok(finalized) => {
-                if validate_transition(lease_binding, finalized.binding, LeaseState::Finalized)
-                    .is_err()
-                {
-                    let _ = self.mark_recovery(instance.id);
-                    return Err(BlazeDaemonError::RecoveryRequired(format!(
-                        "create {}: data-plane finalize returned an invalid transition",
-                        instance.id
-                    )));
-                }
-                finalized.binding
-            }
+            Ok(finalized) => finalized,
             Err(error) => {
                 let _ = self.mark_recovery(instance.id);
                 return Err(BlazeDaemonError::RecoveryRequired(format!(
@@ -1401,16 +1721,7 @@ impl SandboxManager {
                 )));
             }
         };
-        if let Err(error) = self.persist_data_plane_binding(&mut instance, lease_binding, None) {
-            let recovery = self.mark_instance_recovery(instance.clone()).err();
-            return Err(BlazeDaemonError::RecoveryRequired(format!(
-                "create {}: data-plane final ownership is durable but its public ledger update failed: {error}{}",
-                instance.id,
-                recovery
-                    .map(|error| format!("; recovery state persistence failed: {error}"))
-                    .unwrap_or_default()
-            )));
-        }
+        debug_assert_eq!(finalized.state, LeaseState::Finalized);
         self.metrics.inc(&self.metrics.instances_created);
         Ok(CreateSandboxResult {
             instance,
@@ -1441,6 +1752,18 @@ impl SandboxManager {
         if original.state == SandboxState::Destroyed {
             return Ok(false);
         }
+        self.ensure_provider_ownership_matches(&original)?;
+        let checkpoint_metadata = self.checkpoint_ownership_preflight(id).await?;
+        let resolved_pending_create_prepare =
+            original.operation.as_ref().is_some_and(|operation| {
+                operation.kind == OperationKind::Create
+                    && operation.provider_operation.is_some_and(|pending| {
+                        pending.kind == PendingProviderOperationKind::PrepareLease
+                    })
+            });
+        self.consume_pending_provider_operation(&mut original)
+            .await?;
+        self.ensure_provider_ownership_matches(&original)?;
 
         if original.operation.as_ref().map(|operation| operation.kind)
             != Some(OperationKind::Destroy)
@@ -1465,9 +1788,12 @@ impl SandboxManager {
         let replacement_binding = original
             .replacement_data_plane_lease
             .map(|record| LeaseBinding::from_record(id, record));
-        let mut data_plane_released = original.provider_suspension.is_some()
-            && original.data_plane_lease.is_none()
-            && original.replacement_data_plane_lease.is_none();
+        let mut data_plane_released = (resolved_pending_create_prepare
+            && original.data_plane_lease.is_none())
+            || ((original.provider_suspension.is_some()
+                || !original.pending_provider_suspension_retirements.is_empty())
+                && original.data_plane_lease.is_none()
+                && original.replacement_data_plane_lease.is_none());
 
         let backend = self
             .backend_instances
@@ -1516,78 +1842,45 @@ impl SandboxManager {
         }
         original.backend_ownership = BackendOwnership::Stopped;
 
-        if let Some(mut binding) = replacement_binding {
+        if let Some(binding) = replacement_binding {
             match binding.state {
                 LeaseState::Prepared | LeaseState::Committed => {
-                    let aborted = self
-                        .data_plane
-                        .abort(AbortRequest { binding })
-                        .await
-                        .map_err(|error| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: replacement lease abort failed: {error}"
-                            ))
-                        })?;
-                    validate_transition(binding, aborted.binding, LeaseState::Released).map_err(
-                        |_| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: replacement lease abort returned an invalid transition"
-                            ))
-                        },
-                    )?;
+                    self.transition_data_plane(
+                        &mut original,
+                        ProviderLeaseSlot::Replacement,
+                        ProviderTransitionKind::Abort,
+                        None,
+                        None,
+                    )
+                    .await?;
                 }
                 LeaseState::Finalized => {
-                    let stopped = self
-                        .data_plane
-                        .stop(StopRequest { binding })
-                        .await
-                        .map_err(|error| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: replacement lease stop failed: {error}"
-                            ))
-                        })?;
-                    validate_transition(binding, stopped.binding, LeaseState::Stopped).map_err(
-                        |_| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: replacement lease stop returned an invalid transition"
-                            ))
-                        },
-                    )?;
-                    binding = stopped.binding;
-                    let released = self
-                        .data_plane
-                        .release(ReleaseRequest { binding })
-                        .await
-                        .map_err(|error| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: replacement lease release failed: {error}"
-                            ))
-                        })?;
-                    validate_transition(binding, released.binding, LeaseState::Released).map_err(
-                        |_| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: replacement lease release returned an invalid transition"
-                            ))
-                        },
-                    )?;
+                    self.transition_data_plane(
+                        &mut original,
+                        ProviderLeaseSlot::Replacement,
+                        ProviderTransitionKind::Stop,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    self.transition_data_plane(
+                        &mut original,
+                        ProviderLeaseSlot::Replacement,
+                        ProviderTransitionKind::Release,
+                        None,
+                        None,
+                    )
+                    .await?;
                 }
                 LeaseState::Stopped => {
-                    let released = self
-                        .data_plane
-                        .release(ReleaseRequest { binding })
-                        .await
-                        .map_err(|error| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: replacement lease release failed: {error}"
-                            ))
-                        })?;
-                    validate_transition(binding, released.binding, LeaseState::Released).map_err(
-                        |_| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: replacement lease release returned an invalid transition"
-                            ))
-                        },
-                    )?;
+                    self.transition_data_plane(
+                        &mut original,
+                        ProviderLeaseSlot::Replacement,
+                        ProviderTransitionKind::Release,
+                        None,
+                        None,
+                    )
+                    .await?;
                 }
                 LeaseState::Released => {}
                 LeaseState::Quarantined => {
@@ -1598,50 +1891,38 @@ impl SandboxManager {
             }
             original.replacement_data_plane_lease = None;
             self.persist_and_retain(original.clone())?;
+            data_plane_released |= (original.provider_suspension.is_some()
+                || !original.pending_provider_suspension_retirements.is_empty())
+                && original.data_plane_lease.is_none()
+                && original.replacement_data_plane_lease.is_none();
         }
 
         if let Some(binding) = data_plane_binding {
             match binding.state {
                 LeaseState::Finalized => {
                     let stopped = self
-                        .data_plane
-                        .stop(StopRequest { binding })
-                        .await
-                        .map_err(|error| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: backend stopped but data-plane stop failed: {error}"
-                            ))
-                        })?;
-                    validate_transition(binding, stopped.binding, LeaseState::Stopped).map_err(
-                        |_| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: data-plane stop returned an invalid transition"
-                            ))
-                        },
-                    )?;
-                    data_plane_binding = Some(stopped.binding);
-                    self.persist_data_plane_binding(&mut original, stopped.binding, None)?;
+                        .transition_data_plane(
+                            &mut original,
+                            ProviderLeaseSlot::Active,
+                            ProviderTransitionKind::Stop,
+                            None,
+                            None,
+                        )
+                        .await?;
+                    data_plane_binding = Some(stopped);
                 }
                 LeaseState::Prepared | LeaseState::Committed => {
                     let aborted = self
-                        .data_plane
-                        .abort(AbortRequest { binding })
-                        .await
-                        .map_err(|error| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: unfinished data-plane preparation could not be aborted: {error}"
-                            ))
-                        })?;
-                    validate_transition(binding, aborted.binding, LeaseState::Released).map_err(
-                        |_| {
-                            BlazeDaemonError::RecoveryRequired(format!(
-                                "destroy {id}: data-plane abort returned an invalid transition"
-                            ))
-                        },
-                    )?;
-                    data_plane_binding = Some(aborted.binding);
+                        .transition_data_plane(
+                            &mut original,
+                            ProviderLeaseSlot::Active,
+                            ProviderTransitionKind::Abort,
+                            None,
+                            None,
+                        )
+                        .await?;
+                    data_plane_binding = Some(aborted);
                     data_plane_released = true;
-                    self.persist_data_plane_binding(&mut original, aborted.binding, None)?;
                 }
                 LeaseState::Stopped => {}
                 LeaseState::Released => data_plane_released = true,
@@ -1673,20 +1954,6 @@ impl SandboxManager {
             )));
         }
 
-        let metadata_store = self.checkpoints.clone();
-        let checkpoint_metadata =
-            crate::failpoint::spawn_blocking(move || metadata_store.list_metadata(id))
-                .await
-                .map_err(|error| {
-                    BlazeDaemonError::RecoveryRequired(format!(
-                        "destroy {id}: checkpoint inventory task failed: {error}"
-                    ))
-                })?
-                .map_err(|error| {
-                    BlazeDaemonError::RecoveryRequired(format!(
-                        "destroy {id}: checkpoint inventory failed: {error}"
-                    ))
-                })?;
         for record in checkpoint_metadata
             .into_iter()
             .filter_map(|metadata| metadata.provider_checkpoint)
@@ -1694,7 +1961,7 @@ impl SandboxManager {
             if !original
                 .pending_provider_retirements
                 .iter()
-                .any(|pending| pending.reference_id == record.reference_id)
+                .any(|pending| pending == &record)
             {
                 original.pending_provider_retirements.push(record);
             }
@@ -1747,7 +2014,7 @@ impl SandboxManager {
             }
             original
                 .pending_provider_retirements
-                .retain(|pending| pending.reference_id != record.reference_id);
+                .retain(|pending| pending != &record);
             self.persist_and_retain(original.clone())?;
         }
 
@@ -1755,15 +2022,17 @@ impl SandboxManager {
             && !original
                 .pending_provider_suspension_retirements
                 .iter()
-                .any(|pending| pending.reference_id == record.reference_id)
+                .any(|pending| pending == &record)
         {
             original
                 .pending_provider_suspension_retirements
                 .push(record);
+            // The retirement identity must be durable while the public
+            // hibernation owner is still present. A crash after this commit is
+            // recovered by deleting the owner before issuing retirement.
             self.persist_and_retain(original.clone())?;
         }
-        if (original.pending_provider_suspension_id.is_some()
-            || !original.pending_provider_suspension_retirements.is_empty())
+        if !original.pending_provider_suspension_retirements.is_empty()
             && self.data_plane.suspension().is_none()
         {
             let recovery = self.mark_instance_recovery(original).err();
@@ -1774,26 +2043,20 @@ impl SandboxManager {
                     .unwrap_or_default()
             )));
         }
-        if let Some(suspension_id) = original.pending_provider_suspension_id {
-            let has_exact_reference = original
-                .pending_provider_suspension_retirements
-                .iter()
-                .any(|record| record.suspension_id == suspension_id);
-            if !has_exact_reference {
-                self.retire_provider_suspension_identity(
-                    self.data_plane.descriptor().provider_instance_id,
-                    suspension_id,
-                    None,
-                )
-                .await
-                .map_err(|error| {
-                    BlazeDaemonError::RecoveryRequired(format!(
-                        "destroy {id}: unknown provider suspension retirement failed: {error}"
-                    ))
-                })?;
-            }
-            original.pending_provider_suspension_id = None;
+        if original.provider_suspension.take().is_some() {
+            // Remove the lifecycle half of the public owner before the
+            // manifest is unlinked. Startup never retires from this state
+            // until it has also proved the on-disk manifest is gone.
             self.persist_and_retain(original.clone())?;
+        }
+        if let Err(error) = self.cleanup_hibernate_artifacts(id).await {
+            let recovery = self.mark_instance_recovery(original).err();
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "destroy {id}: backend stopped but hibernation owner removal failed: {error}; provider suspension retained{}",
+                recovery
+                    .map(|error| format!("; recovery state persistence failed: {error}"))
+                    .unwrap_or_default()
+            )));
         }
         for record in original.pending_provider_suspension_retirements.clone() {
             let suspension = blaze_provider_api::ProviderSuspensionRef::from_record(&record);
@@ -1808,48 +2071,21 @@ impl SandboxManager {
             }
             original
                 .pending_provider_suspension_retirements
-                .retain(|pending| pending.reference_id != record.reference_id);
-            if original
-                .provider_suspension
-                .as_ref()
-                .is_some_and(|active| active.reference_id == record.reference_id)
-            {
-                original.provider_suspension = None;
-            }
+                .retain(|pending| pending != &record);
             self.persist_and_retain(original.clone())?;
         }
 
-        if let Err(error) = self.cleanup_hibernate_artifacts(id).await {
-            let recovery = self.mark_recovery(id).err();
-            return Err(BlazeDaemonError::RecoveryRequired(format!(
-                "destroy {id}: backend stopped but hibernation cleanup failed: {error}; \
-                 storage retained{}",
-                recovery
-                    .map(|error| format!("; recovery state persistence failed: {error}"))
-                    .unwrap_or_default()
-            )));
-        }
-
         if !data_plane_released {
-            if let Some(binding) = data_plane_binding {
-                let released = self
-                    .data_plane
-                    .release(ReleaseRequest { binding })
-                    .await
-                    .map_err(|error| {
-                        BlazeDaemonError::RecoveryRequired(format!(
-                            "destroy {id}: backend stopped but data-plane release failed: {error}"
-                        ))
-                    })?;
-                validate_transition(binding, released.binding, LeaseState::Released).map_err(
-                    |_| {
-                        BlazeDaemonError::RecoveryRequired(format!(
-                            "destroy {id}: data-plane release returned an invalid transition"
-                        ))
-                    },
-                )?;
+            if data_plane_binding.is_some() {
+                self.transition_data_plane(
+                    &mut original,
+                    ProviderLeaseSlot::Active,
+                    ProviderTransitionKind::Release,
+                    None,
+                    None,
+                )
+                .await?;
                 data_plane_released = true;
-                self.persist_data_plane_binding(&mut original, released.binding, None)?;
             } else if self.data_plane.capabilities().daemon_managed_storage {
                 if let Err(error) = self.storage.release_by_id(&id.to_string()).await {
                     let recovery = self.mark_recovery(id).err();
@@ -1881,7 +2117,6 @@ impl SandboxManager {
         destroyed.data_plane_lease = None;
         destroyed.replacement_data_plane_lease = None;
         destroyed.provider_suspension = None;
-        destroyed.pending_provider_suspension_id = None;
         destroyed.pending_provider_suspension_retirements.clear();
         destroyed.backend_runtime = None;
         if destroyed.state != SandboxState::Destroyed {
@@ -1923,13 +2158,612 @@ impl SandboxManager {
     /// exposed. Per-sandbox conflicts remain visible in the returned report and
     /// are retained in recovery or quarantine state.
     pub async fn reconcile_startup(&self) -> Result<ReconcileReport> {
+        let startup_instances = self.list()?;
+        for instance in &startup_instances {
+            if instance.state == SandboxState::Destroyed {
+                continue;
+            }
+            self.ensure_provider_ownership_matches(instance)?;
+            self.checkpoint_ownership_preflight(instance.id).await?;
+        }
+
+        // Settle every provider call whose exact before-image was durable before
+        // taking an inventory snapshot. Otherwise the same lease can appear as
+        // an apparent orphan or identity conflict solely because Blaze crashed
+        // between the provider response and its state-file update.
+        for id in self
+            .list()?
+            .into_iter()
+            .filter(|instance| instance.provider_transition.is_some())
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>()
+        {
+            let operation_lock = self.operation_lock(id);
+            let _operation = operation_lock.lock().await;
+            let mut instance = self.get(id)?;
+            if instance
+                .provider_transition
+                .is_some_and(|pending| pending.kind == ProviderTransitionKind::Adopt)
+            {
+                if !self.adopt_running_instance(&mut instance).await? {
+                    self.settle_abandoned_provider_adoption(&mut instance)
+                        .await?;
+                }
+            } else {
+                self.settle_pending_provider_transition(&mut instance)
+                    .await?;
+            }
+        }
+
+        // A prepare or immutable capture has its own write-ahead identity. Its
+        // enclosing operation still has to be cleaned after the provider call
+        // converges, so use the ordinary destruction path while all identities
+        // remain available.
         if self.data_plane.inventory().is_some() {
+            for id in self
+                .list()?
+                .into_iter()
+                .filter(|instance| {
+                    instance
+                        .operation
+                        .as_ref()
+                        .is_some_and(|operation| operation.provider_operation.is_some())
+                })
+                .map(|instance| instance.id)
+                .collect::<Vec<_>>()
+            {
+                let operation_lock = self.operation_lock(id);
+                let _operation = operation_lock.lock().await;
+                self.destroy_locked(id).await?;
+            }
+        }
+
+        // Retry only retirement identities that no longer have a public owner.
+        // A transient retirement failure must not quarantine an unrelated live
+        // lease during the later inventory comparison.
+        for id in self
+            .list()?
+            .into_iter()
+            .filter(|instance| {
+                instance.state != SandboxState::Destroyed
+                    && (!instance.pending_provider_retirements.is_empty()
+                        || !instance.pending_provider_suspension_retirements.is_empty())
+            })
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>()
+        {
+            let operation_lock = self.operation_lock(id);
+            let _operation = operation_lock.lock().await;
+            let mut instance = self.get(id)?;
+            self.retry_pending_provider_retirements(&mut instance)
+                .await?;
+        }
+
+        for instance in self.list()? {
+            if instance
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.provider_operation.is_some())
+            {
+                continue;
+            }
+            self.ensure_provider_ownership_matches(&instance)?;
+        }
+        if self.data_plane.inventory().is_some() {
+            // Resolve known interrupted lifecycle states before provider-wide
+            // inventory. Quarantine is reserved for a real identity conflict,
+            // not used as a substitute for deterministic transaction recovery.
+            for id in self
+                .list()?
+                .into_iter()
+                .filter(|instance| {
+                    !is_clean_terminal(instance)
+                        && !is_clean_hibernated(
+                            instance,
+                            self.data_plane.capabilities().daemon_managed_storage,
+                        )
+                        && !requires_explicit_cleanup(instance)
+                        && !is_running_adoption_candidate(instance)
+                        && !instance
+                            .data_plane_lease
+                            .is_some_and(|record| record.state == DataPlaneLeaseState::Quarantined)
+                })
+                .map(|instance| instance.id)
+                .collect::<Vec<_>>()
+            {
+                let operation_lock = self.operation_lock(id);
+                let _operation = operation_lock.lock().await;
+                self.destroy_locked(id).await?;
+            }
             return self.reconcile_provider_startup().await;
         }
         let mut classification_failures = self.classify_interrupted_hibernation();
         let mut report = self.cleanup_owned_instances().await;
         report.failures.append(&mut classification_failures);
         Ok(report)
+    }
+
+    async fn checkpoint_ownership_preflight(&self, id: Uuid) -> Result<Vec<CheckpointMetadata>> {
+        let metadata_store = self.checkpoints.clone();
+        let metadata = crate::failpoint::spawn_blocking(move || {
+            metadata_store
+                .list_metadata(id)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {id} checkpoint ownership preflight task failed: {error}; original state and resources retained"
+            ))
+        })?
+        .map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {id} checkpoint ownership preflight failed: {error}; original state and resources retained"
+            ))
+        })?;
+        let selected_provider = self.data_plane.descriptor().provider_instance_id;
+        if metadata.iter().any(|checkpoint| {
+            checkpoint
+                .provider_checkpoint
+                .as_ref()
+                .is_some_and(|record| record.provider_instance_id != selected_provider)
+        }) {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {id} has a published checkpoint owned by another provider; original state and resources retained"
+            )));
+        }
+        Ok(metadata)
+    }
+
+    async fn retry_pending_provider_retirements(
+        &self,
+        instance: &mut SandboxInstance,
+    ) -> Result<()> {
+        let durable = self.state_store.load(instance.id).map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {} retirement ledger cannot be reread from durable lifecycle state: {error}",
+                instance.id
+            ))
+        })?;
+        let checkpoint_metadata = self.checkpoint_ownership_preflight(instance.id).await?;
+        for record in instance.pending_provider_retirements.clone() {
+            if !durable
+                .pending_provider_retirements
+                .iter()
+                .any(|pending| pending == &record)
+            {
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "sandbox {} checkpoint retirement is not present in the durable ledger",
+                    instance.id
+                )));
+            }
+            if checkpoint_metadata.iter().any(|metadata| {
+                metadata.provider_checkpoint.as_ref().is_some_and(|owner| {
+                    owner.provider_instance_id == record.provider_instance_id
+                        && owner.public_checkpoint_id == record.public_checkpoint_id
+                })
+            }) {
+                // The catalog is still a public owner. Destruction removes it
+                // and synchronizes the catalog before retrying retirement.
+                continue;
+            }
+            let checkpoint = ProviderCheckpointRef::from_record(&record);
+            self.retire_provider_checkpoint(&checkpoint).await?;
+            let mut settled = instance.clone();
+            settled
+                .pending_provider_retirements
+                .retain(|pending| pending != &record);
+            self.commit_instance_update(instance, settled)?;
+        }
+
+        for record in instance.pending_provider_suspension_retirements.clone() {
+            if !durable
+                .pending_provider_suspension_retirements
+                .iter()
+                .any(|pending| pending == &record)
+            {
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "sandbox {} suspension retirement is not present in the durable ledger",
+                    instance.id
+                )));
+            }
+            let lifecycle_owner = durable.provider_suspension.as_ref().is_some_and(|owner| {
+                owner.provider_instance_id == record.provider_instance_id
+                    && owner.suspension_id == record.suspension_id
+            });
+            let manifest_owner = self
+                .hibernation_may_reference_provider_suspension(instance.id, &record)
+                .await?;
+            if lifecycle_owner || manifest_owner {
+                // The lifecycle record or manifest is still a public owner.
+                // The later destruction pass removes both before retirement.
+                continue;
+            }
+            let suspension = blaze_provider_api::ProviderSuspensionRef::from_record(&record);
+            self.retire_provider_suspension(&suspension).await?;
+            let mut settled = instance.clone();
+            settled
+                .pending_provider_suspension_retirements
+                .retain(|pending| pending != &record);
+            self.commit_instance_update(instance, settled)?;
+        }
+        Ok(())
+    }
+
+    async fn consume_pending_provider_operation(
+        &self,
+        instance: &mut SandboxInstance,
+    ) -> Result<()> {
+        if instance.provider_transition.is_some() {
+            self.settle_pending_provider_transition(instance).await?;
+        }
+        let Some(pending) = instance
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.provider_operation)
+        else {
+            return Ok(());
+        };
+        if let Err(error) = instance.validate_provider_operation() {
+            return Err(self.retain_unresolved_prepare(
+                instance,
+                format!("provider write-ahead identity is inconsistent: {error}"),
+            ));
+        }
+        let operation_kind = instance
+            .operation
+            .as_ref()
+            .map(|operation| operation.kind)
+            .expect("pending provider operation has an enclosing lifecycle operation");
+        let descriptor = self.data_plane.descriptor();
+        if validate_descriptor(descriptor).is_err()
+            || pending.provider_instance_id != descriptor.provider_instance_id
+        {
+            return Err(self.retain_unresolved_prepare(
+                instance,
+                "pending provider operation belongs to another provider instance".to_string(),
+            ));
+        }
+        match (operation_kind, pending.kind) {
+            (
+                OperationKind::Create | OperationKind::Restore | OperationKind::Resume,
+                PendingProviderOperationKind::PrepareLease,
+            ) => self.settle_pending_provider_prepare(instance).await,
+            (OperationKind::Checkpoint, PendingProviderOperationKind::CheckpointCapture)
+            | (OperationKind::Hibernate, PendingProviderOperationKind::SuspensionCapture { .. }) => {
+                self.settle_pending_provider_capture(instance).await
+            }
+            _ => Err(self.retain_unresolved_provider_operation(
+                instance,
+                "provider write-ahead operation is not recoverable by this lifecycle path"
+                    .to_string(),
+            )),
+        }
+    }
+
+    pub(super) async fn settle_pending_provider_prepare(
+        &self,
+        instance: &mut SandboxInstance,
+    ) -> Result<()> {
+        let Some(operation) = instance.operation.as_ref() else {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                "provider preparation has no enclosing lifecycle operation".to_string(),
+            ));
+        };
+        let Some(pending) = operation.provider_operation else {
+            return Ok(());
+        };
+        let replacement = match (operation.kind, pending.kind) {
+            (OperationKind::Create, PendingProviderOperationKind::PrepareLease) => false,
+            (
+                OperationKind::Restore | OperationKind::Resume,
+                PendingProviderOperationKind::PrepareLease,
+            ) => true,
+            _ => {
+                return Err(self.retain_unresolved_provider_operation(
+                    instance,
+                    "pending provider operation is not a lease preparation".to_string(),
+                ));
+            }
+        };
+        if let Err(error) = instance.validate_provider_operation() {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                format!("provider write-ahead identity is inconsistent: {error}"),
+            ));
+        }
+        let descriptor = self.data_plane.descriptor();
+        if validate_descriptor(descriptor).is_err()
+            || pending.provider_instance_id != descriptor.provider_instance_id
+        {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                "pending provider operation belongs to another provider instance".to_string(),
+            ));
+        }
+
+        let context = RequestContext::from(pending.context);
+        let observed = match self.data_plane.inspect(InspectRequest { context }).await {
+            Ok(observed) => observed,
+            Err(ProviderError::NotFound) => {
+                let mut settled = instance.clone();
+                if replacement {
+                    settled.replacement_data_plane_lease = None;
+                } else {
+                    settled.data_plane_lease = None;
+                    self.remove_data_plane_lease(instance.id)?;
+                }
+                settled.finish_provider_operation();
+                self.commit_instance_update(instance, settled)?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(self.retain_unresolved_provider_operation(
+                    instance,
+                    format!("pending provider preparation inspection failed: {error}"),
+                ));
+            }
+        };
+        let prepared_before = LeaseBinding {
+            provider_instance_id: pending.provider_instance_id,
+            context,
+            generation: context.generation,
+            state: LeaseState::Prepared,
+        };
+        if validate_transition(prepared_before, observed.binding, LeaseState::Released).is_ok() {
+            let mut settled = instance.clone();
+            if replacement {
+                settled.replacement_data_plane_lease = None;
+            } else {
+                settled.data_plane_lease = None;
+            }
+            settled.finish_provider_operation();
+            self.commit_instance_update(instance, settled)?;
+            if !replacement {
+                self.remove_data_plane_lease(instance.id)?;
+            }
+            return Ok(());
+        }
+        if observed.binding.provider_instance_id != descriptor.provider_instance_id
+            || validate_prepared_binding(context, observed.binding).is_err()
+        {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                "pending provider preparation inspection returned an unsafe state".to_string(),
+            ));
+        }
+        let mut observed_instance = instance.clone();
+        let observed_record = observed
+            .binding
+            .to_record(pending.root_filesystem_bytes, pending.guest_memory_bytes);
+        if replacement {
+            observed_instance.replacement_data_plane_lease = Some(observed_record);
+        } else {
+            observed_instance.data_plane_lease = Some(observed_record);
+        }
+        if let Err(error) = self.commit_instance_update(instance, observed_instance) {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                format!("observed provider preparation could not be persisted: {error}"),
+            ));
+        }
+        if !replacement
+            && let Err(error) = self.retain_data_plane_lease(instance.id, observed.binding)
+        {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                format!("observed provider preparation could not be retained: {error}"),
+            ));
+        }
+        let aborted = match self
+            .data_plane
+            .abort(AbortRequest {
+                binding: observed.binding,
+            })
+            .await
+        {
+            Ok(aborted) => aborted,
+            Err(error) => {
+                return Err(self.retain_unresolved_provider_operation(
+                    instance,
+                    format!("pending provider preparation abort failed: {error}"),
+                ));
+            }
+        };
+        if validate_transition(observed.binding, aborted.binding, LeaseState::Released).is_err() {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                "pending provider preparation abort returned an invalid transition".to_string(),
+            ));
+        }
+        if !replacement {
+            self.remove_data_plane_lease(instance.id)?;
+        }
+        let mut settled = instance.clone();
+        if replacement {
+            settled.replacement_data_plane_lease = None;
+        } else {
+            settled.data_plane_lease = None;
+        }
+        settled.finish_provider_operation();
+        self.commit_instance_update(instance, settled)
+    }
+
+    pub(super) async fn settle_pending_provider_capture(
+        &self,
+        instance: &mut SandboxInstance,
+    ) -> Result<()> {
+        let Some(operation) = instance.operation.as_ref() else {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                "provider capture has no enclosing lifecycle operation".to_string(),
+            ));
+        };
+        let Some(pending) = operation.provider_operation else {
+            return Ok(());
+        };
+        let public_checkpoint_id = operation.checkpoint_id.clone();
+        if let Err(error) = instance.validate_provider_operation() {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                format!("provider capture write-ahead identity is inconsistent: {error}"),
+            ));
+        }
+        let descriptor = self.data_plane.descriptor();
+        if validate_descriptor(descriptor).is_err()
+            || pending.provider_instance_id != descriptor.provider_instance_id
+        {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                "pending provider capture belongs to another provider instance".to_string(),
+            ));
+        }
+        let context = RequestContext::from(pending.context);
+        let observed = match self.data_plane.inspect(InspectRequest { context }).await {
+            Ok(observed) => observed,
+            Err(error) => {
+                return Err(self.retain_unresolved_provider_operation(
+                    instance,
+                    format!("pending provider capture inspection failed: {error}"),
+                ));
+            }
+        };
+        let generation_after_call = pending.generation_before_call.checked_add(1);
+        if observed.binding.provider_instance_id != descriptor.provider_instance_id
+            || observed.binding.context != context
+            || observed.binding.state != LeaseState::Finalized
+            || !(observed.binding.generation == pending.generation_before_call
+                || generation_after_call == Some(observed.binding.generation))
+        {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                "pending provider capture inspection returned an unsafe state".to_string(),
+            ));
+        }
+        let mut observed_instance = instance.clone();
+        observed_instance.data_plane_lease = Some(
+            observed
+                .binding
+                .to_record(pending.root_filesystem_bytes, pending.guest_memory_bytes),
+        );
+        if let Err(error) = self.commit_instance_update(instance, observed_instance) {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                format!("observed provider capture generation could not be persisted: {error}"),
+            ));
+        }
+        if let Err(error) = self.retain_data_plane_lease(instance.id, observed.binding) {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                format!("observed provider capture generation could not be retained: {error}"),
+            ));
+        }
+
+        let retirement = match pending.kind {
+            PendingProviderOperationKind::CheckpointCapture => {
+                let checkpoint_id = public_checkpoint_id
+                    .as_deref()
+                    .ok_or_else(|| {
+                        self.retain_unresolved_provider_operation(
+                            instance,
+                            "pending provider checkpoint has no public identity".to_string(),
+                        )
+                    })
+                    .and_then(|checkpoint_id| {
+                        validate_checkpoint_id(checkpoint_id).map_err(|error| {
+                            self.retain_unresolved_provider_operation(
+                                instance,
+                                format!("pending provider checkpoint identity is invalid: {error}"),
+                            )
+                        })
+                    })?;
+                self.retire_provider_checkpoint_identity(
+                    pending.provider_instance_id,
+                    checkpoint_id,
+                    None,
+                )
+                .await
+                .map(|_| ())
+            }
+            PendingProviderOperationKind::SuspensionCapture { suspension_id } => self
+                .retire_provider_suspension_identity(
+                    pending.provider_instance_id,
+                    suspension_id,
+                    None,
+                )
+                .await
+                .map(|_| ()),
+            PendingProviderOperationKind::PrepareLease => {
+                return Err(self.retain_unresolved_provider_operation(
+                    instance,
+                    "pending provider capture uses a preparation identity".to_string(),
+                ));
+            }
+        };
+        if let Err(error) = retirement {
+            return Err(self.retain_unresolved_provider_operation(
+                instance,
+                format!("pending provider capture retirement failed: {error}"),
+            ));
+        }
+
+        let mut settled = instance.clone();
+        settled.finish_provider_operation();
+        self.commit_instance_update(instance, settled)
+    }
+
+    fn ensure_provider_ownership_matches(&self, instance: &SandboxInstance) -> Result<()> {
+        let selected = self.data_plane.descriptor().provider_instance_id;
+        let foreign = instance
+            .data_plane_lease
+            .iter()
+            .map(|record| record.provider_instance_id)
+            .chain(
+                instance
+                    .provider_transition
+                    .iter()
+                    .map(|record| record.before.provider_instance_id),
+            )
+            .chain(
+                instance
+                    .operation
+                    .iter()
+                    .filter_map(|operation| operation.provider_operation)
+                    .map(|record| record.provider_instance_id),
+            )
+            .chain(
+                instance
+                    .replacement_data_plane_lease
+                    .iter()
+                    .map(|record| record.provider_instance_id),
+            )
+            .chain(
+                instance
+                    .pending_provider_retirements
+                    .iter()
+                    .map(|record| record.provider_instance_id),
+            )
+            .chain(
+                instance
+                    .provider_suspension
+                    .iter()
+                    .map(|record| record.provider_instance_id),
+            )
+            .chain(
+                instance
+                    .pending_provider_suspension_retirements
+                    .iter()
+                    .map(|record| record.provider_instance_id),
+            )
+            .any(|owner| owner != selected);
+        if foreign {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {} has durable data-plane ownership from another provider; resources and ownership records were retained",
+                instance.id
+            )));
+        }
+        Ok(())
     }
 
     async fn reconcile_provider_startup(&self) -> Result<ReconcileReport> {
@@ -1955,7 +2789,14 @@ impl SandboxManager {
         let mut observed_by_lease = HashMap::new();
         let mut seen_cursors = HashSet::new();
         let mut cursor: Option<String> = None;
+        let mut page_count = 0_usize;
         loop {
+            page_count += 1;
+            if page_count > MAX_INVENTORY_PAGES {
+                return Err(BlazeDaemonError::RecoveryRequired(
+                    "data-plane inventory exceeded the page-count safety bound".to_string(),
+                ));
+            }
             if let Some(value) = cursor.as_ref()
                 && !seen_cursors.insert(value.clone())
             {
@@ -1970,9 +2811,9 @@ impl SandboxManager {
                     page_size: INVENTORY_PAGE_SIZE,
                 })
                 .await?;
-            if page.leases.len() > INVENTORY_PAGE_SIZE as usize {
+            if validate_inventory_page(&page, INVENTORY_PAGE_SIZE).is_err() {
                 return Err(BlazeDaemonError::RecoveryRequired(
-                    "data-plane inventory exceeded the requested page size".to_string(),
+                    "data-plane inventory returned an invalid page".to_string(),
                 ));
             }
             for lease in page.leases {
@@ -2003,15 +2844,16 @@ impl SandboxManager {
         }
 
         let persisted = self.list()?;
+        let daemon_managed_storage = self.data_plane.capabilities().daemon_managed_storage;
         let mut report = ReconcileReport {
             attempted: persisted
                 .iter()
-                .filter(|instance| requires_automatic_cleanup(instance))
+                .filter(|instance| requires_automatic_cleanup(instance, daemon_managed_storage))
                 .count(),
             ..ReconcileReport::default()
         };
         for mut instance in persisted {
-            if !requires_automatic_cleanup(&instance) {
+            if !requires_automatic_cleanup(&instance, daemon_managed_storage) {
                 continue;
             }
             let id = instance.id;
@@ -2022,12 +2864,12 @@ impl SandboxManager {
                 .map(|record| LeaseBinding::from_record(id, record));
             let observed =
                 expected.and_then(|binding| observed_by_lease.remove(&binding.context.lease_id));
-            let adoptable = instance.state == SandboxState::Running
-                && instance.operation.is_none()
-                && instance.backend_ownership == BackendOwnership::Running
-                && instance.backend_runtime.is_some()
-                && instance.replacement_data_plane_lease.is_none()
-                && instance.pending_provider_retirements.is_empty()
+            let expected_replacement = instance
+                .replacement_data_plane_lease
+                .map(|record| LeaseBinding::from_record(id, record));
+            let observed_replacement = expected_replacement
+                .and_then(|binding| observed_by_lease.remove(&binding.context.lease_id));
+            let adoptable = is_running_adoption_candidate(&instance)
                 && expected.is_some()
                 && expected == observed
                 && expected.is_some_and(|binding| {
@@ -2035,21 +2877,61 @@ impl SandboxManager {
                 });
 
             if adoptable {
-                match self
-                    .adopt_running_instance(&mut instance, observed.expect("checked"), inventory)
-                    .await
-                {
+                if self.backend_owner(id).is_some() {
+                    report.completed += 1;
+                    continue;
+                }
+                match self.adopt_running_instance(&mut instance).await {
                     Ok(true) => {
                         report.completed += 1;
                         continue;
                     }
                     Ok(false) => {}
                     Err(error) => {
+                        if instance.provider_transition.is_some() {
+                            return Err(error);
+                        }
                         report.failures.push(ReconcileFailure {
                             instance_id: id,
                             error: error.to_string(),
                         });
                     }
+                }
+            }
+
+            if let Some(observed_replacement) = observed_replacement {
+                match inventory
+                    .reconcile(ReconcileRequest {
+                        expected: expected_replacement,
+                        observed: observed_replacement,
+                        action: ReconcileAction::Quarantine,
+                    })
+                    .await
+                {
+                    Ok(result)
+                        if validate_reconcile_result(
+                            observed_replacement,
+                            result.binding,
+                            ReconcileAction::Quarantine,
+                        )
+                        .is_ok() =>
+                    {
+                        if let Some(record) = instance.replacement_data_plane_lease {
+                            instance.replacement_data_plane_lease = Some(result.binding.to_record(
+                                record.root_filesystem_bytes,
+                                record.guest_memory_bytes,
+                            ));
+                        }
+                    }
+                    Ok(_) => report.failures.push(ReconcileFailure {
+                        instance_id: id,
+                        error: "provider replacement quarantine returned an invalid transition"
+                            .to_string(),
+                    }),
+                    Err(error) => report.failures.push(ReconcileFailure {
+                        instance_id: id,
+                        error: format!("provider replacement quarantine failed: {error}"),
+                    }),
                 }
             }
 
@@ -2155,12 +3037,7 @@ impl SandboxManager {
         Ok(report)
     }
 
-    async fn adopt_running_instance(
-        &self,
-        instance: &mut SandboxInstance,
-        observed: LeaseBinding,
-        inventory: &dyn blaze_provider_api::DataPlaneInventory,
-    ) -> Result<bool> {
+    async fn adopt_running_instance(&self, instance: &mut SandboxInstance) -> Result<bool> {
         let runtime = instance.backend_runtime.as_ref().ok_or_else(|| {
             BlazeDaemonError::RecoveryRequired(format!(
                 "sandbox {} has no durable backend identity",
@@ -2173,6 +3050,15 @@ impl SandboxManager {
                 instance.id
             ))
         })?;
+        if let Some(pending) = instance.provider_transition
+            && (pending.kind != ProviderTransitionKind::Adopt
+                || pending.backend_process != Some(process))
+        {
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "sandbox {} adoption WAL does not match its durable backend identity",
+                instance.id
+            )));
+        }
         let spawner = self.spawner(instance.backend).ok_or_else(|| {
             BlazeDaemonError::RecoveryRequired(format!(
                 "sandbox {} has no registered recovery backend",
@@ -2210,18 +3096,32 @@ impl SandboxManager {
                     .unwrap_or_default()
             )));
         }
-        let reconciled = match inventory
-            .reconcile(ReconcileRequest {
-                expected: Some(observed),
-                observed,
-                action: ReconcileAction::Adopt {
-                    backend_process: process,
-                },
-            })
+        instance.backend_runtime = Some(owner.runtime_record());
+        let transition = if instance.provider_transition.is_some() {
+            self.settle_pending_provider_transition(instance).await
+        } else {
+            self.transition_data_plane(
+                instance,
+                ProviderLeaseSlot::Active,
+                ProviderTransitionKind::Adopt,
+                None,
+                Some(process),
+            )
             .await
-        {
+        };
+        let reconciled = match transition {
             Ok(reconciled) => reconciled,
             Err(error) => {
+                if instance.provider_transition.is_some() {
+                    self.backend_instances
+                        .lock()
+                        .map_err(|_| poisoned("backend_instances"))?
+                        .insert(instance.id, owner);
+                    return Err(BlazeDaemonError::RecoveryRequired(format!(
+                        "sandbox {} provider adoption outcome is unresolved; backend owner and WAL retained: {error}",
+                        instance.id
+                    )));
+                }
                 let cleanup = owner.kill().await.err();
                 return Err(BlazeDaemonError::RecoveryRequired(format!(
                     "sandbox {} provider adoption failed: {error}{}",
@@ -2232,72 +3132,102 @@ impl SandboxManager {
                 )));
             }
         };
-        if validate_reconcile_result(
-            observed,
-            reconciled.binding,
-            ReconcileAction::Adopt {
-                backend_process: process,
-            },
-        )
-        .is_err()
-        {
-            let cleanup = owner.kill().await.err();
-            return Err(BlazeDaemonError::RecoveryRequired(format!(
-                "sandbox {} provider adoption returned an invalid transition{}",
-                instance.id,
-                cleanup
-                    .map(|error| format!("; backend cleanup failed: {error}"))
-                    .unwrap_or_default()
-            )));
-        }
-        instance.backend_runtime = Some(owner.runtime_record());
-        if let Err(error) = self.persist_data_plane_binding(instance, reconciled.binding, None) {
-            let quarantine = inventory
-                .reconcile(ReconcileRequest {
-                    expected: Some(reconciled.binding),
-                    observed: reconciled.binding,
-                    action: ReconcileAction::Quarantine,
-                })
-                .await;
-            let quarantine_error = match quarantine {
-                Ok(result)
-                    if validate_reconcile_result(
-                        reconciled.binding,
-                        result.binding,
-                        ReconcileAction::Quarantine,
-                    )
-                    .is_ok() =>
-                {
-                    if let Some(record) = instance.data_plane_lease {
-                        instance.data_plane_lease = Some(
-                            result
-                                .binding
-                                .to_record(record.root_filesystem_bytes, record.guest_memory_bytes),
-                        );
-                    }
-                    self.state_store
-                        .persist(instance)
-                        .err()
-                        .map(|error| format!("; quarantined state persistence failed: {error}"))
-                }
-                Ok(_) => Some("; provider returned an invalid quarantine transition".to_string()),
-                Err(error) => Some(format!("; provider quarantine failed: {error}")),
-            };
-            let cleanup = owner.kill().await.err();
-            return Err(BlazeDaemonError::RecoveryRequired(format!(
-                "sandbox {} adopted ownership could not be persisted: {error}{}{}",
-                instance.id,
-                quarantine_error.unwrap_or_default(),
-                cleanup
-                    .map(|error| format!("; backend cleanup failed: {error}"))
-                    .unwrap_or_default()
-            )));
-        }
+        debug_assert_eq!(reconciled.state, LeaseState::Finalized);
         self.backend_instances
             .lock()
             .map_err(|_| poisoned("backend_instances"))?
             .insert(instance.id, owner);
         Ok(true)
+    }
+
+    /// Resolve an adoption WAL after the recorded backend is proven absent.
+    ///
+    /// Replaying `Adopt` against an exited process would attach provider
+    /// ownership to a backend that can never serve. Accept only a transition
+    /// that the provider already completed; otherwise clear the unissued
+    /// intent and let the ordinary inventory comparison quarantine or reclaim
+    /// the remaining lease without blocking every later daemon start.
+    async fn settle_abandoned_provider_adoption(
+        &self,
+        instance: &mut SandboxInstance,
+    ) -> Result<()> {
+        instance.validate_provider_transition().map_err(|error| {
+            BlazeDaemonError::RecoveryRequired(format!(
+                "provider adoption WAL is inconsistent: {error}"
+            ))
+        })?;
+        let pending = instance.provider_transition.ok_or_else(|| {
+            BlazeDaemonError::RecoveryRequired(
+                "abandoned provider adoption has no durable WAL".to_string(),
+            )
+        })?;
+        if pending.kind != ProviderTransitionKind::Adopt {
+            return Err(BlazeDaemonError::RecoveryRequired(
+                "abandoned provider transition is not an adoption".to_string(),
+            ));
+        }
+        let before = LeaseBinding::from_record(instance.id, pending.before);
+        if before.provider_instance_id != self.data_plane.descriptor().provider_instance_id {
+            return Err(BlazeDaemonError::RecoveryRequired(
+                "provider adoption belongs to another provider instance; WAL retained".to_string(),
+            ));
+        }
+        let observed = self
+            .data_plane
+            .inspect(InspectRequest {
+                context: before.context,
+            })
+            .await;
+        match observed {
+            Ok(observed)
+                if validate_transition(before, observed.binding, LeaseState::Finalized).is_ok() =>
+            {
+                self.accept_provider_transition(instance, pending, observed.binding)?;
+            }
+            Ok(observed) if observed.binding == before => {
+                let mut cleared = instance.clone();
+                cleared.finish_provider_transition();
+                self.commit_instance_update(instance, cleared)?;
+            }
+            Err(ProviderError::NotFound) => {
+                // Neither the recorded backend nor this exact provider lease
+                // exists. Retain a local released tombstone so destruction can
+                // remove public metadata without issuing an unsafe transition
+                // against a resource the provider proved absent.
+                let released = LeaseBinding {
+                    state: LeaseState::Released,
+                    ..before
+                };
+                let mut cleared = instance.clone();
+                cleared.data_plane_lease = Some(released.to_record(
+                    pending.before.root_filesystem_bytes,
+                    pending.before.guest_memory_bytes,
+                ));
+                cleared.finish_provider_transition();
+                self.commit_instance_update(instance, cleared)?;
+                self.retain_data_plane_lease(instance.id, released)?;
+            }
+            Ok(_) => {
+                return Err(BlazeDaemonError::RecoveryRequired(
+                    "abandoned provider adoption observed neither its before-image nor exact successor; WAL retained"
+                        .to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "abandoned provider adoption inspection failed: {error}; WAL retained"
+                )));
+            }
+        }
+        // Failure to re-adopt proves that the recorded process no longer owns
+        // a live backend. Persist that fact before the deterministic cleanup
+        // pass so the surviving provider lease is stopped and released instead
+        // of repeatedly being treated as an adoptable running sandbox.
+        let mut stopped = instance.clone();
+        stopped.backend_ownership = BackendOwnership::Stopped;
+        stopped.backend_runtime = None;
+        self.commit_instance_update(instance, stopped)?;
+        Ok(())
     }
 
     async fn lock_running(&self, id: Uuid) -> Result<OwnedMutexGuard<()>> {
@@ -2449,6 +3379,15 @@ impl SandboxManager {
         registered: bool,
         original: BlazeDaemonError,
     ) -> BlazeDaemonError {
+        if instance.provider_transition.is_some() {
+            let recovery = self.mark_instance_recovery(instance.clone()).err();
+            return BlazeDaemonError::RecoveryRequired(format!(
+                "{original}; provider transition outcome is unresolved and its WAL was retained{}",
+                recovery
+                    .map(|error| format!("; recovery state persistence failed: {error}"))
+                    .unwrap_or_default()
+            ));
+        }
         if instance.operation.is_none() {
             instance.begin_operation(OperationKind::Create);
         }
@@ -2484,29 +3423,35 @@ impl SandboxManager {
 
         let mut data_plane_released = false;
         if backend_stopped {
-            match self.data_plane.abort(AbortRequest { binding }).await {
-                Ok(aborted) => {
-                    if validate_transition(binding, aborted.binding, LeaseState::Released).is_ok() {
-                        data_plane_released = true;
-                        if let Some(record) = instance.data_plane_lease {
-                            instance.data_plane_lease = Some(aborted.binding.to_record(
-                                record.root_filesystem_bytes,
-                                record.guest_memory_bytes,
-                            ));
-                        }
-                        if let Err(error) = self.remove_data_plane_lease(instance.id) {
-                            cleanup_errors.push(format!(
-                                "data-plane lease retention cleanup failed: {error}"
-                            ));
-                        }
-                    } else {
-                        cleanup_errors
-                            .push("data-plane abort returned an invalid transition".to_string());
+            if binding.state == LeaseState::Released {
+                data_plane_released = true;
+            } else if instance
+                .data_plane_lease
+                .is_some_and(|record| LeaseBinding::from_record(instance.id, record) == binding)
+            {
+                match self
+                    .transition_data_plane(
+                        instance,
+                        ProviderLeaseSlot::Active,
+                        ProviderTransitionKind::Abort,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => data_plane_released = true,
+                    Err(error) => {
+                        cleanup_errors.push(format!("data-plane abort failed: {error}"));
                     }
                 }
-                Err(error) => {
-                    cleanup_errors.push(format!("data-plane abort failed: {error}"));
-                }
+            } else {
+                cleanup_errors
+                    .push("data-plane abort identity does not match its durable lease".to_string());
+            }
+            if data_plane_released && let Err(error) = self.remove_data_plane_lease(instance.id) {
+                cleanup_errors.push(format!(
+                    "data-plane lease retention cleanup failed: {error}"
+                ));
             }
         } else {
             cleanup_errors.push(
@@ -2650,14 +3595,82 @@ fn poisoned(name: &str) -> BlazeDaemonError {
     BlazeDaemonError::Internal(format!("{name} lock poisoned"))
 }
 
+fn provider_transition_target(before: LeaseBinding, target: LeaseState) -> Result<LeaseBinding> {
+    let generation = before.generation.checked_add(1).ok_or_else(|| {
+        BlazeDaemonError::RecoveryRequired(
+            "provider transition generation overflowed; WAL retained".to_string(),
+        )
+    })?;
+    Ok(LeaseBinding {
+        provider_instance_id: before.provider_instance_id,
+        context: before.context,
+        generation,
+        state: target,
+    })
+}
+
+pub(super) fn checkpoint_retirement_operation_id(
+    provider_instance_id: Uuid,
+    public_checkpoint_id: Uuid,
+    reference_id: Option<Uuid>,
+) -> Uuid {
+    retirement_operation_id(
+        b"checkpoint",
+        provider_instance_id,
+        public_checkpoint_id,
+        reference_id,
+    )
+}
+
+pub(super) fn suspension_retirement_operation_id(
+    provider_instance_id: Uuid,
+    suspension_id: Uuid,
+    reference_id: Option<Uuid>,
+) -> Uuid {
+    retirement_operation_id(
+        b"suspension",
+        provider_instance_id,
+        suspension_id,
+        reference_id,
+    )
+}
+
+fn retirement_operation_id(
+    domain: &[u8],
+    provider_instance_id: Uuid,
+    public_owner_id: Uuid,
+    reference_id: Option<Uuid>,
+) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"blaze-provider-retirement-v1\0");
+    digest.update(domain);
+    digest.update([0]);
+    digest.update(provider_instance_id.as_bytes());
+    digest.update(public_owner_id.as_bytes());
+    match reference_id {
+        Some(reference_id) => {
+            digest.update([1]);
+            digest.update(reference_id.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 9562 version 8 identifies an application-defined UUID layout.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 fn is_clean_terminal(instance: &SandboxInstance) -> bool {
     instance.state == SandboxState::Destroyed
         && instance.operation.is_none()
+        && instance.provider_transition.is_none()
         && instance.data_plane_lease.is_none()
         && instance.replacement_data_plane_lease.is_none()
         && instance.pending_provider_retirements.is_empty()
         && instance.provider_suspension.is_none()
-        && instance.pending_provider_suspension_id.is_none()
         && instance.pending_provider_suspension_retirements.is_empty()
         && instance.backend_runtime.is_none()
         && matches!(
@@ -2666,19 +3679,75 @@ fn is_clean_terminal(instance: &SandboxInstance) -> bool {
         )
 }
 
-fn requires_automatic_cleanup(instance: &SandboxInstance) -> bool {
+fn is_clean_hibernated(instance: &SandboxInstance, daemon_managed_storage: bool) -> bool {
+    // The standard file-backed hibernation path keeps its finalized storage
+    // lease: resume reconstructs the root filesystem and memory files from
+    // that durable owner. A provider-managed suspension instead releases the
+    // active lease and records an immutable suspension owner. Both are clean
+    // hibernated states, but a non-finalized live lease is never one.
+    let data_plane_is_clean = match instance.data_plane_lease {
+        None => true,
+        Some(record) => {
+            daemon_managed_storage
+                && record.state == DataPlaneLeaseState::Finalized
+                && instance.provider_suspension.is_none()
+        }
+    };
+    instance.state == SandboxState::Hibernated
+        && instance.operation.is_none()
+        && instance.provider_transition.is_none()
+        && data_plane_is_clean
+        && instance.replacement_data_plane_lease.is_none()
+        && instance.pending_provider_retirements.is_empty()
+        && instance.pending_provider_suspension_retirements.is_empty()
+        && instance
+            .backend_runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.process.is_none())
+        && instance.backend_ownership == BackendOwnership::Stopped
+}
+
+fn is_running_adoption_candidate(instance: &SandboxInstance) -> bool {
+    instance.state == SandboxState::Running
+        && instance.operation.is_none()
+        && instance.provider_transition.is_none()
+        && instance.data_plane_lease.is_some_and(|record| {
+            matches!(
+                record.state,
+                DataPlaneLeaseState::Committed | DataPlaneLeaseState::Finalized
+            )
+        })
+        && instance.replacement_data_plane_lease.is_none()
+        && instance.pending_provider_retirements.is_empty()
+        && instance.pending_provider_suspension_retirements.is_empty()
+        && instance.backend_runtime.is_some()
+        && instance.backend_ownership == BackendOwnership::Running
+}
+
+fn requires_automatic_cleanup(instance: &SandboxInstance, daemon_managed_storage: bool) -> bool {
     !(is_clean_terminal(instance)
-        || (instance.state == SandboxState::Hibernated
-            && instance.operation.is_none()
-            && instance.backend_ownership == BackendOwnership::Stopped
-            && instance.replacement_data_plane_lease.is_none()
-            && instance.pending_provider_suspension_id.is_none()
-            && (instance.provider_suspension.is_none() || instance.data_plane_lease.is_none()))
-        || (instance.state == SandboxState::RecoveryRequired
-            && matches!(
-                instance.operation.as_ref().map(|operation| operation.kind),
-                Some(OperationKind::Hibernate | OperationKind::Resume)
-            )))
+        || is_clean_hibernated(instance, daemon_managed_storage)
+        || requires_explicit_cleanup(instance))
+}
+
+// An interrupted hibernation or resume without a provider write-ahead identity
+// is intentionally retained for explicit cleanup. Startup can no longer prove
+// whether its published artifacts are the old or new public owner, so automatic
+// destruction would turn a recoverable state into data loss. When the durable
+// operation contains a provider identity, `destroy_locked` can first inspect
+// that exact request and deterministically abort or retire its side effect; do
+// not hide that recoverable transaction from automatic cleanup merely because
+// the provider does not implement whole-provider inventory.
+fn requires_explicit_cleanup(instance: &SandboxInstance) -> bool {
+    instance.state == SandboxState::RecoveryRequired
+        && matches!(
+            instance.operation.as_ref().map(|operation| operation.kind),
+            Some(OperationKind::Hibernate | OperationKind::Resume)
+        )
+        && instance
+            .operation
+            .as_ref()
+            .is_none_or(|operation| operation.provider_operation.is_none())
 }
 
 /// Require the command line captured in a Firecracker snapshot to equal the
@@ -2709,7 +3778,7 @@ pub(super) fn provider_restore_attachments(
         ProviderAttachmentAccess, ProviderAttachmentKind, ProviderAttachmentRole,
         ProviderAttachmentSharing, ProviderRestoreAttachment, ProviderRestoreAttachments,
     };
-    use blaze_provider_api::{AttachmentAccess, AttachmentKind, AttachmentRole, AttachmentSharing};
+    use blaze_provider_api::{AttachmentKind, AttachmentRole};
 
     let attachments = attachments
         .into_iter()
@@ -2719,14 +3788,8 @@ pub(super) fn provider_restore_attachments(
                 AttachmentRole::GuestMemory => ProviderAttachmentRole::GuestMemory,
             },
             file: Arc::new(std::fs::File::from(attachment.descriptor)),
-            access: match attachment.access {
-                AttachmentAccess::ReadOnly => ProviderAttachmentAccess::ReadOnly,
-                AttachmentAccess::ReadWrite => ProviderAttachmentAccess::ReadWrite,
-            },
-            sharing: match attachment.sharing {
-                AttachmentSharing::Exclusive => ProviderAttachmentSharing::Exclusive,
-                AttachmentSharing::SharedReadOnly => ProviderAttachmentSharing::SharedReadOnly,
-            },
+            access: ProviderAttachmentAccess::ReadWrite,
+            sharing: ProviderAttachmentSharing::Exclusive,
             kind: match attachment.kind {
                 AttachmentKind::RegularFile => ProviderAttachmentKind::RegularFile,
                 AttachmentKind::CharacterDevice => ProviderAttachmentKind::CharacterDevice,

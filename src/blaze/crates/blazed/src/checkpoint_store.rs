@@ -2911,8 +2911,6 @@ mod tests {
             parent_reference_id: None,
             source_lease_id: Uuid::new_v4(),
             source_generation: 4,
-            root_filesystem: true,
-            guest_memory: true,
         });
 
         let metadata = store

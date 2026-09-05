@@ -1264,10 +1264,16 @@ impl BackendSpawner for MockSpawner {
             backend: BackendKind::Mock,
             version: Some("mock-v1".to_string()),
             snapshot_kind: blaze_core::backend::SnapshotKind::Full,
+            consumes_typed_opened_attachments: false,
         }))
     }
 
     async fn restore(&self, request: BackendRestoreRequest) -> RestoreResult {
+        if request.provider_attachments.is_some() {
+            return Err(SpawnFailure::clean(BlazeError::BackendError {
+                msg: "mock restore does not consume typed opened attachments".to_string(),
+            }));
+        }
         let RestoreRequest {
             instance_id,
             payload_dir,
@@ -1474,6 +1480,7 @@ impl BackendSpawner for GuestMockSpawner {
             backend: BackendKind::Mock,
             version: Some("guest-mock-v1".to_string()),
             snapshot_kind: blaze_core::backend::SnapshotKind::Full,
+            consumes_typed_opened_attachments: false,
         }))
     }
 
@@ -1481,6 +1488,11 @@ impl BackendSpawner for GuestMockSpawner {
     /// [`GuestMockInstance::snapshot`], proving the payload contract carries
     /// a container-backend layout end to end.
     async fn restore(&self, request: BackendRestoreRequest) -> RestoreResult {
+        if request.provider_attachments.is_some() {
+            return Err(SpawnFailure::clean(BlazeError::BackendError {
+                msg: "guest mock restore does not consume typed opened attachments".to_string(),
+            }));
+        }
         let run_dir = request.run_dir.clone();
         let RestoreRequest {
             instance_id,
@@ -2789,6 +2801,74 @@ mod tests {
         assert!(instance.quiesce_for_capture().await.is_err());
         assert!(instance.unquiesce_after_capture().await.is_err());
         assert!(instance.snapshot(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_restore_rejects_typed_opened_attachments() {
+        let temp = tempfile::tempdir().expect("temp");
+        let spawn = request(temp.path());
+        let attachment_path = temp.path().join("opened-rootfs");
+        let attachment_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&attachment_path)
+            .expect("opened attachment");
+        attachment_file
+            .set_len(4096)
+            .expect("size opened attachment");
+
+        let capability = MockSpawner
+            .restore_capability(None)
+            .await
+            .expect("restore capability")
+            .expect("mock restore capability");
+        assert!(!capability.consumes_typed_opened_attachments);
+
+        let mut restore = BackendRestoreRequest::new(
+            RestoreRequest {
+                instance_id: spawn.instance_id,
+                binary_path: PathBuf::new(),
+                storage: spawn.storage.clone(),
+                payload_dir: temp.path().join("unused-payload"),
+                checkpoint_backend: BackendKind::Mock,
+                expected_version: Some("mock-v1".to_string()),
+                snapshot_kind: SnapshotKind::Full,
+                expose_guest_socket: false,
+                preserve_network: false,
+                record_console_log: false,
+                snapshot_from_other_sandbox: false,
+            },
+            spawn.run_dir.clone(),
+            None,
+        )
+        .expect("restore request");
+        restore.provider_attachments = Some(ProviderRestoreAttachments {
+            instance_id: spawn.instance_id,
+            lease_id: Uuid::new_v4(),
+            generation: 1,
+            attachments: vec![ProviderRestoreAttachment {
+                role: ProviderAttachmentRole::RootDrive,
+                file: Arc::new(attachment_file),
+                access: ProviderAttachmentAccess::ReadWrite,
+                sharing: ProviderAttachmentSharing::Exclusive,
+                kind: ProviderAttachmentKind::RegularFile,
+                logical_size_bytes: 4096,
+                consumer_path: None,
+            }],
+        });
+
+        let error = MockSpawner
+            .restore(restore)
+            .await
+            .err()
+            .expect("Mock must reject typed opened attachments");
+        assert!(
+            error
+                .to_string()
+                .contains("does not consume typed opened attachments"),
+            "unexpected error: {error}"
+        );
     }
 
     /// A template capture records its source sandbox, so the mock adapter must

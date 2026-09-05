@@ -244,10 +244,12 @@ Blaze captures a running sandbox through
 `POST /v1/sandboxes/{id}/checkpoint`.
 
 Capture always requires full snapshot support from the selected backend. The
-standard file path also requires storage checkpoint support and captures the
-writable root filesystem through the configured storage provider. A sandbox
-with a finalized provider lease instead requires `DataPlaneCheckpoint`; the
-current provider path must own both the writable-root and guest-memory content.
+data-plane path is selected by the provider's declared integration mode, not by
+the mere presence of a provider lease. A provider-owned capture uses
+`DataPlaneCheckpoint` and owns the complete writable-root and guest-memory
+image. A provider that instead declares `daemon_managed_storage` uses the
+configured storage provider for the writable-root capture and does not need the
+checkpoint extension; the standard file provider follows this path.
 Firecracker and the built-in mock backend support full capture, while
 Bubblewrap and the other process backends do not. An unsupported combination
 returns HTTP 501 before the backend is quiesced or its lifecycle record changes.
@@ -276,11 +278,12 @@ sandbox checkpoint HEAD, and returns the workload to execution. Guest
 operations and other lifecycle changes wait for the same operation lock while
 capture is in progress.
 
-For a finalized provider-backed lease, Blaze still stores backend artifacts
-under `backend/`, while `DataPlaneCheckpoint` freezes immutable writable-root
-and guest-memory content at the same quiescent boundary. The durable manifest
-stores an implementation-neutral reference and digest instead of requiring
-`storage/rootfs.snap`; the management response omits that ownership record.
+On the provider-owned extension path, Blaze still stores backend artifacts
+under `backend/`, while `DataPlaneCheckpoint` freezes the complete immutable
+writable-root and guest-memory image at the same quiescent boundary. The durable
+manifest stores an implementation-neutral reference and digest instead of
+requiring `storage/rootfs.snap`; the management response omits that ownership
+record.
 
 A successful response contains the public management view of the published
 manifest. The existing
@@ -413,10 +416,12 @@ POST /v1/sandboxes/{id}/rollback/{checkpoint_id}
 
 Restore requires a verified full checkpoint, an exact match for the sandbox's
 policy, image, backend, and backend version, and a compatible backend restore
-adapter. A file-backed checkpoint also requires storage restore support. A
-provider-managed checkpoint requires `DataPlaneCheckpoint` from the matching
-provider instance. Unsupported combinations return HTTP 501 before stopping
-the current runtime.
+adapter. A checkpoint whose data plane was captured through
+`daemon_managed_storage` requires storage restore support, even when the active
+lease came from a build-time provider. Only a checkpoint containing a
+provider-owned immutable reference requires `DataPlaneCheckpoint` from the
+matching provider instance. Unsupported combinations return HTTP 501 before
+stopping the current runtime.
 
 Restoring a Firecracker sandbox replaces its virtual machine monitor with a new
 process that loads the captured memory and device state, so the process
@@ -476,9 +481,12 @@ to a consistent stop is delegated to the backend's quiesce-for-capture hook,
 whose default pauses the backend; a self-freezing backend overrides that hook
 and does not need separate pause support.
 
-A provider-backed sandbox additionally requires `DataPlaneSuspend`, a
-finalized active lease, and guest protocol version 1 with
-`prepare_hibernate`, `reseed_rng`, and `post_restore`.
+The data-plane path is again selected by the provider's declared integration
+mode. A provider-owned hibernation image requires `DataPlaneSuspend`, a
+finalized active lease, and guest protocol version 1 with `prepare_hibernate`,
+`reseed_rng`, and `post_restore`. A provider that declares
+`daemon_managed_storage` instead uses the configured storage provider and does
+not need the suspension extension.
 
 On the standard file path, a successful hibernate records intent, quiesces the
 backend for capture, writes
@@ -489,10 +497,11 @@ commits `Hibernated`. The published image is resolved through the retained
 sandbox directory descriptor, so a replaced or symlinked instance directory
 cannot redirect it.
 
-On the provider path, the provider freezes immutable writable-root and
-guest-memory content at the same quiescent boundary as the backend snapshot.
-After the backend stops, Blaze stops and releases the active lease; the
-hibernated sandbox retains the immutable suspension reference.
+On the provider-owned extension path, the provider freezes the complete
+immutable writable-root and guest-memory image at the same quiescent boundary
+as the backend snapshot. After the backend stops, Blaze stops and releases the
+active lease; the hibernated sandbox retains the immutable suspension
+reference.
 
 Resume verifies the manifest identity, the exact file set, and every artifact
 digest before it starts a replacement backend. Blaze takes ownership of that
@@ -514,13 +523,13 @@ be confirmed returns the sandbox to `Hibernated` so the request can be retried;
 when cleanup cannot be confirmed, the replacement owner and the operation
 journal are retained through `RecoveryRequired` for explicit destroy.
 
-The standard file path retains its storage slot while hibernated. The provider
-path retains no active lease; it preserves an immutable suspension reference
-and prepares a fresh lease for every resume. Both paths retain the latest
-resumable image or reference until the next hibernate replaces it or destroy
-removes it. After a daemon restart, a completed hibernation remains resumable,
-but an interrupted hibernate or resume is retained as `RecoveryRequired` and
-waits for explicit destroy.
+The daemon-managed path retains its storage slot while hibernated. The
+provider-owned extension path retains no active lease; it preserves an
+immutable suspension reference and prepares a fresh lease for every resume.
+Both paths retain the latest resumable image or reference until the next
+hibernate replaces it or destroy removes it. After a daemon restart, a
+completed hibernation remains resumable, but an interrupted hibernate or resume
+is retained as `RecoveryRequired` and waits for explicit destroy.
 
 ## Storage Artifact Synchronization
 

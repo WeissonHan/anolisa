@@ -6,14 +6,17 @@ use std::sync::Arc;
 
 use blaze_core::backend::{RestoreRequest, SnapshotKind};
 use blaze_core::checkpoint::{ProviderCheckpointRecord, validate_checkpoint_id};
-use blaze_core::lifecycle::{BackendOwnership, OperationPhase, SandboxInstance, SandboxState};
+use blaze_core::data_plane::{PendingProviderOperationKind, PendingProviderOperationRecord};
+use blaze_core::lifecycle::{
+    BackendOwnership, OperationPhase, ProviderLeaseSlot, ProviderTransitionKind, SandboxInstance,
+    SandboxState,
+};
 use blaze_core::storage::StorageRestoreTransaction;
 use blaze_provider_api::{
-    AbortRequest, FinalizeRequest, LeaseBinding, LeaseState, PreparedResources,
-    ProviderCheckpointRef, ProviderError, PublicTransitionRef, ReleaseRequest, RequestContext,
-    RestoreCheckpointRequest, StopRequest,
+    LeaseBinding, LeaseState, PreparedResources, ProviderCapabilities, ProviderCheckpointRef,
+    ProviderError, PublicTransitionRef, RequestContext, RestoreCheckpointRequest,
 };
-use blaze_provider_conformance::{validate_checkpoint_restore, validate_transition};
+use blaze_provider_conformance::validate_checkpoint_restore;
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
@@ -221,6 +224,16 @@ impl SandboxManager {
                 capability.snapshot_kind
             )));
         }
+        let data_plane_capabilities = self.data_plane.capabilities();
+        if target_metadata.provider_checkpoint.is_some()
+            && data_plane_capabilities.opened_checkpoint_restore_resources
+            && !capability.consumes_typed_opened_attachments
+        {
+            return Err(BlazeDaemonError::UnsupportedOperation(format!(
+                "checkpoint {} may use typed opened restore attachments, but backend {} cannot consume them",
+                request.checkpoint_id, target_metadata.backend
+            )));
+        }
         let expose_guest_socket = !current_backend.guest_socket_path().as_os_str().is_empty();
         // Probe the network shape while the captured owner is still alive: its
         // cleanup removes the host device the snapshot names, so the replacement
@@ -240,6 +253,7 @@ impl SandboxManager {
                     expose_guest_socket,
                     preserve_network,
                     record_console_log,
+                    data_plane_capabilities,
                 )
                 .await;
         }
@@ -563,6 +577,7 @@ impl SandboxManager {
         expose_guest_socket: bool,
         preserve_network: bool,
         record_console_log: bool,
+        data_plane_capabilities: ProviderCapabilities,
     ) -> Result<RestoreSandboxResult> {
         let id = instance.id;
         let provider = self.data_plane.checkpoints().ok_or_else(|| {
@@ -577,7 +592,7 @@ impl SandboxManager {
                 "instance {id} has no durable provider lease"
             ))
         })?;
-        let mut current_binding = LeaseBinding::from_record(id, current_record);
+        let current_binding = LeaseBinding::from_record(id, current_record);
         if provider_record.provider_instance_id != descriptor.provider_instance_id
             || current_binding.provider_instance_id != descriptor.provider_instance_id
             || current_binding.state != LeaseState::Finalized
@@ -599,6 +614,14 @@ impl SandboxManager {
         let guest_memory_bytes = current_record.guest_memory_bytes;
 
         instance.begin_restore_operation(request.checkpoint_id.clone())?;
+        instance.begin_provider_operation(PendingProviderOperationRecord {
+            provider_instance_id: descriptor.provider_instance_id,
+            context: context.into(),
+            generation_before_call: 0,
+            root_filesystem_bytes,
+            guest_memory_bytes,
+            kind: PendingProviderOperationKind::PrepareLease,
+        })?;
         crate::failpoint::state("restore-provider-begin-state")
             .and_then(|_| self.persist_and_retain(instance.clone()))?;
 
@@ -608,25 +631,16 @@ impl SandboxManager {
             root_filesystem_bytes,
             guest_memory_bytes,
         };
-        let prepared = match provider.restore_checkpoint(provider_request.clone()).await {
-            Err(ProviderError::OutcomeUnknown) => {
-                let recovery = self.mark_instance_recovery(instance).err();
-                return Err(BlazeDaemonError::RecoveryRequired(format!(
-                    "checkpoint {} replacement lease outcome is unknown{}",
-                    request.checkpoint_id,
-                    recovery
-                        .map(|error| format!("; recovery state persistence failed: {error}"))
-                        .unwrap_or_default()
-                )));
-            }
+        let prepared = match provider.restore_checkpoint(provider_request).await {
             Err(error) => {
-                instance.finish_operation();
-                self.persist_and_retain(instance)?;
-                return Err(error.into());
+                return Err(self
+                    .finish_failed_provider_restore_prepare(instance, error.into())
+                    .await);
             }
             Ok(prepared) => prepared,
         };
         if validate_checkpoint_restore(
+            data_plane_capabilities,
             context,
             &checkpoint,
             root_filesystem_bytes,
@@ -635,28 +649,26 @@ impl SandboxManager {
         )
         .is_err()
         {
-            let recovery = self.mark_instance_recovery(instance).err();
-            return Err(BlazeDaemonError::RecoveryRequired(format!(
-                "checkpoint {} provider returned an invalid replacement lease{}",
-                request.checkpoint_id,
-                recovery
-                    .map(|error| format!("; recovery state persistence failed: {error}"))
-                    .unwrap_or_default()
-            )));
+            return Err(self
+                .finish_failed_provider_restore_prepare(
+                    instance,
+                    BlazeDaemonError::DataPlane(ProviderError::InvalidResponse),
+                )
+                .await);
         }
         let mut replacement_binding = prepared.binding;
         if let Err(error) = instance.advance_restore_phase(OperationPhase::RestoreStorageStaged) {
             return Err(self
-                .abort_provider_restore_before_stop(instance, replacement_binding, error.into())
+                .finish_failed_provider_restore_prepare(instance, error.into())
                 .await);
         }
-        if let Err(error) = self.persist_replacement_data_plane_binding(
+        if let Err(error) = self.accept_prepared_replacement_data_plane_binding(
             &mut instance,
             replacement_binding,
-            Some((root_filesystem_bytes, guest_memory_bytes)),
+            (root_filesystem_bytes, guest_memory_bytes),
         ) {
             return Err(self
-                .abort_provider_restore_before_stop(instance, replacement_binding, error)
+                .finish_failed_provider_restore_prepare(instance, error)
                 .await);
         }
         let (replacement_storage, replacement_attachments) = match prepared.resources {
@@ -669,24 +681,28 @@ impl SandboxManager {
 
         if let Err(error) = current_backend.kill().await {
             instance.backend_ownership = BackendOwnership::Unknown;
-            return Err(self
-                .fail_provider_restore_after_stop(
-                    instance,
-                    Some(replacement_binding),
-                    format!("current backend termination failed: {error}"),
-                )
-                .await);
+            let recovery = self.mark_instance_recovery(instance).err();
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "restore {id}: current backend termination failed: {error}; current owner and \
+                 replacement provider lease retained{}",
+                recovery
+                    .map(|error| format!("; recovery state persistence failed: {error}"))
+                    .unwrap_or_default()
+            )));
         }
         instance.backend_ownership = BackendOwnership::Stopped;
         instance.backend_runtime = None;
-        let stopped = match self
-            .data_plane
-            .stop(StopRequest {
-                binding: current_binding,
-            })
+        match self
+            .transition_data_plane(
+                &mut instance,
+                ProviderLeaseSlot::Active,
+                ProviderTransitionKind::Stop,
+                None,
+                None,
+            )
             .await
         {
-            Ok(stopped) => stopped,
+            Ok(_) => {}
             Err(error) => {
                 self.remove_backend_owner(id);
                 return Err(self
@@ -697,18 +713,7 @@ impl SandboxManager {
                     )
                     .await);
             }
-        };
-        if validate_transition(current_binding, stopped.binding, LeaseState::Stopped).is_err() {
-            self.remove_backend_owner(id);
-            return Err(self
-                .fail_provider_restore_after_stop(
-                    instance,
-                    Some(replacement_binding),
-                    "provider returned an invalid stopped lease",
-                )
-                .await);
         }
-        current_binding = stopped.binding;
         if let Err(error) = instance
             .advance_restore_phase(OperationPhase::RestoreBackendStopped)
             .and_then(|_| instance.transition(SandboxState::Restoring))
@@ -722,7 +727,7 @@ impl SandboxManager {
                 )
                 .await);
         }
-        if let Err(error) = self.persist_data_plane_binding(&mut instance, current_binding, None) {
+        if let Err(error) = self.persist_and_retain(instance.clone()) {
             self.remove_backend_owner(id);
             return Err(self
                 .fail_provider_restore_after_stop(
@@ -770,6 +775,7 @@ impl SandboxManager {
         }
         instance.backend_ownership = BackendOwnership::Starting;
         if let Err(error) = self.persist_and_retain(instance.clone()) {
+            instance.backend_ownership = BackendOwnership::Stopped;
             return Err(self
                 .fail_provider_restore_after_stop(
                     instance,
@@ -819,38 +825,45 @@ impl SandboxManager {
             Ok(restored) => restored,
             Err(error) => {
                 let (source, owner) = error.into_parts();
+                let mut retention = None;
                 if let Some(owner) = owner {
-                    let _ = owner.kill().await;
+                    instance.backend_ownership = BackendOwnership::Unknown;
+                    instance.backend_runtime = Some(owner.runtime_record());
+                    retention = self.retain_backend(id, owner);
+                } else {
+                    instance.backend_ownership = BackendOwnership::Stopped;
                 }
-                instance.backend_ownership = BackendOwnership::Stopped;
                 return Err(self
                     .fail_provider_restore_after_stop(
                         instance,
                         Some(replacement_binding),
-                        format!("replacement backend start failed: {source}"),
+                        format!(
+                            "replacement backend start failed: {source}{}",
+                            retention
+                                .map(|error| format!("; {error}"))
+                                .unwrap_or_default()
+                        ),
                     )
                     .await);
             }
         };
         instance.backend_ownership = BackendOwnership::Running;
         instance.backend_runtime = Some(restored.runtime_record());
+        if let Some(error) = self.retain_backend(id, restored.clone()) {
+            return Err(self
+                .fail_provider_restore_after_stop(instance, Some(replacement_binding), error)
+                .await);
+        }
         if restored.instance_id() != id
             || restored.backend() != target.metadata().backend
             || restored.version().map(str::to_string) != target.metadata().backend_version
         {
-            let _ = restored.kill().await;
             return Err(self
                 .fail_provider_restore_after_stop(
                     instance,
                     Some(replacement_binding),
                     "replacement backend identity does not match the checkpoint",
                 )
-                .await);
-        }
-        if let Some(error) = self.retain_backend(id, restored.clone()) {
-            let _ = restored.kill().await;
-            return Err(self
-                .fail_provider_restore_after_stop(instance, Some(replacement_binding), error)
                 .await);
         }
         if let Err(error) = self
@@ -879,7 +892,16 @@ impl SandboxManager {
                 .await);
         }
 
-        replacement_binding = match self.commit_data_plane(replacement_binding).await {
+        replacement_binding = match self
+            .transition_data_plane(
+                &mut instance,
+                ProviderLeaseSlot::Replacement,
+                ProviderTransitionKind::Commit,
+                None,
+                None,
+            )
+            .await
+        {
             Ok(binding) => binding,
             Err(error) => {
                 return Err(self
@@ -891,17 +913,6 @@ impl SandboxManager {
                     .await);
             }
         };
-        if let Err(error) =
-            self.persist_replacement_data_plane_binding(&mut instance, replacement_binding, None)
-        {
-            return Err(self
-                .fail_provider_restore_after_stop(
-                    instance,
-                    Some(replacement_binding),
-                    format!("replacement provider commit could not be persisted: {error}"),
-                )
-                .await);
-        }
 
         let checkpoints = self.checkpoints.clone();
         let head_updated = crate::failpoint::spawn_blocking(move || {
@@ -938,34 +949,27 @@ impl SandboxManager {
                 .await);
         }
 
-        let released = match self
-            .data_plane
-            .release(ReleaseRequest {
-                binding: current_binding,
-            })
+        match self
+            .transition_data_plane(
+                &mut instance,
+                ProviderLeaseSlot::Active,
+                ProviderTransitionKind::Release,
+                None,
+                None,
+            )
             .await
         {
-            Ok(released) => released,
+            Ok(_) => {}
             Err(error) => {
                 return Err(self.fail_after_restore_stop(
                     instance,
                     format!("replaced provider lease release failed: {error}"),
                 ));
             }
-        };
-        if validate_transition(current_binding, released.binding, LeaseState::Released).is_err() {
-            return Err(self.fail_after_restore_stop(
-                instance,
-                "provider returned an invalid released predecessor lease",
-            ));
         }
-        if let Err(error) = self
-            .persist_data_plane_binding(&mut instance, released.binding, None)
-            .and_then(|_| {
-                instance
-                    .advance_restore_phase(OperationPhase::RestoreStorageCommitted)
-                    .map_err(BlazeDaemonError::from)
-            })
+        if let Err(error) = instance
+            .advance_restore_phase(OperationPhase::RestoreStorageCommitted)
+            .map_err(BlazeDaemonError::from)
             .and_then(|_| self.persist_and_retain(instance.clone()))
         {
             return Err(self
@@ -1007,32 +1011,20 @@ impl SandboxManager {
             )));
         }
 
-        let finalized = provider
-            .finalize(FinalizeRequest {
-                binding: replacement_binding,
-                public_transition: PublicTransitionRef {
+        let finalized = match self
+            .transition_data_plane(
+                &mut instance,
+                ProviderLeaseSlot::Active,
+                ProviderTransitionKind::Finalize,
+                Some(PublicTransitionRef {
                     instance_id: id,
                     operation_id: replacement_binding.context.operation_id,
-                },
-            })
-            .await;
-        let finalized = match finalized {
-            Ok(finalized)
-                if validate_transition(
-                    replacement_binding,
-                    finalized.binding,
-                    LeaseState::Finalized,
-                )
-                .is_ok() =>
-            {
-                finalized.binding
-            }
-            Ok(_) => {
-                self.mark_recovery(id)?;
-                return Err(BlazeDaemonError::RecoveryRequired(format!(
-                    "restore {id}: provider finalize returned an invalid transition"
-                )));
-            }
+                }),
+                None,
+            )
+            .await
+        {
+            Ok(finalized) => finalized,
             Err(error) => {
                 self.mark_recovery(id)?;
                 return Err(BlazeDaemonError::RecoveryRequired(format!(
@@ -1040,43 +1032,28 @@ impl SandboxManager {
                 )));
             }
         };
-        if let Err(error) = self.persist_data_plane_binding(&mut instance, finalized, None) {
-            self.mark_recovery(id)?;
-            return Err(BlazeDaemonError::RecoveryRequired(format!(
-                "restore {id}: finalized provider lease could not be persisted: {error}"
-            )));
-        }
+        debug_assert_eq!(finalized.state, LeaseState::Finalized);
         Ok(RestoreSandboxResult {
             instance,
             checkpoint_id: request.checkpoint_id,
         })
     }
 
-    async fn abort_provider_restore_before_stop(
+    pub(super) async fn finish_failed_provider_restore_prepare(
         &self,
         mut instance: SandboxInstance,
-        binding: LeaseBinding,
         original: BlazeDaemonError,
     ) -> BlazeDaemonError {
-        let aborted = self.data_plane.abort(AbortRequest { binding }).await;
-        match aborted {
-            Ok(aborted)
-                if validate_transition(binding, aborted.binding, LeaseState::Released).is_ok() =>
-            {
-                instance.replacement_data_plane_lease = None;
-                instance.finish_operation();
-                match self.persist_and_retain(instance) {
-                    Ok(()) => original,
-                    Err(error) => BlazeDaemonError::RecoveryRequired(format!(
-                        "{original}; replacement cleanup state commit failed: {error}"
-                    )),
-                }
-            }
-            Ok(_) => BlazeDaemonError::RecoveryRequired(format!(
-                "{original}; provider returned an invalid replacement abort"
-            )),
+        if let Err(error) = self.settle_pending_provider_prepare(&mut instance).await {
+            return BlazeDaemonError::RecoveryRequired(format!(
+                "{original}; replacement provider preparation did not converge: {error}"
+            ));
+        }
+        instance.finish_operation();
+        match self.persist_and_retain(instance) {
+            Ok(()) => original,
             Err(error) => BlazeDaemonError::RecoveryRequired(format!(
-                "{original}; replacement provider abort failed: {error}"
+                "{original}; replacement preparation compensation could not be persisted: {error}"
             )),
         }
     }
@@ -1088,21 +1065,80 @@ impl SandboxManager {
         cause: impl std::fmt::Display,
     ) -> BlazeDaemonError {
         let id = instance.id;
-        let backend_cleanup = match self.remove_backend_owner(id) {
-            Some(owner) => owner.kill().await.err(),
-            None => None,
-        };
-        let replacement_cleanup = if let Some(binding) = replacement {
-            match self.data_plane.abort(AbortRequest { binding }).await {
-                Ok(aborted)
-                    if validate_transition(binding, aborted.binding, LeaseState::Released)
-                        .is_ok() =>
-                {
-                    instance.replacement_data_plane_lease = None;
-                    None
+        match self.remove_backend_owner(id) {
+            Some(owner) => {
+                if let Err(error) = owner.kill().await {
+                    // The backend may still access the replacement resources.
+                    // Keep the owner and provider lease until a later cleanup proves termination.
+                    let retention = self.retain_backend(id, owner);
+                    instance.backend_ownership = BackendOwnership::Unknown;
+                    let recovery = self.mark_instance_recovery(instance).err();
+                    return BlazeDaemonError::RecoveryRequired(format!(
+                        "restore {id}: {cause}; replacement backend cleanup failed: {error}; \
+                         replacement provider lease retained{}{}",
+                        retention
+                            .map(|error| format!("; {error}"))
+                            .unwrap_or_default(),
+                        recovery
+                            .map(|error| {
+                                format!("; recovery state persistence failed: {error}")
+                            })
+                            .unwrap_or_default()
+                    ));
                 }
-                Ok(_) => Some("provider returned an invalid replacement abort".to_string()),
-                Err(error) => Some(format!("replacement provider abort failed: {error}")),
+            }
+            None if matches!(
+                instance.backend_ownership,
+                BackendOwnership::Starting | BackendOwnership::Running | BackendOwnership::Unknown
+            ) =>
+            {
+                instance.backend_ownership = BackendOwnership::Unknown;
+                let recovery = self.mark_instance_recovery(instance).err();
+                return BlazeDaemonError::RecoveryRequired(format!(
+                    "restore {id}: {cause}; replacement backend owner is unavailable; \
+                     replacement provider lease retained{}",
+                    recovery
+                        .map(|error| format!("; recovery state persistence failed: {error}"))
+                        .unwrap_or_default()
+                ));
+            }
+            None => {}
+        }
+        if instance.provider_transition.is_some() {
+            let recovery = self.mark_instance_recovery(instance).err();
+            return BlazeDaemonError::RecoveryRequired(format!(
+                "restore {id}: {cause}; provider transition outcome is unresolved and its WAL was retained{}",
+                recovery
+                    .map(|error| format!("; recovery state persistence failed: {error}"))
+                    .unwrap_or_default()
+            ));
+        }
+        let replacement_cleanup = if let Some(binding) = replacement {
+            if instance
+                .replacement_data_plane_lease
+                .is_some_and(|record| LeaseBinding::from_record(id, record) == binding)
+            {
+                match self
+                    .transition_data_plane(
+                        &mut instance,
+                        ProviderLeaseSlot::Replacement,
+                        ProviderTransitionKind::Abort,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        instance.replacement_data_plane_lease = None;
+                        None
+                    }
+                    Err(error) => Some(format!("replacement provider abort failed: {error}")),
+                }
+            } else {
+                Some(
+                    "replacement provider abort identity does not match its durable lease"
+                        .to_string(),
+                )
             }
         } else {
             None
@@ -1111,10 +1147,7 @@ impl SandboxManager {
         instance.backend_runtime = None;
         let recovery = self.mark_instance_recovery(instance).err();
         BlazeDaemonError::RecoveryRequired(format!(
-            "restore {id}: {cause}; resources retained{}{}{}",
-            backend_cleanup
-                .map(|error| format!("; replacement backend cleanup failed: {error}"))
-                .unwrap_or_default(),
+            "restore {id}: {cause}; resources retained{}{}",
             replacement_cleanup
                 .map(|error| format!("; {error}"))
                 .unwrap_or_default(),
