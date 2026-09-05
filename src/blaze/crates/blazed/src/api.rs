@@ -813,13 +813,14 @@ mod tests {
     use blaze_provider_api::{
         AbortRequest, AbortResult, BeginInventoryRequest, CheckpointSubmission, CommitRequest,
         CommittedLease, DataPlaneCheckpoint, DataPlaneInventory, DataPlaneProvider,
-        FinalizeRequest, FinalizedLease, InspectRequest, InventoryLease, InventoryPage,
-        InventoryPageRequest, InventorySnapshot, LeaseBinding, LeaseState, ObservedLease,
-        PrepareRequest, PreparedLease, PreparedResources, ProviderCapabilities,
+        DataPlaneSuspend, FinalizeRequest, FinalizedLease, InspectRequest, InventoryLease,
+        InventoryPage, InventoryPageRequest, InventorySnapshot, LeaseBinding, LeaseState,
+        ObservedLease, PrepareRequest, PreparedLease, PreparedResources, ProviderCapabilities,
         ProviderCheckpointRef, ProviderCheckpointRequest, ProviderDescriptor, ProviderError,
-        ReconcileAction, ReconcileRequest, ReconcileResult, ReleaseRequest, ReleaseResult,
-        RestoreCheckpointRequest, RetireCheckpointRequest, RetireCheckpointResult, StopRequest,
-        StoppedLease,
+        ProviderSuspensionRef, ReconcileAction, ReconcileRequest, ReconcileResult, ReleaseRequest,
+        ReleaseResult, RestoreCheckpointRequest, ResumeRequest as ProviderResumeRequest,
+        RetireCheckpointRequest, RetireCheckpointResult, RetireSuspensionRequest,
+        RetireSuspensionResult, StopRequest, StoppedLease, SuspendRequest, SuspensionSubmission,
     };
     use sha2::{Digest, Sha256};
 
@@ -1699,6 +1700,8 @@ mod tests {
         snapshot_id: Uuid,
         bindings: std::sync::Mutex<HashMap<Uuid, LeaseBinding>>,
         checkpoints: std::sync::Mutex<HashMap<Uuid, ProviderCheckpointRef>>,
+        suspensions: std::sync::Mutex<HashMap<Uuid, ProviderSuspensionRef>>,
+        extents: std::sync::Mutex<HashMap<Uuid, (u64, u64)>>,
     }
 
     impl InventoryTestProvider {
@@ -1708,6 +1711,8 @@ mod tests {
                 snapshot_id: Uuid::new_v4(),
                 bindings: std::sync::Mutex::new(HashMap::new()),
                 checkpoints: std::sync::Mutex::new(HashMap::new()),
+                suspensions: std::sync::Mutex::new(HashMap::new()),
+                extents: std::sync::Mutex::new(HashMap::new()),
             }
         }
 
@@ -1728,6 +1733,10 @@ mod tests {
 
         fn checkpoint_count(&self) -> usize {
             self.checkpoints.lock().expect("provider checkpoints").len()
+        }
+
+        fn suspension_count(&self) -> usize {
+            self.suspensions.lock().expect("provider suspensions").len()
         }
 
         fn transition(
@@ -1772,6 +1781,10 @@ mod tests {
             Some(self)
         }
 
+        fn suspension(&self) -> Option<&dyn DataPlaneSuspend> {
+            Some(self)
+        }
+
         async fn probe(&self) -> std::result::Result<(), ProviderError> {
             self.inner.probe().await
         }
@@ -1780,8 +1793,14 @@ mod tests {
             &self,
             request: PrepareRequest,
         ) -> std::result::Result<PreparedLease, ProviderError> {
+            let lease_id = request.context.lease_id;
+            let extents = (request.root_filesystem_bytes, request.guest_memory_bytes);
             let prepared = self.inner.prepare(request).await?;
             self.record(prepared.binding);
+            self.extents
+                .lock()
+                .expect("provider extents")
+                .insert(lease_id, extents);
             Ok(prepared)
         }
 
@@ -1817,9 +1836,12 @@ mod tests {
             &self,
             request: AbortRequest,
         ) -> std::result::Result<AbortResult, ProviderError> {
-            Ok(AbortResult {
-                binding: self.transition(request.binding, LeaseState::Released, true)?,
-            })
+            let binding = self.transition(request.binding, LeaseState::Released, true)?;
+            self.extents
+                .lock()
+                .expect("provider extents")
+                .remove(&binding.context.lease_id);
+            Ok(AbortResult { binding })
         }
 
         async fn stop(
@@ -1835,9 +1857,12 @@ mod tests {
             &self,
             request: ReleaseRequest,
         ) -> std::result::Result<ReleaseResult, ProviderError> {
-            Ok(ReleaseResult {
-                binding: self.transition(request.binding, LeaseState::Released, true)?,
-            })
+            let binding = self.transition(request.binding, LeaseState::Released, true)?;
+            self.extents
+                .lock()
+                .expect("provider extents")
+                .remove(&binding.context.lease_id);
+            Ok(ReleaseResult { binding })
         }
     }
 
@@ -1965,6 +1990,10 @@ mod tests {
                 state: LeaseState::Prepared,
             };
             self.record(binding);
+            self.extents.lock().expect("provider extents").insert(
+                binding.context.lease_id,
+                (request.root_filesystem_bytes, request.guest_memory_bytes),
+            );
             let id = request.context.instance_id.to_string();
             Ok(PreparedLease {
                 binding,
@@ -2006,6 +2035,122 @@ mod tests {
             let retired = checkpoints.remove(&request.public_checkpoint_id);
             Ok(RetireCheckpointResult {
                 public_checkpoint_id: request.public_checkpoint_id,
+                reference_id: request.reference_id,
+                retired: retired.is_some(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DataPlaneSuspend for InventoryTestProvider {
+        async fn suspend(
+            &self,
+            request: SuspendRequest,
+        ) -> std::result::Result<SuspensionSubmission, ProviderError> {
+            if request.binding.state != LeaseState::Finalized
+                || self.binding(request.binding.context.lease_id) != Some(request.binding)
+                || request.suspension_id.is_nil()
+                || self
+                    .extents
+                    .lock()
+                    .expect("provider extents")
+                    .get(&request.binding.context.lease_id)
+                    != Some(&(request.root_filesystem_bytes, request.guest_memory_bytes))
+            {
+                return Err(ProviderError::Conflict);
+            }
+            let binding = self.transition(request.binding, LeaseState::Finalized, false)?;
+            let suspension = ProviderSuspensionRef {
+                provider_instance_id: binding.provider_instance_id,
+                suspension_id: request.suspension_id,
+                reference_id: Uuid::new_v4(),
+                content_digest: format!(
+                    "sha256:{:x}",
+                    Sha256::digest(request.suspension_id.as_bytes())
+                ),
+                source_lease_id: binding.context.lease_id,
+                source_generation: binding.generation,
+                root_filesystem: true,
+                guest_memory: true,
+                root_filesystem_bytes: request.root_filesystem_bytes,
+                guest_memory_bytes: request.guest_memory_bytes,
+            };
+            self.suspensions
+                .lock()
+                .expect("provider suspensions")
+                .insert(request.suspension_id, suspension.clone());
+            Ok(SuspensionSubmission {
+                binding,
+                suspension,
+            })
+        }
+
+        async fn resume(
+            &self,
+            request: ProviderResumeRequest,
+        ) -> std::result::Result<PreparedLease, ProviderError> {
+            if self
+                .suspensions
+                .lock()
+                .expect("provider suspensions")
+                .get(&request.suspension.suspension_id)
+                != Some(&request.suspension)
+                || request.root_filesystem_bytes != request.suspension.root_filesystem_bytes
+                || request.guest_memory_bytes != request.suspension.guest_memory_bytes
+            {
+                return Err(ProviderError::Conflict);
+            }
+            let binding = LeaseBinding {
+                provider_instance_id: self.descriptor().provider_instance_id,
+                context: request.context,
+                generation: request.context.generation,
+                state: LeaseState::Prepared,
+            };
+            self.record(binding);
+            self.extents.lock().expect("provider extents").insert(
+                binding.context.lease_id,
+                (request.root_filesystem_bytes, request.guest_memory_bytes),
+            );
+            Ok(PreparedLease {
+                binding,
+                resources: PreparedResources::SuspensionRestore {
+                    storage: Some(StorageSlot {
+                        id: request.context.instance_id.to_string(),
+                        rootfs_path: PathBuf::new(),
+                        mem_path: PathBuf::new(),
+                        mem_diff_path: PathBuf::new(),
+                        rootfs_diff_path: PathBuf::new(),
+                        instance_dir: PathBuf::new(),
+                    }),
+                    attachments: Vec::new(),
+                },
+            })
+        }
+
+        async fn retire_suspension(
+            &self,
+            request: RetireSuspensionRequest,
+        ) -> std::result::Result<RetireSuspensionResult, ProviderError> {
+            if request.provider_instance_id != self.descriptor().provider_instance_id
+                || request.suspension_id.is_nil()
+                || request
+                    .reference_id
+                    .is_some_and(|reference_id| reference_id.is_nil())
+                || request.operation_id.is_nil()
+            {
+                return Err(ProviderError::Conflict);
+            }
+            let mut suspensions = self.suspensions.lock().expect("provider suspensions");
+            if let (Some(expected), Some(actual)) = (
+                request.reference_id,
+                suspensions.get(&request.suspension_id),
+            ) && expected != actual.reference_id
+            {
+                return Err(ProviderError::Conflict);
+            }
+            let retired = suspensions.remove(&request.suspension_id);
+            Ok(RetireSuspensionResult {
+                suspension_id: request.suspension_id,
                 reference_id: request.reference_id,
                 retired: retired.is_some(),
             })
@@ -3641,6 +3786,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hibernate_rejects_unmanaged_storage_without_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(ManagedStorageToggleProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(GuestMockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        let state_path = configured_state_dir(&state).join(id).join("state.json");
+        let persisted_before = std::fs::read(&state_path).expect("persisted state");
+        let owner = state.manager.backend_owner(uuid).expect("backend owner");
+        provider.set_daemon_managed_storage(false);
+
+        let error = state
+            .manager
+            .hibernate(
+                uuid,
+                HibernateSandbox {
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect_err("unmanaged storage must not use the standard hibernation path");
+
+        assert!(matches!(error, BlazeDaemonError::UnsupportedOperation(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("does not use daemon-managed storage for hibernation")
+        );
+        let lifecycle = state.manager.get(uuid).expect("lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::Running);
+        assert!(lifecycle.operation.is_none());
+        assert_eq!(
+            std::fs::read(state_path).expect("persisted state"),
+            persisted_before
+        );
+        let retained = state.manager.backend_owner(uuid).expect("retained backend");
+        assert!(Arc::ptr_eq(&owner, &retained));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_unmanaged_storage_without_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(ManagedStorageToggleProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(GuestMockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        state
+            .manager
+            .hibernate(
+                uuid,
+                HibernateSandbox {
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect("standard hibernation");
+        let state_path = configured_state_dir(&state).join(id).join("state.json");
+        let persisted_before = std::fs::read(&state_path).expect("persisted state");
+        provider.set_daemon_managed_storage(false);
+
+        let error = state
+            .manager
+            .resume(
+                uuid,
+                ResumeSandbox {
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect_err("unmanaged storage must not use the standard resume path");
+
+        assert!(matches!(error, BlazeDaemonError::UnsupportedOperation(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("does not use daemon-managed storage for resume")
+        );
+        let lifecycle = state.manager.get(uuid).expect("lifecycle");
+        assert_eq!(lifecycle.state, SandboxState::Hibernated);
+        assert!(lifecycle.operation.is_none());
+        assert_eq!(
+            std::fs::read(state_path).expect("persisted state"),
+            persisted_before
+        );
+        assert!(state.manager.backend_owner(uuid).is_none());
+    }
+
+    #[tokio::test]
     async fn hibernate_releases_the_backend_and_resume_survives_restart() {
         let temp = tempfile::tempdir().expect("temp");
         let config = test_config(&temp);
@@ -3741,6 +4000,266 @@ mod tests {
         );
         assert!(restarted.manager.destroy(uuid).await.expect("destroy"));
         assert!(!hibernate_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn provider_hibernation_releases_active_lease_and_resumes_with_a_fresh_lease() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config.clone(),
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(GuestMockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        let original_lease = state
+            .manager
+            .get(uuid)
+            .expect("created lifecycle")
+            .data_plane_lease
+            .expect("created provider lease")
+            .lease_id;
+
+        let hibernated = state
+            .manager
+            .hibernate(
+                uuid,
+                HibernateSandbox {
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect("provider hibernate");
+        assert_eq!(hibernated.state, SandboxState::Hibernated);
+        assert_eq!(hibernated.backend_ownership, BackendOwnership::Stopped);
+        assert!(hibernated.data_plane_lease.is_none());
+        let suspension = hibernated
+            .provider_suspension
+            .clone()
+            .expect("durable provider suspension");
+        assert_eq!(provider.suspension_count(), 1);
+        assert!(provider.binding(original_lease).is_none());
+        drop(state);
+
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let restarted = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(GuestMockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let report = restarted
+            .manager
+            .reconcile_startup()
+            .await
+            .expect("restart reconciliation");
+        assert_eq!(report.attempted, 0);
+        assert!(report.failures.is_empty());
+
+        let resumed = restarted
+            .manager
+            .resume(
+                uuid,
+                ResumeSandbox {
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect("provider resume");
+        assert_eq!(resumed.state, SandboxState::Running);
+        assert_eq!(resumed.provider_suspension, Some(suspension));
+        let resumed_lease = resumed.data_plane_lease.expect("fresh provider lease");
+        assert_ne!(resumed_lease.lease_id, original_lease);
+        assert_eq!(
+            resumed_lease.state,
+            blaze_core::data_plane::DataPlaneLeaseState::Finalized
+        );
+        assert_eq!(provider.suspension_count(), 1);
+
+        assert!(restarted.manager.destroy(uuid).await.expect("destroy"));
+        assert_eq!(provider.suspension_count(), 0);
+        let destroyed = restarted.manager.get(uuid).expect("destroyed lifecycle");
+        assert!(destroyed.data_plane_lease.is_none());
+        assert!(destroyed.provider_suspension.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_suspension_stays_out_of_hibernate_and_resume_responses() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(GuestMockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let (status, created) =
+            dispatched_json(&state, Method::POST, "/v1/sandboxes", test_request()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["instance"]["id"].as_str().expect("sandbox id");
+        let uuid = Uuid::parse_str(id).expect("sandbox UUID");
+        let item = format!("/v1/sandboxes/{id}");
+
+        let (status, hibernated) = dispatched_json(
+            &state,
+            Method::POST,
+            &format!("{item}/hibernate"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hibernated["state"], "hibernated");
+        assert_sandbox_management_shape(&hibernated);
+        assert!(
+            state
+                .manager
+                .get(uuid)
+                .expect("durable hibernated sandbox")
+                .provider_suspension
+                .is_some(),
+            "the test must cover a durable provider suspension"
+        );
+        assert_eq!(provider.suspension_count(), 1);
+
+        let (status, resumed) =
+            dispatched_json(&state, Method::POST, &format!("{item}/resume"), Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resumed["state"], "running");
+        assert_sandbox_management_shape(&resumed);
+
+        state.manager.destroy(uuid).await.expect("destroy sandbox");
+        assert_eq!(provider.suspension_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_hibernation_requires_guest_hooks_before_provider_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        let before = state.manager.get(uuid).expect("created lifecycle");
+
+        let error = state
+            .manager
+            .hibernate(
+                uuid,
+                HibernateSandbox {
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect_err("guest transport is mandatory");
+
+        assert!(matches!(error, BlazeDaemonError::UnsupportedOperation(_)));
+        let after = state.manager.get(uuid).expect("retained lifecycle");
+        assert_eq!(after.state, SandboxState::Running);
+        assert_eq!(after.operation, None);
+        assert_eq!(after.data_plane_lease, before.data_plane_lease);
+        assert_eq!(provider.suspension_count(), 0);
+        assert!(state.manager.backend_owner(uuid).is_some());
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn provider_resume_start_failure_preserves_immutable_content_for_retry() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            config.storage.instances_dir.clone(),
+        ));
+        let provider = Arc::new(InventoryTestProvider::new(storage.clone()));
+        let state = build_test_state_with_provider(
+            config,
+            test_policy(BackendKind::Mock),
+            spawners(BackendKind::Mock, Arc::new(GuestMockSpawner)),
+            BackendKind::Mock,
+            storage,
+            provider.clone(),
+        );
+        let created = created_json(&state, &test_request()).await;
+        let id = created["instance"]["id"].as_str().expect("id");
+        let uuid = Uuid::parse_str(id).expect("uuid");
+        let hibernated = state
+            .manager
+            .hibernate(
+                uuid,
+                HibernateSandbox {
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect("hibernate");
+        let suspension = hibernated
+            .provider_suspension
+            .clone()
+            .expect("provider suspension");
+        let hook = crate::failpoint::TestFailpoint::new(&["resume-backend-start"]);
+
+        hook.run(state.manager.resume(
+            uuid,
+            ResumeSandbox {
+                binary_path: PathBuf::new(),
+            },
+        ))
+        .await
+        .expect_err("resume start failure");
+
+        let retained = state.manager.get(uuid).expect("retained hibernation");
+        assert_eq!(retained.state, SandboxState::Hibernated);
+        assert_eq!(retained.provider_suspension, Some(suspension));
+        assert!(retained.data_plane_lease.is_none());
+        assert!(retained.replacement_data_plane_lease.is_none());
+        assert_eq!(provider.suspension_count(), 1);
+        assert!(state.manager.backend_owner(uuid).is_none());
+
+        let resumed = state
+            .manager
+            .resume(
+                uuid,
+                ResumeSandbox {
+                    binary_path: PathBuf::new(),
+                },
+            )
+            .await
+            .expect("retry resume");
+        assert_eq!(resumed.state, SandboxState::Running);
     }
 
     #[tokio::test]
@@ -7964,12 +8483,16 @@ mod tests {
         let acquire_hook = crate::failpoint::TestFailpoint::new(&[
             "storage-acquire-artifacts",
             "storage-acquire-rollback",
+            "storage-release",
         ]);
         let error = acquire_hook
             .run(create_sandbox(&state, &test_request()))
             .await
             .expect_err("residual slot must require recovery");
-        assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
+        assert!(
+            matches!(error, BlazeDaemonError::RecoveryRequired(_)),
+            "unexpected create failure: {error:?}"
+        );
 
         let instance = state
             .instances

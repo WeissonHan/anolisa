@@ -14,8 +14,8 @@ use blaze_provider_api::{
     DataPlaneProvider, FinalizeRequest, InspectRequest, InventorySnapshot, LeaseBinding,
     LeaseState, PROVIDER_CONTRACT_VERSION, PrepareRequest, PrepareSource, PreparedLease,
     PreparedResources, ProviderCheckpointRef, ProviderDescriptor, ProviderError,
-    PublicTransitionRef, ReconcileAction, ReleaseRequest, RequestContext, RetireCheckpointResult,
-    StopRequest,
+    ProviderSuspensionRef, PublicTransitionRef, ReconcileAction, ReleaseRequest, RequestContext,
+    RetireCheckpointResult, RetireSuspensionResult, StopRequest, SuspensionSubmission,
 };
 use thiserror::Error;
 
@@ -40,6 +40,9 @@ pub enum ConformanceError {
     /// Checkpoint identity, lineage, or provider content is invalid.
     #[error("provider checkpoint response is invalid")]
     InvalidCheckpoint,
+    /// Suspension identity or provider content is invalid.
+    #[error("provider suspension response is invalid")]
+    InvalidSuspension,
 }
 
 /// Failure reported by the reusable create-and-delete contract exercise.
@@ -93,7 +96,8 @@ pub fn validate_prepared(
             }
             validate_opened_attachments(attachments, root_filesystem_bytes, guest_memory_bytes)?;
         }
-        PreparedResources::CheckpointRestore { .. } => {
+        PreparedResources::CheckpointRestore { .. }
+        | PreparedResources::SuspensionRestore { .. } => {
             return Err(ConformanceError::InvalidResources);
         }
     }
@@ -291,6 +295,99 @@ pub fn validate_checkpoint_retirement(
     Ok(())
 }
 
+/// Validate one immutable suspension capture and its active-lease generation.
+pub fn validate_suspension_submission(
+    previous: LeaseBinding,
+    suspension_id: uuid::Uuid,
+    root_filesystem_bytes: u64,
+    guest_memory_bytes: u64,
+    submission: &SuspensionSubmission,
+) -> Result<(), ConformanceError> {
+    validate_transition(previous, submission.binding, LeaseState::Finalized)?;
+    let suspension = &submission.suspension;
+    validate_suspension_reference(previous.provider_instance_id, suspension)?;
+    if suspension_id.is_nil()
+        || suspension.suspension_id != suspension_id
+        || suspension.source_lease_id != previous.context.lease_id
+        || suspension.source_generation != submission.binding.generation
+        || suspension.root_filesystem_bytes != root_filesystem_bytes
+        || suspension.guest_memory_bytes != guest_memory_bytes
+    {
+        return Err(ConformanceError::InvalidSuspension);
+    }
+    Ok(())
+}
+
+/// Validate the bounded identity and integrity shape of a suspension reference.
+pub fn validate_suspension_reference(
+    provider_instance_id: uuid::Uuid,
+    suspension: &ProviderSuspensionRef,
+) -> Result<(), ConformanceError> {
+    let digest = suspension.content_digest.strip_prefix("sha256:");
+    if provider_instance_id.is_nil()
+        || suspension.provider_instance_id != provider_instance_id
+        || suspension.suspension_id.is_nil()
+        || suspension.reference_id.is_nil()
+        || suspension.source_lease_id.is_nil()
+        || suspension.source_generation == 0
+        || (!suspension.root_filesystem && !suspension.guest_memory)
+        || suspension.root_filesystem_bytes == 0
+        || suspension.guest_memory_bytes == 0
+        || !digest.is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err(ConformanceError::InvalidSuspension);
+    }
+    Ok(())
+}
+
+/// Validate resources prepared from one immutable suspension reference.
+pub fn validate_suspension_restore(
+    context: RequestContext,
+    suspension: &ProviderSuspensionRef,
+    root_filesystem_bytes: u64,
+    guest_memory_bytes: u64,
+    prepared: &PreparedLease,
+) -> Result<(), ConformanceError> {
+    validate_prepared_binding(context, prepared.binding)?;
+    if prepared.binding.provider_instance_id != suspension.provider_instance_id
+        || root_filesystem_bytes != suspension.root_filesystem_bytes
+        || guest_memory_bytes != suspension.guest_memory_bytes
+    {
+        return Err(ConformanceError::InvalidSuspension);
+    }
+    match &prepared.resources {
+        PreparedResources::SuspensionRestore {
+            storage: Some(storage),
+            attachments,
+        } if attachments.is_empty() && storage.id == context.instance_id.to_string() => {}
+        PreparedResources::SuspensionRestore {
+            storage: None,
+            attachments,
+        } => validate_opened_attachments(attachments, root_filesystem_bytes, guest_memory_bytes)?,
+        _ => return Err(ConformanceError::InvalidResources),
+    }
+    Ok(())
+}
+
+/// Validate idempotent retirement of one exact provider suspension reference.
+pub fn validate_suspension_retirement(
+    suspension: &ProviderSuspensionRef,
+    result: RetireSuspensionResult,
+) -> Result<(), ConformanceError> {
+    if suspension.reference_id.is_nil()
+        || result.suspension_id != suspension.suspension_id
+        || result.reference_id != Some(suspension.reference_id)
+    {
+        return Err(ConformanceError::InvalidSuspension);
+    }
+    Ok(())
+}
+
 /// Map a conformance violation to the public provider error category.
 pub fn invalid_response(_: ConformanceError) -> ProviderError {
     ProviderError::InvalidResponse
@@ -371,7 +468,10 @@ pub async fn exercise_create_delete(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use blaze_core::storage::StorageSlot;
     use uuid::Uuid;
 
     fn binding(state: LeaseState, generation: u64) -> LeaseBinding {
@@ -444,6 +544,83 @@ mod tests {
         assert_eq!(
             validate_inventory_lease(descriptor, wrong_provider),
             Err(ConformanceError::InvalidInventory)
+        );
+    }
+
+    #[test]
+    fn suspension_capture_and_restore_require_exact_identity_and_extents() {
+        let previous = binding(LeaseState::Finalized, 4);
+        let suspension_id = Uuid::new_v4();
+        let suspension = ProviderSuspensionRef {
+            provider_instance_id: previous.provider_instance_id,
+            suspension_id,
+            reference_id: Uuid::new_v4(),
+            content_digest: format!("sha256:{}", "b".repeat(64)),
+            source_lease_id: previous.context.lease_id,
+            source_generation: 5,
+            root_filesystem: true,
+            guest_memory: true,
+            root_filesystem_bytes: 4096,
+            guest_memory_bytes: 8192,
+        };
+        let submission = SuspensionSubmission {
+            binding: LeaseBinding {
+                generation: 5,
+                state: LeaseState::Finalized,
+                ..previous
+            },
+            suspension: suspension.clone(),
+        };
+        validate_suspension_submission(previous, suspension_id, 4096, 8192, &submission)
+            .expect("suspension capture");
+
+        let context = RequestContext {
+            instance_id: previous.context.instance_id,
+            request_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let prepared = PreparedLease {
+            binding: LeaseBinding {
+                provider_instance_id: previous.provider_instance_id,
+                context,
+                generation: 1,
+                state: LeaseState::Prepared,
+            },
+            resources: PreparedResources::SuspensionRestore {
+                storage: Some(StorageSlot {
+                    id: context.instance_id.to_string(),
+                    rootfs_path: PathBuf::new(),
+                    mem_path: PathBuf::new(),
+                    mem_diff_path: PathBuf::new(),
+                    rootfs_diff_path: PathBuf::new(),
+                    instance_dir: PathBuf::new(),
+                }),
+                attachments: Vec::new(),
+            },
+        };
+        validate_suspension_restore(context, &suspension, 4096, 8192, &prepared)
+            .expect("suspension restore");
+        assert_eq!(
+            validate_suspension_restore(context, &suspension, 4097, 8192, &prepared),
+            Err(ConformanceError::InvalidSuspension)
+        );
+
+        let mut wrong = suspension.clone();
+        wrong.guest_memory_bytes += 1;
+        assert_eq!(
+            validate_suspension_submission(
+                previous,
+                suspension_id,
+                4096,
+                8192,
+                &SuspensionSubmission {
+                    binding: submission.binding,
+                    suspension: wrong,
+                },
+            ),
+            Err(ConformanceError::InvalidSuspension)
         );
     }
 }

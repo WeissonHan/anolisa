@@ -48,6 +48,7 @@ semver = "1.0"
 base64 = "0.22"
 rustix = { version = "1.1", features = ["fs"] }
 sha2 = "0.10"
+getrandom = "0.4"
 
 # Workspace crates
 blaze-core = { path = "crates/blaze-core" }

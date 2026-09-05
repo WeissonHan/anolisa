@@ -447,8 +447,8 @@ new lease and releases the predecessor; it never reuses the active lease.
 Hibernation exists to free the host resources a running sandbox holds — the
 backend process and its memory — during a period when the sandbox is not needed,
 without discarding guest-visible state. Unlike destroy, the sandbox keeps its
-identity and storage; unlike checkpoint capture, the live backend does not keep
-running afterwards.
+identity and restorable state; unlike checkpoint capture, the live backend does
+not keep running afterwards.
 
 ```http
 POST /v1/sandboxes/{id}/hibernate
@@ -464,7 +464,12 @@ to a consistent stop is delegated to the backend's quiesce-for-capture hook,
 whose default pauses the backend; a self-freezing backend overrides that hook
 and does not need separate pause support.
 
-A successful hibernate records intent, quiesces the backend for capture, writes
+A provider-backed sandbox additionally requires `DataPlaneSuspend`, a
+finalized active lease, and guest protocol version 1 with
+`prepare_hibernate`, `reseed_rng`, and `post_restore`.
+
+On the standard file path, a successful hibernate records intent, quiesces the
+backend for capture, writes
 the backend payload and guest memory into a private staging directory, flushes
 the retained storage slot, records each artifact's size and SHA-256 digest in a
 manifest, synchronizes the complete image, and only then publishes it and
@@ -472,11 +477,18 @@ commits `Hibernated`. The published image is resolved through the retained
 sandbox directory descriptor, so a replaced or symlinked instance directory
 cannot redirect it.
 
+On the provider path, the provider freezes immutable writable-root and
+guest-memory content at the same quiescent boundary as the backend snapshot.
+After the backend stops, Blaze stops and releases the active lease; the
+hibernated sandbox retains the immutable suspension reference.
+
 Resume verifies the manifest identity, the exact file set, and every artifact
 digest before it starts a replacement backend. Blaze takes ownership of that
-backend before waiting for optional guest readiness and commits `Running` only
-after a final liveness check. Corrupted or incomplete artifacts are refused
-before any backend starts.
+backend before any readiness check. The standard file path may wait for
+optional guest readiness. The provider path prepares a fresh exclusive lease
+and completes entropy injection and guest clock synchronization before
+publishing `Running`. Corrupted or incomplete artifacts are refused before any
+backend starts.
 
 Failure handling follows the same "before the stop" boundary the restore
 endpoint uses. A failure before Blaze begins stopping the backend resumes the
@@ -490,13 +502,13 @@ be confirmed returns the sandbox to `Hibernated` so the request can be retried;
 when cleanup cannot be confirmed, the replacement owner and the operation
 journal are retained through `RecoveryRequired` for explicit destroy.
 
-Two durability properties are worth planning for. The storage slot stays
-allocated for the whole hibernated period, and a successful resume keeps the
-most recent hibernation image until the next hibernate replaces it or destroy
-removes it — this trades disk space for a repeatable resume. After a daemon
-restart, a completed hibernation is retained so it can still be resumed, but an
-interrupted hibernate or resume is not completed automatically; it is retained
-as `RecoveryRequired` and waits for explicit destroy.
+The standard file path retains its storage slot while hibernated. The provider
+path retains no active lease; it preserves an immutable suspension reference
+and prepares a fresh lease for every resume. Both paths retain the latest
+resumable image or reference until the next hibernate replaces it or destroy
+removes it. After a daemon restart, a completed hibernation remains resumable,
+but an interrupted hibernate or resume is retained as `RecoveryRequired` and
+waits for explicit destroy.
 
 ## Storage Artifact Synchronization
 

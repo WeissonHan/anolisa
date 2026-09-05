@@ -21,7 +21,7 @@ use blaze_core::backend::{
 };
 use blaze_core::data_plane::BackendRuntimeRecord;
 #[cfg(test)]
-use blaze_core::guest_protocol::DEFAULT_MAX_RESPONSE_BYTES;
+use blaze_core::guest_protocol::{DEFAULT_MAX_RESPONSE_BYTES, GUEST_PROTOCOL_VERSION};
 use blaze_core::{BlazeError, Result};
 #[cfg(test)]
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1742,6 +1742,53 @@ async fn serve_mock_guest(
     };
     let id = request.get("id").cloned().unwrap_or_default();
     let response = match request.get("op").and_then(serde_json::Value::as_str) {
+        Some("hello") => serde_json::json!({
+            "id": id,
+            "ok": true,
+            "proto_version": GUEST_PROTOCOL_VERSION,
+            "ops": [
+                "ping",
+                "hello",
+                "prepare_hibernate",
+                "reseed_rng",
+                "post_restore",
+                "exec",
+                "read",
+                "write"
+            ]
+        }),
+        Some("prepare_hibernate") => serde_json::json!({
+            "id": id,
+            "ok": true,
+            "synced": true,
+            "drop_caches": false
+        }),
+        Some("reseed_rng") => {
+            let seed_bytes = request
+                .get("seed_b64")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|encoded| BASE64.decode(encoded).ok())
+                .map_or(0, |seed| seed.len());
+            serde_json::json!({
+                "id": id,
+                "ok": true,
+                "seed_bytes": seed_bytes,
+                "reseed": true
+            })
+        }
+        Some("post_restore") => {
+            let host_ts_ms = request
+                .get("host_ts_ms")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default();
+            serde_json::json!({
+                "id": id,
+                "ok": true,
+                "ts_ms": host_ts_ms,
+                "delta_ms": 0,
+                "clock_stepped": false
+            })
+        }
         Some("exec") => {
             let command = request
                 .get("cmd")

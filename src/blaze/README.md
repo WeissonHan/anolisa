@@ -372,13 +372,16 @@ for response fields, supported capability combinations, and failure handling.
 ### Hibernation and resume
 
 Hibernation is available only when the running backend supports full snapshot
-capture and its configured adapter can restore the same backend version. These
-compatibility checks happen before the lifecycle journal changes, so an
-unsupported combination leaves the sandbox running. How the workload is brought
-to a consistent stop is left to the backend's quiesce-for-capture hook, whose
-default pauses the backend; a self-freezing backend (one whose capture
-primitive stops the workload itself) overrides that hook and needs no separate
-pause support. A successful hibernate:
+capture and its configured adapter can restore the same backend version. A
+provider-backed sandbox also requires `DataPlaneSuspend`, a finalized lease,
+and guest protocol version 1 with `prepare_hibernate`, `reseed_rng`, and
+`post_restore`. These compatibility checks happen before the lifecycle journal
+changes, so an unsupported combination leaves the sandbox running. How the
+workload is brought to a consistent stop is left to the backend's
+quiesce-for-capture hook, whose default pauses the backend; a self-freezing
+backend overrides that hook and needs no separate pause support.
+
+On the standard file path, a successful hibernate:
 
 1. records intent, quiesces the backend for capture, and writes the backend
    payload and memory into a hidden staging directory;
@@ -393,18 +396,25 @@ when persisting the hibernating intent crosses an uncertain durability boundary
 it: the durable record may then disagree with the live runtime, so the sandbox
 is retained as `RecoveryRequired` instead.
 
-Resume verifies the manifest identity, exact file set, and artifact digests
-before starting a replacement backend. The manager owns that backend before
-waiting for optional guest readiness and commits `Running` only after a final
-liveness check. A failure before the replacement backend starts returns the
-sandbox to `Hibernated` so the request can be retried; if the replacement's
-cleanup cannot be confirmed, its owner and the operation journal remain
-available through `RecoveryRequired`.
+On the provider path, the provider freezes immutable writable-root and
+guest-memory content at the same quiescent boundary as the backend snapshot.
+After the backend stops, Blaze stops and releases the active lease; the
+hibernated sandbox retains only the immutable suspension reference.
 
-The storage slot remains allocated while hibernated. A successful resume also
-retains the latest hibernation image until the next hibernate replaces it or an
-explicit destroy removes it. The daemon does not automatically complete an
-interrupted hibernate or resume after restart.
+Resume verifies the manifest identity, exact file set, and artifact digests
+before starting a replacement backend. The standard file path may wait for
+optional guest readiness. The provider path always prepares a fresh exclusive
+lease and must complete entropy injection and guest clock synchronization
+before publishing `Running`. A failure before the replacement backend starts
+returns the sandbox to `Hibernated` so the request can be retried; if the
+replacement's cleanup cannot be confirmed, its owner and operation journal
+remain available through `RecoveryRequired`.
+
+The standard file path retains its storage slot while hibernated. The provider
+path retains no active lease and prepares a fresh lease for every resume. Both
+paths retain the latest resumable image or reference until the next hibernate
+replaces it or an explicit destroy removes it. The daemon does not
+automatically complete an interrupted hibernate or resume after restart.
 
 See the [hibernation and resume user guide](../../docs/user-guide/en/runtime/blaze.md#hibernation-and-resume)
 for the status-code contract, artifact verification, and failure ownership.

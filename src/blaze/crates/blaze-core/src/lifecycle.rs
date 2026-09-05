@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::backend::BackendKind;
 use crate::checkpoint::ProviderCheckpointRecord;
-use crate::data_plane::{BackendRuntimeRecord, DataPlaneLeaseRecord};
+use crate::data_plane::{BackendRuntimeRecord, DataPlaneLeaseRecord, DataPlaneSuspensionRecord};
 use crate::error::{BlazeError, Result};
 use crate::policy::WorkloadClass;
 
@@ -136,6 +136,8 @@ pub enum OperationPhase {
     HibernateArtifactsSynced,
     /// The live backend has stopped and no longer owns runtime resources.
     HibernateBackendStopped,
+    /// Provider-owned active resources were released while immutable content remains.
+    HibernateDataPlaneReleased,
     /// The replacement hibernation directory is durably visible.
     HibernatePublished,
     /// Resume intent is durable and no backend has started.
@@ -146,6 +148,8 @@ pub enum OperationPhase {
     ResumeBackendStarted,
     /// The restored backend and optional guest transport are ready.
     ResumeBackendReady,
+    /// Replacement provider resources are committed for public publication.
+    ResumeDataPlaneCommitted,
 }
 
 impl OperationPhase {
@@ -166,11 +170,13 @@ impl OperationPhase {
             OperationPhase::HibernatePaused => "hibernate-paused",
             OperationPhase::HibernateArtifactsSynced => "hibernate-artifacts-synced",
             OperationPhase::HibernateBackendStopped => "hibernate-backend-stopped",
+            OperationPhase::HibernateDataPlaneReleased => "hibernate-data-plane-released",
             OperationPhase::HibernatePublished => "hibernate-published",
             OperationPhase::ResumePreparing => "resume-preparing",
             OperationPhase::ResumeBackendStarting => "resume-backend-starting",
             OperationPhase::ResumeBackendStarted => "resume-backend-started",
             OperationPhase::ResumeBackendReady => "resume-backend-ready",
+            OperationPhase::ResumeDataPlaneCommitted => "resume-data-plane-committed",
         }
     }
 
@@ -191,11 +197,13 @@ impl OperationPhase {
             | OperationPhase::HibernatePaused
             | OperationPhase::HibernateArtifactsSynced
             | OperationPhase::HibernateBackendStopped
+            | OperationPhase::HibernateDataPlaneReleased
             | OperationPhase::HibernatePublished => OperationKind::Hibernate,
             OperationPhase::ResumePreparing
             | OperationPhase::ResumeBackendStarting
             | OperationPhase::ResumeBackendStarted
-            | OperationPhase::ResumeBackendReady => OperationKind::Resume,
+            | OperationPhase::ResumeBackendReady
+            | OperationPhase::ResumeDataPlaneCommitted => OperationKind::Resume,
         }
     }
 
@@ -216,11 +224,13 @@ impl OperationPhase {
             OperationPhase::HibernatePaused => 1,
             OperationPhase::HibernateArtifactsSynced => 2,
             OperationPhase::HibernateBackendStopped => 3,
-            OperationPhase::HibernatePublished => 4,
+            OperationPhase::HibernateDataPlaneReleased => 4,
+            OperationPhase::HibernatePublished => 5,
             OperationPhase::ResumePreparing => 0,
             OperationPhase::ResumeBackendStarting => 1,
             OperationPhase::ResumeBackendStarted => 2,
             OperationPhase::ResumeBackendReady => 3,
+            OperationPhase::ResumeDataPlaneCommitted => 4,
         }
     }
 }
@@ -308,6 +318,16 @@ pub struct SandboxInstance {
     /// confirmed retired by its owner.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_provider_retirements: Vec<ProviderCheckpointRecord>,
+    /// Immutable provider content that can recreate this sandbox after hibernation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_suspension: Option<DataPlaneSuspensionRecord>,
+    /// Identity persisted before a suspension call whose result may be unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_provider_suspension_id: Option<Uuid>,
+    /// Provider suspension content no longer referenced by the active image but
+    /// not yet confirmed retired by its owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_provider_suspension_retirements: Vec<DataPlaneSuspensionRecord>,
     /// Live backend identity captured with the provider lease.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_runtime: Option<BackendRuntimeRecord>,
@@ -339,6 +359,9 @@ impl SandboxInstance {
             data_plane_lease: None,
             replacement_data_plane_lease: None,
             pending_provider_retirements: Vec::new(),
+            provider_suspension: None,
+            pending_provider_suspension_id: None,
+            pending_provider_suspension_retirements: Vec::new(),
             backend_runtime: None,
         }
     }
@@ -517,6 +540,7 @@ impl SandboxInstance {
             ),
             (SandboxState::Hibernating, SandboxState::Hibernated) => {
                 self.backend_ownership == BackendOwnership::Stopped
+                    && (self.provider_suspension.is_none() || self.data_plane_lease.is_none())
                     && self.operation_phase_reached(
                         OperationKind::Hibernate,
                         OperationPhase::HibernatePublished,
@@ -542,6 +566,12 @@ impl SandboxInstance {
                         OperationKind::Resume,
                         OperationPhase::ResumeBackendReady,
                     )
+                    && (self.provider_suspension.is_none()
+                        || (self.data_plane_lease.is_some()
+                            && self.operation_phase_reached(
+                                OperationKind::Resume,
+                                OperationPhase::ResumeDataPlaneCommitted,
+                            )))
             }
             (SandboxState::Resuming, SandboxState::Hibernated) => {
                 self.backend_ownership == BackendOwnership::Stopped
@@ -658,6 +688,8 @@ fn is_valid_transition(from: SandboxState, to: SandboxState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::data_plane::DataPlaneLeaseState;
+
     use super::*;
 
     fn fresh() -> SandboxInstance {
@@ -777,6 +809,79 @@ mod tests {
             .expect("backend ready");
         inst.transition(SandboxState::Running)
             .expect("resume commits");
+    }
+
+    #[test]
+    fn provider_hibernation_requires_release_and_resume_requires_commit() {
+        let mut inst = fresh();
+        inst.transition(SandboxState::Creating).expect("creating");
+        inst.transition(SandboxState::Running).expect("running");
+        inst.backend_ownership = BackendOwnership::Running;
+        let provider_instance_id = Uuid::new_v4();
+        let source_lease_id = Uuid::new_v4();
+        let active = DataPlaneLeaseRecord {
+            provider_instance_id,
+            request_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4(),
+            lease_id: source_lease_id,
+            initial_generation: 1,
+            generation: 3,
+            state: DataPlaneLeaseState::Finalized,
+            root_filesystem_bytes: 4096,
+            guest_memory_bytes: 8192,
+        };
+        inst.data_plane_lease = Some(active);
+        inst.begin_hibernate_operation().expect("begin hibernate");
+        inst.transition(SandboxState::Hibernating)
+            .expect("hibernate starts");
+        inst.advance_hibernate_phase(OperationPhase::HibernateArtifactsSynced)
+            .expect("artifacts durable");
+        inst.backend_ownership = BackendOwnership::Stopped;
+        inst.provider_suspension = Some(DataPlaneSuspensionRecord {
+            provider_instance_id,
+            suspension_id: Uuid::new_v4(),
+            reference_id: Uuid::new_v4(),
+            content_digest: format!("sha256:{}", "a".repeat(64)),
+            source_lease_id,
+            source_generation: 4,
+            root_filesystem: true,
+            guest_memory: true,
+            root_filesystem_bytes: 4096,
+            guest_memory_bytes: 8192,
+        });
+        inst.advance_hibernate_phase(OperationPhase::HibernatePublished)
+            .expect("publish image");
+        assert!(
+            inst.transition(SandboxState::Hibernated).is_err(),
+            "an active provider lease must not survive hibernation"
+        );
+        inst.data_plane_lease = None;
+        inst.transition(SandboxState::Hibernated)
+            .expect("released hibernation");
+        inst.finish_operation();
+
+        inst.begin_resume_operation().expect("begin resume");
+        inst.transition(SandboxState::Resuming)
+            .expect("resume starts");
+        inst.backend_ownership = BackendOwnership::Running;
+        inst.advance_resume_phase(OperationPhase::ResumeBackendReady)
+            .expect("backend ready");
+        inst.data_plane_lease = Some(DataPlaneLeaseRecord {
+            lease_id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4(),
+            generation: 2,
+            state: DataPlaneLeaseState::Committed,
+            ..active
+        });
+        assert!(
+            inst.transition(SandboxState::Running).is_err(),
+            "provider commit boundary must be journaled"
+        );
+        inst.advance_resume_phase(OperationPhase::ResumeDataPlaneCommitted)
+            .expect("provider commit durable");
+        inst.transition(SandboxState::Running)
+            .expect("provider resume commits");
     }
 
     #[test]

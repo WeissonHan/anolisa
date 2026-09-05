@@ -161,6 +161,7 @@ dependencies = [
  "blaze-provider-conformance",
  "chrono",
  "clap",
+ "getrandom",
  "http-body-util",
  "hyper",
  "hyper-util",

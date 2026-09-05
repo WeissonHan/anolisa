@@ -37,7 +37,7 @@ use crate::spawner::{
 };
 use crate::state_store::{OwnedRunDir, StateStore};
 
-const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Inputs already parsed and policy-evaluated by the API.
 #[derive(Debug, Clone)]
@@ -347,12 +347,28 @@ impl SandboxManager {
                         {
                             Err(BlazeDaemonError::Internal(violation.to_string()))
                         }
-                        Ok(_) => Err(BlazeDaemonError::RecoveryRequired(format!(
-                            "{violation}; provider compensation returned an invalid transition"
-                        ))),
-                        Err(error) => Err(BlazeDaemonError::RecoveryRequired(format!(
-                            "{violation}; provider compensation failed: {error}"
-                        ))),
+                        Ok(_) => {
+                            let retained = self
+                                .retain_data_plane_lease(context.instance_id, prepared.binding)
+                                .err();
+                            Err(BlazeDaemonError::RecoveryRequired(format!(
+                                "{violation}; provider compensation returned an invalid transition{}",
+                                retained
+                                    .map(|error| format!("; lease retention also failed: {error}"))
+                                    .unwrap_or_default()
+                            )))
+                        }
+                        Err(error) => {
+                            let retained = self
+                                .retain_data_plane_lease(context.instance_id, prepared.binding)
+                                .err();
+                            Err(BlazeDaemonError::RecoveryRequired(format!(
+                                "{violation}; provider compensation failed: {error}{}",
+                                retained
+                                    .map(|error| format!("; lease retention also failed: {error}"))
+                                    .unwrap_or_default()
+                            )))
+                        }
                     };
                 }
                 Ok(prepared)
@@ -374,24 +390,39 @@ impl SandboxManager {
                         "data-plane preparation inspection returned an unsafe state".to_string(),
                     ));
                 }
-                let aborted = self
+                let aborted = match self
                     .data_plane
                     .abort(AbortRequest {
                         binding: observed.binding,
                     })
                     .await
-                    .map_err(|error| {
-                        BlazeDaemonError::RecoveryRequired(format!(
-                            "data-plane preparation was observed but compensation failed: {error}"
-                        ))
-                    })?;
-                validate_transition(observed.binding, aborted.binding, LeaseState::Released)
-                    .map_err(|_| {
-                        BlazeDaemonError::RecoveryRequired(
-                            "data-plane preparation compensation returned an invalid transition"
-                                .to_string(),
-                        )
-                    })?;
+                {
+                    Ok(aborted) => aborted,
+                    Err(error) => {
+                        let retained = self
+                            .retain_data_plane_lease(context.instance_id, observed.binding)
+                            .err();
+                        return Err(BlazeDaemonError::RecoveryRequired(format!(
+                            "data-plane preparation was observed but compensation failed: {error}{}",
+                            retained
+                                .map(|error| format!("; lease retention also failed: {error}"))
+                                .unwrap_or_default()
+                        )));
+                    }
+                };
+                if validate_transition(observed.binding, aborted.binding, LeaseState::Released)
+                    .is_err()
+                {
+                    let retained = self
+                        .retain_data_plane_lease(context.instance_id, observed.binding)
+                        .err();
+                    return Err(BlazeDaemonError::RecoveryRequired(format!(
+                        "data-plane preparation compensation returned an invalid transition{}",
+                        retained
+                            .map(|error| format!("; lease retention also failed: {error}"))
+                            .unwrap_or_default()
+                    )));
+                }
                 Err(BlazeDaemonError::DataPlane(ProviderError::OutcomeUnknown))
             }
             Err(error) => Err(error.into()),
@@ -869,6 +900,33 @@ impl SandboxManager {
         let prepared = match self.prepare_data_plane(prepare_request).await {
             Ok(prepared) => prepared,
             Err(error) => {
+                match self.data_plane_lease(instance.id) {
+                    Ok(Some(binding)) => {
+                        instance.data_plane_lease =
+                            Some(binding.to_record(lease_extents.0, lease_extents.1));
+                        let recovery = self.mark_instance_recovery(instance).err();
+                        return Err(BlazeDaemonError::RecoveryRequired(format!(
+                            "{error}; prepared provider ownership was retained{}",
+                            recovery
+                                .map(|error| format!(
+                                    "; recovery state persistence failed: {error}"
+                                ))
+                                .unwrap_or_default()
+                        )));
+                    }
+                    Ok(None) => {}
+                    Err(retention_error) => {
+                        let recovery = self.mark_instance_recovery(instance).err();
+                        return Err(BlazeDaemonError::RecoveryRequired(format!(
+                            "{error}; provider lease retention is unreadable: {retention_error}{}",
+                            recovery
+                                .map(|error| format!(
+                                    "; recovery state persistence failed: {error}"
+                                ))
+                                .unwrap_or_default()
+                        )));
+                    }
+                }
                 let errors = self.commit_create_rollback(&mut instance);
                 return if errors.is_empty() {
                     Err(error)
@@ -968,7 +1026,11 @@ impl SandboxManager {
                     )
                     .await);
             }
-            (PreparedResources::CheckpointRestore { .. }, _) => {
+            (
+                PreparedResources::CheckpointRestore { .. }
+                | PreparedResources::SuspensionRestore { .. },
+                _,
+            ) => {
                 return Err(self
                     .cleanup_failed_create(
                         &mut instance,
@@ -976,7 +1038,7 @@ impl SandboxManager {
                         None,
                         false,
                         BlazeDaemonError::Internal(
-                            "data-plane provider returned checkpoint resources for creation"
+                            "data-plane provider returned lifecycle restore resources for creation"
                                 .to_string(),
                         ),
                     )
@@ -1352,7 +1414,9 @@ impl SandboxManager {
         let replacement_binding = original
             .replacement_data_plane_lease
             .map(|record| LeaseBinding::from_record(id, record));
-        let mut data_plane_released = false;
+        let mut data_plane_released = original.provider_suspension.is_some()
+            && original.data_plane_lease.is_none()
+            && original.replacement_data_plane_lease.is_none();
 
         let backend = self
             .backend_instances
@@ -1636,6 +1700,74 @@ impl SandboxManager {
             self.persist_and_retain(original.clone())?;
         }
 
+        if let Some(record) = original.provider_suspension.clone()
+            && !original
+                .pending_provider_suspension_retirements
+                .iter()
+                .any(|pending| pending.reference_id == record.reference_id)
+        {
+            original
+                .pending_provider_suspension_retirements
+                .push(record);
+            self.persist_and_retain(original.clone())?;
+        }
+        if (original.pending_provider_suspension_id.is_some()
+            || !original.pending_provider_suspension_retirements.is_empty())
+            && self.data_plane.suspension().is_none()
+        {
+            let recovery = self.mark_instance_recovery(original).err();
+            return Err(BlazeDaemonError::RecoveryRequired(format!(
+                "destroy {id}: provider suspension retirement is unavailable{}",
+                recovery
+                    .map(|error| format!("; recovery state persistence failed: {error}"))
+                    .unwrap_or_default()
+            )));
+        }
+        if let Some(suspension_id) = original.pending_provider_suspension_id {
+            let has_exact_reference = original
+                .pending_provider_suspension_retirements
+                .iter()
+                .any(|record| record.suspension_id == suspension_id);
+            if !has_exact_reference {
+                self.retire_provider_suspension_identity(
+                    self.data_plane.descriptor().provider_instance_id,
+                    suspension_id,
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    BlazeDaemonError::RecoveryRequired(format!(
+                        "destroy {id}: unknown provider suspension retirement failed: {error}"
+                    ))
+                })?;
+            }
+            original.pending_provider_suspension_id = None;
+            self.persist_and_retain(original.clone())?;
+        }
+        for record in original.pending_provider_suspension_retirements.clone() {
+            let suspension = blaze_provider_api::ProviderSuspensionRef::from_record(&record);
+            if let Err(error) = self.retire_provider_suspension(&suspension).await {
+                let recovery = self.mark_instance_recovery(original).err();
+                return Err(BlazeDaemonError::RecoveryRequired(format!(
+                    "destroy {id}: provider suspension retirement failed: {error}{}",
+                    recovery
+                        .map(|error| format!("; recovery state persistence failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+            original
+                .pending_provider_suspension_retirements
+                .retain(|pending| pending.reference_id != record.reference_id);
+            if original
+                .provider_suspension
+                .as_ref()
+                .is_some_and(|active| active.reference_id == record.reference_id)
+            {
+                original.provider_suspension = None;
+            }
+            self.persist_and_retain(original.clone())?;
+        }
+
         if let Err(error) = self.cleanup_hibernate_artifacts(id).await {
             let recovery = self.mark_recovery(id).err();
             return Err(BlazeDaemonError::RecoveryRequired(format!(
@@ -1696,6 +1828,10 @@ impl SandboxManager {
 
         let mut destroyed = original;
         destroyed.data_plane_lease = None;
+        destroyed.replacement_data_plane_lease = None;
+        destroyed.provider_suspension = None;
+        destroyed.pending_provider_suspension_id = None;
+        destroyed.pending_provider_suspension_retirements.clear();
         destroyed.backend_runtime = None;
         if destroyed.state != SandboxState::Destroyed {
             destroyed.transition(SandboxState::Destroyed)?;
@@ -2469,6 +2605,9 @@ fn is_clean_terminal(instance: &SandboxInstance) -> bool {
         && instance.data_plane_lease.is_none()
         && instance.replacement_data_plane_lease.is_none()
         && instance.pending_provider_retirements.is_empty()
+        && instance.provider_suspension.is_none()
+        && instance.pending_provider_suspension_id.is_none()
+        && instance.pending_provider_suspension_retirements.is_empty()
         && instance.backend_runtime.is_none()
         && matches!(
             instance.backend_ownership,
@@ -2480,7 +2619,10 @@ fn requires_automatic_cleanup(instance: &SandboxInstance) -> bool {
     !(is_clean_terminal(instance)
         || (instance.state == SandboxState::Hibernated
             && instance.operation.is_none()
-            && instance.backend_ownership == BackendOwnership::Stopped)
+            && instance.backend_ownership == BackendOwnership::Stopped
+            && instance.replacement_data_plane_lease.is_none()
+            && instance.pending_provider_suspension_id.is_none()
+            && (instance.provider_suspension.is_none() || instance.data_plane_lease.is_none()))
         || (instance.state == SandboxState::RecoveryRequired
             && matches!(
                 instance.operation.as_ref().map(|operation| operation.kind),

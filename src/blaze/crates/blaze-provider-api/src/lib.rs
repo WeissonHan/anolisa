@@ -15,7 +15,9 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use blaze_core::checkpoint::ProviderCheckpointRecord;
-use blaze_core::data_plane::{BackendProcessIdentity, DataPlaneLeaseRecord, DataPlaneLeaseState};
+use blaze_core::data_plane::{
+    BackendProcessIdentity, DataPlaneLeaseRecord, DataPlaneLeaseState, DataPlaneSuspensionRecord,
+};
 use blaze_core::storage::{StorageSlot, TemplateStorage};
 use thiserror::Error;
 use uuid::Uuid;
@@ -178,6 +180,13 @@ pub enum PreparedResources {
     /// Resources for an in-place restore whose backend payload remains in the
     /// daemon checkpoint catalog.
     CheckpointRestore {
+        /// Path-backed replacement slot, when the provider exposes files.
+        storage: Option<StorageSlot>,
+        /// Opened root-drive and guest-memory attachments otherwise.
+        attachments: Vec<OpenedAttachment>,
+    },
+    /// Resources for resuming from immutable provider-owned suspension content.
+    SuspensionRestore {
         /// Path-backed replacement slot, when the provider exposes files.
         storage: Option<StorageSlot>,
         /// Opened root-drive and guest-memory attachments otherwise.
@@ -494,6 +503,124 @@ pub struct RetireCheckpointResult {
     pub retired: bool,
 }
 
+/// Opaque, immutable provider content retained while a sandbox is hibernated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSuspensionRef {
+    /// Build-time provider instance that owns the immutable content.
+    pub provider_instance_id: Uuid,
+    /// Stable identity selected before suspension can create content.
+    pub suspension_id: Uuid,
+    /// Opaque provider-local immutable content reference.
+    pub reference_id: Uuid,
+    /// SHA-256 identity of the provider's canonical content manifest.
+    pub content_digest: String,
+    /// Finalized lease frozen by this suspension.
+    pub source_lease_id: Uuid,
+    /// Source lease generation after the provider accepted suspension.
+    pub source_generation: u64,
+    /// Whether this reference owns the retained root-filesystem view.
+    pub root_filesystem: bool,
+    /// Whether this reference owns the retained guest-memory view.
+    pub guest_memory: bool,
+    /// Logical root-filesystem extent required by a fresh resume lease.
+    pub root_filesystem_bytes: u64,
+    /// Logical guest-memory extent required by a fresh resume lease.
+    pub guest_memory_bytes: u64,
+}
+
+impl ProviderSuspensionRef {
+    /// Convert the result into an implementation-neutral durable ownership record.
+    pub fn to_record(&self) -> DataPlaneSuspensionRecord {
+        DataPlaneSuspensionRecord {
+            provider_instance_id: self.provider_instance_id,
+            suspension_id: self.suspension_id,
+            reference_id: self.reference_id,
+            content_digest: self.content_digest.clone(),
+            source_lease_id: self.source_lease_id,
+            source_generation: self.source_generation,
+            root_filesystem: self.root_filesystem,
+            guest_memory: self.guest_memory,
+            root_filesystem_bytes: self.root_filesystem_bytes,
+            guest_memory_bytes: self.guest_memory_bytes,
+        }
+    }
+
+    /// Reconstruct the source-level provider reference from a durable ledger.
+    pub fn from_record(record: &DataPlaneSuspensionRecord) -> Self {
+        Self {
+            provider_instance_id: record.provider_instance_id,
+            suspension_id: record.suspension_id,
+            reference_id: record.reference_id,
+            content_digest: record.content_digest.clone(),
+            source_lease_id: record.source_lease_id,
+            source_generation: record.source_generation,
+            root_filesystem: record.root_filesystem,
+            guest_memory: record.guest_memory,
+            root_filesystem_bytes: record.root_filesystem_bytes,
+            guest_memory_bytes: record.guest_memory_bytes,
+        }
+    }
+}
+
+/// Freeze provider-owned state while the backend is quiesced for hibernation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuspendRequest {
+    /// Finalized active lease captured while backend writes are stopped.
+    pub binding: LeaseBinding,
+    /// Stable identity selected before any provider-side mutation.
+    pub suspension_id: Uuid,
+    /// Logical root-filesystem extent retained by the suspension.
+    pub root_filesystem_bytes: u64,
+    /// Logical guest-memory extent retained by the suspension.
+    pub guest_memory_bytes: u64,
+}
+
+/// Provider result for one immutable suspension capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspensionSubmission {
+    /// Active lease advanced by exactly one generation and still finalized.
+    pub binding: LeaseBinding,
+    /// Immutable content retained after the active lease is released.
+    pub suspension: ProviderSuspensionRef,
+}
+
+/// Prepare a fresh exclusive lease from immutable suspension content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeRequest {
+    /// Fresh identity for the independent replacement lease.
+    pub context: RequestContext,
+    /// Immutable provider content selected by the verified hibernation image.
+    pub suspension: ProviderSuspensionRef,
+    /// Required writable root-filesystem extent.
+    pub root_filesystem_bytes: u64,
+    /// Required guest-memory extent.
+    pub guest_memory_bytes: u64,
+}
+
+/// Retire suspension content after no durable hibernation image references it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireSuspensionRequest {
+    /// Build-time provider instance expected to own the content.
+    pub provider_instance_id: Uuid,
+    /// Stable suspension identity used to make unknown captures idempotent.
+    pub suspension_id: Uuid,
+    /// Absent only when capture had an unknown outcome before a reference returned.
+    pub reference_id: Option<Uuid>,
+    /// Idempotency identity chosen by Blaze for this retirement attempt.
+    pub operation_id: Uuid,
+}
+
+/// Confirm that a provider suspension reference no longer owns content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetireSuspensionResult {
+    /// Suspension identity accepted by the provider.
+    pub suspension_id: Uuid,
+    /// Exact opaque reference retired, or absent for an unknown capture.
+    pub reference_id: Option<Uuid>,
+    /// True when content was removed by this call, false when already absent.
+    pub retired: bool,
+}
+
 /// Provider-independent failures mapped into stable Blaze diagnostics.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderError {
@@ -619,6 +746,23 @@ pub trait DataPlaneCheckpoint: DataPlaneProvider {
     ) -> Result<RetireCheckpointResult, ProviderError>;
 }
 
+/// Optional hibernation capture, fresh-lease resume, and retirement extension.
+#[async_trait]
+pub trait DataPlaneSuspend: DataPlaneCheckpoint {
+    /// Capture immutable provider content at the backend's quiesce boundary.
+    async fn suspend(&self, request: SuspendRequest)
+    -> Result<SuspensionSubmission, ProviderError>;
+
+    /// Prepare a new exclusive lease from one verified suspension reference.
+    async fn resume(&self, request: ResumeRequest) -> Result<PreparedLease, ProviderError>;
+
+    /// Idempotently release content after its public hibernation owner is removed.
+    async fn retire_suspension(
+        &self,
+        request: RetireSuspensionRequest,
+    ) -> Result<RetireSuspensionResult, ProviderError>;
+}
+
 /// Source-level data-plane provider compiled into one Blaze daemon binary.
 #[async_trait]
 pub trait DataPlaneProvider: Send + Sync {
@@ -635,6 +779,11 @@ pub trait DataPlaneProvider: Send + Sync {
 
     /// Return checkpoint support when provider-owned immutable content exists.
     fn checkpoints(&self) -> Option<&dyn DataPlaneCheckpoint> {
+        None
+    }
+
+    /// Return hibernation support when provider-owned immutable content exists.
+    fn suspension(&self) -> Option<&dyn DataPlaneSuspend> {
         None
     }
 
@@ -688,5 +837,26 @@ mod tests {
         assert_eq!(LeaseBinding::from_record(instance_id, record), binding);
         assert_eq!(record.initial_generation, 7);
         assert_eq!(record.generation, 11);
+    }
+
+    #[test]
+    fn durable_suspension_round_trip_preserves_resume_contract() {
+        let suspension = ProviderSuspensionRef {
+            provider_instance_id: Uuid::new_v4(),
+            suspension_id: Uuid::new_v4(),
+            reference_id: Uuid::new_v4(),
+            content_digest: format!("sha256:{}", "a".repeat(64)),
+            source_lease_id: Uuid::new_v4(),
+            source_generation: 9,
+            root_filesystem: true,
+            guest_memory: true,
+            root_filesystem_bytes: 8 * 1024 * 1024 * 1024,
+            guest_memory_bytes: 512 * 1024 * 1024,
+        };
+
+        assert_eq!(
+            ProviderSuspensionRef::from_record(&suspension.to_record()),
+            suspension
+        );
     }
 }

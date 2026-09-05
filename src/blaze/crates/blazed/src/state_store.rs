@@ -896,18 +896,24 @@ fn validate_terminal_record(instance: &SandboxInstance) -> Result<()> {
         && instance.data_plane_lease.is_none()
         && instance.replacement_data_plane_lease.is_none()
         && instance.pending_provider_retirements.is_empty()
+        && instance.provider_suspension.is_none()
+        && instance.pending_provider_suspension_id.is_none()
+        && instance.pending_provider_suspension_retirements.is_empty()
         && instance.backend_runtime.is_none()
     {
         return Ok(());
     }
     Err(BlazeDaemonError::RecoveryRequired(format!(
-        "destroyed instance {} does not prove completed cleanup: backend ownership {:?}, active operation {:?}, provider lease retained {}, replacement lease retained {}, pending provider retirements {}, backend identity retained {}",
+        "destroyed instance {} does not prove completed cleanup: backend ownership {:?}, active operation {:?}, provider lease retained {}, replacement lease retained {}, pending provider retirements {}, provider suspension retained {}, pending provider suspension identity retained {}, pending provider suspension retirements {}, backend identity retained {}",
         instance.id,
         instance.backend_ownership,
         instance.operation.as_ref().map(|operation| operation.kind),
         instance.data_plane_lease.is_some(),
         instance.replacement_data_plane_lease.is_some(),
         instance.pending_provider_retirements.len(),
+        instance.provider_suspension.is_some(),
+        instance.pending_provider_suspension_id.is_some(),
+        instance.pending_provider_suspension_retirements.len(),
         instance.backend_runtime.is_some()
     )))
 }

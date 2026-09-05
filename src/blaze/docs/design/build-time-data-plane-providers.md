@@ -160,7 +160,7 @@ implementing the base contract.
 | Provider lease adoption after daemon restart | Requires the optional inventory contract and a backend that supports identity-based adoption |
 | Provider-owned checkpoint and rollback | Requires the optional checkpoint contract and full backend snapshot and restore support |
 | Create a new sandbox from a provider checkpoint | Deferred; no public endpoint or policy contract |
-| Provider-owned hibernation and resume | Not supported |
+| Provider-owned hibernation and resume | Requires the optional suspension contract, full backend snapshot and restore support, and the documented guest protocol operations |
 | Provider capacity and reusable-resource pools | Not supported |
 | Runtime dynamic-library or process plugin discovery | Not supported |
 
@@ -169,9 +169,10 @@ production-ready for persistent workloads. The inventory contract and its
 fail-closed recovery rules are specified in
 [Provider Reconciliation](provider-reconciliation.md). Provider checkpoint
 ownership and compensation are specified in
-[Provider-owned Checkpoints](provider-checkpoints.md). Hibernation and capacity
-still require separate optional contracts rather than unused methods in the
-base interface.
+[Provider-owned Checkpoints](provider-checkpoints.md). Suspension ownership,
+guest recovery hooks, and failure handling are specified in
+[Provider-owned Suspension](provider-suspension.md). Capacity still requires a
+separate optional contract rather than unused methods in the base interface.
 
 ## Verification
 
