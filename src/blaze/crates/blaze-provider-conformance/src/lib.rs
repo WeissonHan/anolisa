@@ -10,13 +10,13 @@ pub use example_provider::ExampleFileProvider;
 use std::collections::HashSet;
 
 use blaze_provider_api::{
-    AttachmentAccess, AttachmentRole, AttachmentSharing, CapacityRequest, CapacitySnapshot,
-    CheckpointSubmission, CommitRequest, DataPlaneProvider, DrainRequest, DrainResult,
-    FinalizeRequest, InspectRequest, InventorySnapshot, LeaseBinding, LeaseState,
+    AttachmentRole, CapacityRequest, CapacitySnapshot, CheckpointSubmission, CommitRequest,
+    DataPlaneProvider, DrainRequest, DrainResult, FinalizeRequest, InspectRequest, InventoryPage,
+    InventorySnapshot, LeaseBinding, LeaseState, MAX_INVENTORY_CURSOR_BYTES,
     PROVIDER_CONTRACT_VERSION, PrepareRequest, PrepareSource, PreparedLease, PreparedResources,
-    ProviderCheckpointRef, ProviderDescriptor, ProviderError, ProviderSuspensionRef,
-    PublicTransitionRef, ReconcileAction, ReleaseRequest, RequestContext, RetireCheckpointResult,
-    RetireSuspensionResult, StopRequest, SuspensionSubmission,
+    ProviderCapabilities, ProviderCheckpointRef, ProviderDescriptor, ProviderError,
+    ProviderSuspensionRef, PublicTransitionRef, ReconcileAction, ReleaseRequest, RequestContext,
+    RetireCheckpointResult, RetireSuspensionResult, StopRequest, SuspensionSubmission,
 };
 use thiserror::Error;
 
@@ -72,6 +72,7 @@ pub fn validate_descriptor(descriptor: ProviderDescriptor) -> Result<(), Conform
 
 /// Validate a preparation result against the exact initiating request.
 pub fn validate_prepared(
+    capabilities: ProviderCapabilities,
     context: RequestContext,
     template_source: bool,
     root_filesystem_bytes: u64,
@@ -95,7 +96,10 @@ pub fn validate_prepared(
             restore_payload_dir,
             attachments,
         } => {
-            if !template_source || restore_payload_dir.as_os_str().is_empty() {
+            if !template_source
+                || !capabilities.opened_template_restore_resources
+                || restore_payload_dir.as_os_str().is_empty()
+            {
                 return Err(ConformanceError::InvalidResources);
             }
             validate_opened_attachments(attachments, root_filesystem_bytes, guest_memory_bytes)?;
@@ -138,9 +142,12 @@ pub fn validate_transition(
     next: LeaseBinding,
     expected: LeaseState,
 ) -> Result<(), ConformanceError> {
+    let Some(expected_generation) = previous.generation.checked_add(1) else {
+        return Err(ConformanceError::InvalidTransition);
+    };
     if next.provider_instance_id != previous.provider_instance_id
         || next.context != previous.context
-        || next.generation != previous.generation.saturating_add(1)
+        || next.generation != expected_generation
         || next.state != expected
     {
         return Err(ConformanceError::InvalidTransition);
@@ -162,6 +169,24 @@ pub fn validate_inventory_snapshot(
     Ok(())
 }
 
+/// Validate one bounded inventory page before consuming any lease identities.
+pub fn validate_inventory_page(
+    page: &InventoryPage,
+    requested_page_size: u32,
+) -> Result<(), ConformanceError> {
+    if requested_page_size == 0 || page.leases.len() > requested_page_size as usize {
+        return Err(ConformanceError::InvalidInventory);
+    }
+    if let Some(cursor) = page.next_cursor.as_deref()
+        && (cursor.is_empty()
+            || cursor.len() > MAX_INVENTORY_CURSOR_BYTES
+            || page.leases.is_empty())
+    {
+        return Err(ConformanceError::InvalidInventory);
+    }
+    Ok(())
+}
+
 /// Validate one lease returned by a provider inventory.
 pub fn validate_inventory_lease(
     descriptor: ProviderDescriptor,
@@ -174,6 +199,7 @@ pub fn validate_inventory_lease(
         || binding.context.lease_id.is_nil()
         || binding.context.generation == 0
         || binding.generation < binding.context.generation
+        || binding.state == LeaseState::Released
     {
         return Err(ConformanceError::InvalidInventory);
     }
@@ -186,10 +212,32 @@ pub fn validate_reconcile_result(
     next: LeaseBinding,
     action: ReconcileAction,
 ) -> Result<(), ConformanceError> {
+    if previous.generation < previous.context.generation {
+        return Err(ConformanceError::InvalidTransition);
+    }
     let expected = match action {
-        ReconcileAction::Adopt { .. } => LeaseState::Finalized,
-        ReconcileAction::Quarantine => LeaseState::Quarantined,
-        ReconcileAction::Release => LeaseState::Released,
+        ReconcileAction::Adopt { backend_process }
+            if matches!(
+                previous.state,
+                LeaseState::Committed | LeaseState::Finalized
+            ) && backend_process.pid != 0
+                && backend_process.start_time_ticks != 0 =>
+        {
+            LeaseState::Finalized
+        }
+        ReconcileAction::Quarantine
+            if matches!(
+                previous.state,
+                LeaseState::Prepared
+                    | LeaseState::Committed
+                    | LeaseState::Finalized
+                    | LeaseState::Stopped
+                    | LeaseState::Quarantined
+            ) =>
+        {
+            LeaseState::Quarantined
+        }
+        _ => return Err(ConformanceError::InvalidTransition),
     };
     validate_transition(previous, next, expected)
 }
@@ -211,7 +259,6 @@ pub fn validate_checkpoint_submission(
         || checkpoint.source_lease_id != previous.context.lease_id
         || checkpoint.source_generation != submission.binding.generation
         || checkpoint.parent_reference_id != parent.map(|parent| parent.reference_id)
-        || (!checkpoint.root_filesystem && !checkpoint.guest_memory)
         || !digest.is_some_and(|hex| {
             hex.len() == 64
                 && hex
@@ -226,6 +273,7 @@ pub fn validate_checkpoint_submission(
 
 /// Validate resources prepared from one provider checkpoint.
 pub fn validate_checkpoint_restore(
+    capabilities: ProviderCapabilities,
     context: RequestContext,
     checkpoint: &ProviderCheckpointRef,
     root_filesystem_bytes: u64,
@@ -244,7 +292,9 @@ pub fn validate_checkpoint_restore(
         PreparedResources::CheckpointRestore {
             storage: None,
             attachments,
-        } => validate_opened_attachments(attachments, root_filesystem_bytes, guest_memory_bytes)?,
+        } if capabilities.opened_checkpoint_restore_resources => {
+            validate_opened_attachments(attachments, root_filesystem_bytes, guest_memory_bytes)?
+        }
         _ => return Err(ConformanceError::InvalidResources),
     }
     Ok(())
@@ -261,8 +311,6 @@ fn validate_opened_attachments(
     let mut roles = HashSet::new();
     for attachment in attachments {
         if !roles.insert(attachment.role)
-            || attachment.access != AttachmentAccess::ReadWrite
-            || attachment.sharing != AttachmentSharing::Exclusive
             || attachment.logical_size_bytes == 0
             || !attachment.logical_size_bytes.is_multiple_of(4096)
         {
@@ -334,7 +382,6 @@ pub fn validate_suspension_reference(
         || suspension.reference_id.is_nil()
         || suspension.source_lease_id.is_nil()
         || suspension.source_generation == 0
-        || (!suspension.root_filesystem && !suspension.guest_memory)
         || suspension.root_filesystem_bytes == 0
         || suspension.guest_memory_bytes == 0
         || !digest.is_some_and(|hex| {
@@ -351,6 +398,7 @@ pub fn validate_suspension_reference(
 
 /// Validate resources prepared from one immutable suspension reference.
 pub fn validate_suspension_restore(
+    capabilities: ProviderCapabilities,
     context: RequestContext,
     suspension: &ProviderSuspensionRef,
     root_filesystem_bytes: u64,
@@ -372,7 +420,9 @@ pub fn validate_suspension_restore(
         PreparedResources::SuspensionRestore {
             storage: None,
             attachments,
-        } => validate_opened_attachments(attachments, root_filesystem_bytes, guest_memory_bytes)?,
+        } if capabilities.opened_suspension_restore_resources => {
+            validate_opened_attachments(attachments, root_filesystem_bytes, guest_memory_bytes)?
+        }
         _ => return Err(ConformanceError::InvalidResources),
     }
     Ok(())
@@ -467,6 +517,7 @@ pub async fn exercise_create_delete(
     let guest_memory_bytes = request.guest_memory_bytes;
     let prepared = provider.prepare(request).await?;
     validate_prepared(
+        capabilities,
         context,
         template_source,
         root_filesystem_bytes,
@@ -518,10 +569,12 @@ pub async fn exercise_create_delete(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
     use std::path::PathBuf;
 
     use super::*;
     use blaze_core::storage::StorageSlot;
+    use blaze_provider_api::{AttachmentKind, InventoryLease, OpenedAttachment};
     use uuid::Uuid;
 
     fn binding(state: LeaseState, generation: u64) -> LeaseBinding {
@@ -537,6 +590,33 @@ mod tests {
             generation,
             state,
         }
+    }
+
+    fn opened_attachments() -> Vec<OpenedAttachment> {
+        let open = || -> std::os::fd::OwnedFd {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .expect("open attachment")
+                .into()
+        };
+        vec![
+            OpenedAttachment {
+                role: AttachmentRole::RootDrive,
+                descriptor: open(),
+                kind: AttachmentKind::CharacterDevice,
+                logical_size_bytes: 4096,
+                consumer_path: Some(PathBuf::from("rootfs.ext4")),
+            },
+            OpenedAttachment {
+                role: AttachmentRole::GuestMemory,
+                descriptor: open(),
+                kind: AttachmentKind::CharacterDevice,
+                logical_size_bytes: 8192,
+                consumer_path: None,
+            },
+        ]
     }
 
     #[test]
@@ -558,6 +638,16 @@ mod tests {
         };
         assert_eq!(
             validate_transition(previous, stale, LeaseState::Committed),
+            Err(ConformanceError::InvalidTransition)
+        );
+
+        let exhausted = binding(LeaseState::Prepared, u64::MAX);
+        let wrapped = LeaseBinding {
+            state: LeaseState::Committed,
+            ..exhausted
+        };
+        assert_eq!(
+            validate_transition(exhausted, wrapped, LeaseState::Committed),
             Err(ConformanceError::InvalidTransition)
         );
     }
@@ -598,6 +688,89 @@ mod tests {
     }
 
     #[test]
+    fn inventory_rejects_released_leases_and_unbounded_continuations() {
+        let released = binding(LeaseState::Released, 4);
+        let descriptor = ProviderDescriptor {
+            contract_version: PROVIDER_CONTRACT_VERSION,
+            provider_instance_id: released.provider_instance_id,
+        };
+        assert_eq!(
+            validate_inventory_lease(descriptor, released),
+            Err(ConformanceError::InvalidInventory)
+        );
+
+        for page in [
+            InventoryPage {
+                leases: Vec::new(),
+                next_cursor: Some("next".to_string()),
+            },
+            InventoryPage {
+                leases: vec![InventoryLease {
+                    binding: binding(LeaseState::Finalized, 4),
+                }],
+                next_cursor: Some(String::new()),
+            },
+            InventoryPage {
+                leases: vec![InventoryLease {
+                    binding: binding(LeaseState::Finalized, 4),
+                }],
+                next_cursor: Some("x".repeat(MAX_INVENTORY_CURSOR_BYTES + 1)),
+            },
+        ] {
+            assert_eq!(
+                validate_inventory_page(&page, 256),
+                Err(ConformanceError::InvalidInventory)
+            );
+        }
+    }
+
+    #[test]
+    fn reconciliation_rejects_impossible_source_states_and_generations() {
+        let released = binding(LeaseState::Released, 4);
+        let quarantined = LeaseBinding {
+            generation: 5,
+            state: LeaseState::Quarantined,
+            ..released
+        };
+        assert_eq!(
+            validate_reconcile_result(released, quarantined, ReconcileAction::Quarantine),
+            Err(ConformanceError::InvalidTransition)
+        );
+
+        let prepared = binding(LeaseState::Prepared, 4);
+        let finalized = LeaseBinding {
+            generation: 5,
+            state: LeaseState::Finalized,
+            ..prepared
+        };
+        assert_eq!(
+            validate_reconcile_result(
+                prepared,
+                finalized,
+                ReconcileAction::Adopt {
+                    backend_process: blaze_core::data_plane::BackendProcessIdentity {
+                        pid: 12,
+                        start_time_ticks: 34,
+                    },
+                },
+            ),
+            Err(ConformanceError::InvalidTransition)
+        );
+
+        let mut invalid_generation = binding(LeaseState::Finalized, 1);
+        invalid_generation.context.generation = 2;
+        let next = LeaseBinding {
+            generation: 2,
+            state: LeaseState::Quarantined,
+            ..invalid_generation
+        };
+        assert_eq!(
+            validate_reconcile_result(invalid_generation, next, ReconcileAction::Quarantine,),
+            Err(ConformanceError::InvalidTransition)
+        );
+    }
+
+    #[test]
     fn suspension_capture_and_restore_require_exact_identity_and_extents() {
         let previous = binding(LeaseState::Finalized, 4);
         let suspension_id = Uuid::new_v4();
@@ -608,8 +781,6 @@ mod tests {
             content_digest: format!("sha256:{}", "b".repeat(64)),
             source_lease_id: previous.context.lease_id,
             source_generation: 5,
-            root_filesystem: true,
-            guest_memory: true,
             root_filesystem_bytes: 4096,
             guest_memory_bytes: 8192,
         };
@@ -650,10 +821,24 @@ mod tests {
                 attachments: Vec::new(),
             },
         };
-        validate_suspension_restore(context, &suspension, 4096, 8192, &prepared)
-            .expect("suspension restore");
+        validate_suspension_restore(
+            ProviderCapabilities::default(),
+            context,
+            &suspension,
+            4096,
+            8192,
+            &prepared,
+        )
+        .expect("suspension restore");
         assert_eq!(
-            validate_suspension_restore(context, &suspension, 4097, 8192, &prepared),
+            validate_suspension_restore(
+                ProviderCapabilities::default(),
+                context,
+                &suspension,
+                4097,
+                8192,
+                &prepared,
+            ),
             Err(ConformanceError::InvalidSuspension)
         );
 
@@ -672,6 +857,130 @@ mod tests {
             ),
             Err(ConformanceError::InvalidSuspension)
         );
+    }
+
+    #[test]
+    fn opened_restore_resources_require_the_matching_declared_capability() {
+        let template_binding = binding(LeaseState::Prepared, 1);
+        let template = PreparedLease {
+            binding: template_binding,
+            resources: PreparedResources::OpenedRestore {
+                restore_payload_dir: PathBuf::from("payload"),
+                attachments: opened_attachments(),
+            },
+        };
+        assert_eq!(
+            validate_prepared(
+                ProviderCapabilities::default(),
+                template_binding.context,
+                true,
+                4096,
+                8192,
+                &template,
+            ),
+            Err(ConformanceError::InvalidResources)
+        );
+        validate_prepared(
+            ProviderCapabilities {
+                opened_template_restore_resources: true,
+                ..ProviderCapabilities::default()
+            },
+            template_binding.context,
+            true,
+            4096,
+            8192,
+            &template,
+        )
+        .expect("declared template attachments");
+
+        let checkpoint_binding = binding(LeaseState::Prepared, 1);
+        let checkpoint = ProviderCheckpointRef {
+            provider_instance_id: checkpoint_binding.provider_instance_id,
+            public_checkpoint_id: Uuid::new_v4(),
+            reference_id: Uuid::new_v4(),
+            content_digest: format!("sha256:{}", "c".repeat(64)),
+            parent_reference_id: None,
+            source_lease_id: Uuid::new_v4(),
+            source_generation: 2,
+        };
+        let checkpoint_restore = PreparedLease {
+            binding: checkpoint_binding,
+            resources: PreparedResources::CheckpointRestore {
+                storage: None,
+                attachments: opened_attachments(),
+            },
+        };
+        assert_eq!(
+            validate_checkpoint_restore(
+                ProviderCapabilities {
+                    opened_template_restore_resources: true,
+                    ..ProviderCapabilities::default()
+                },
+                checkpoint_binding.context,
+                &checkpoint,
+                4096,
+                8192,
+                &checkpoint_restore,
+            ),
+            Err(ConformanceError::InvalidResources)
+        );
+        validate_checkpoint_restore(
+            ProviderCapabilities {
+                opened_checkpoint_restore_resources: true,
+                ..ProviderCapabilities::default()
+            },
+            checkpoint_binding.context,
+            &checkpoint,
+            4096,
+            8192,
+            &checkpoint_restore,
+        )
+        .expect("declared checkpoint attachments");
+
+        let suspension_binding = binding(LeaseState::Prepared, 1);
+        let suspension = ProviderSuspensionRef {
+            provider_instance_id: suspension_binding.provider_instance_id,
+            suspension_id: Uuid::new_v4(),
+            reference_id: Uuid::new_v4(),
+            content_digest: format!("sha256:{}", "d".repeat(64)),
+            source_lease_id: Uuid::new_v4(),
+            source_generation: 2,
+            root_filesystem_bytes: 4096,
+            guest_memory_bytes: 8192,
+        };
+        let suspension_restore = PreparedLease {
+            binding: suspension_binding,
+            resources: PreparedResources::SuspensionRestore {
+                storage: None,
+                attachments: opened_attachments(),
+            },
+        };
+        assert_eq!(
+            validate_suspension_restore(
+                ProviderCapabilities {
+                    opened_checkpoint_restore_resources: true,
+                    ..ProviderCapabilities::default()
+                },
+                suspension_binding.context,
+                &suspension,
+                4096,
+                8192,
+                &suspension_restore,
+            ),
+            Err(ConformanceError::InvalidResources)
+        );
+        validate_suspension_restore(
+            ProviderCapabilities {
+                opened_suspension_restore_resources: true,
+                ..ProviderCapabilities::default()
+            },
+            suspension_binding.context,
+            &suspension,
+            4096,
+            8192,
+            &suspension_restore,
+        )
+        .expect("declared suspension attachments");
     }
 
     #[test]

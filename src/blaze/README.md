@@ -288,16 +288,15 @@ remains unavailable and never restores a checkpoint.
 ### Checkpoint capture and history
 
 `POST /v1/sandboxes/{id}/checkpoint` requires full snapshot support from the
-selected backend. A standard file-backed sandbox also requires storage
-checkpoint support and stores the writable root in the Blaze checkpoint
-directory. A sandbox with a finalized provider lease instead requires the
-optional `DataPlaneCheckpoint` extension. The current provider path freezes
-both writable-root and guest-memory content, while Blaze retains the backend
-snapshot artifacts and an implementation-neutral durable reference.
-Unsupported combinations return HTTP 501 before the backend is quiesced or
-sandbox state changes. New captures publish checkpoint format 3; formats 1 and
-2 remain readable when their original backend and storage requirements are
-available.
+selected backend. Data-plane handling follows the provider's declared
+integration mode, not the mere presence of a provider lease. The optional
+`DataPlaneCheckpoint` extension owns one complete writable-root and
+guest-memory image. A provider that declares `daemon_managed_storage` instead
+uses the configured storage provider for root capture and does not need that
+extension; the standard file provider follows this path. Unsupported
+combinations return HTTP 501 before the backend is quiesced or sandbox state
+changes. New captures publish checkpoint format 3; formats 1 and 2 remain
+readable when their original backend and storage requirements are available.
 
 `GET /v1/sandboxes/{id}/checkpoints` returns committed history summaries,
 including parentage, logical size, current-HEAD status, and HEAD reachability.
@@ -341,11 +340,13 @@ grow with the total checkpoint history. Operators should investigate storage
 corruption instead of repeatedly calling prune.
 
 `POST /v1/sandboxes/{id}/rollback/{checkpoint_id}` requires a compatible
-backend restore adapter. A file-backed checkpoint also requires storage
-restore support; a provider-managed checkpoint requires the current build-time
-provider to expose `DataPlaneCheckpoint` and to match the recorded provider
-identity. The daemon verifies the selected checkpoint, its parent chain,
-runtime identity, and all artifact hashes before changing runtime state.
+backend restore adapter. A checkpoint captured through
+`daemon_managed_storage` requires storage restore support, even when its active
+lease came from a build-time provider. Only a checkpoint containing a
+provider-owned immutable reference requires the current build-time provider to
+expose `DataPlaneCheckpoint` and match the recorded provider identity. The
+daemon verifies the selected checkpoint, its parent chain, runtime identity,
+and all artifact hashes before changing runtime state.
 
 The file provider stages a separate rootfs copy while the current backend is
 still running. After the old backend stops, the daemon selects that copy,
@@ -360,7 +361,7 @@ stopped — retains the resources that actually exist and marks the sandbox
 `RecoveryRequired`, so a later destroy can finish cleanup without losing
 process ownership.
 
-For a provider-managed checkpoint, Blaze prepares a distinct replacement lease
+For a provider-owned checkpoint, Blaze prepares a distinct replacement lease
 from the immutable reference while the current backend remains running; it
 never reuses the active lease. After the stop boundary, Blaze starts the
 replacement from the daemon-owned backend payload and provider resources,
@@ -378,14 +379,16 @@ for response fields, supported capability combinations, and failure handling.
 ### Hibernation and resume
 
 Hibernation is available only when the running backend supports full snapshot
-capture and its configured adapter can restore the same backend version. A
-provider-backed sandbox also requires `DataPlaneSuspend`, a finalized lease,
-and guest protocol version 1 with `prepare_hibernate`, `reseed_rng`, and
-`post_restore`. These compatibility checks happen before the lifecycle journal
-changes, so an unsupported combination leaves the sandbox running. How the
-workload is brought to a consistent stop is left to the backend's
-quiesce-for-capture hook, whose default pauses the backend; a self-freezing
-backend overrides that hook and needs no separate pause support.
+capture and its configured adapter can restore the same backend version.
+Provider-owned hibernation additionally requires `DataPlaneSuspend`, a
+finalized lease, and guest protocol version 1 with `prepare_hibernate`,
+`reseed_rng`, and `post_restore`. A provider that declares
+`daemon_managed_storage` uses the configured storage provider instead and does
+not need the suspension extension. These compatibility checks happen before
+the lifecycle journal changes, so an unsupported combination leaves the
+sandbox running. How the workload is brought to a consistent stop is left to
+the backend's quiesce-for-capture hook, whose default pauses the backend; a
+self-freezing backend overrides that hook and needs no separate pause support.
 
 On the standard file path, a successful hibernate:
 
@@ -402,10 +405,11 @@ when persisting the hibernating intent crosses an uncertain durability boundary
 it: the durable record may then disagree with the live runtime, so the sandbox
 is retained as `RecoveryRequired` instead.
 
-On the provider path, the provider freezes immutable writable-root and
-guest-memory content at the same quiescent boundary as the backend snapshot.
-After the backend stops, Blaze stops and releases the active lease; the
-hibernated sandbox retains only the immutable suspension reference.
+On the provider-owned extension path, the provider freezes one complete
+immutable writable-root and guest-memory image at the same quiescent boundary
+as the backend snapshot. After the backend stops, Blaze stops and releases the
+active lease; the hibernated sandbox retains only the immutable suspension
+reference.
 
 Resume verifies the manifest identity, exact file set, and artifact digests
 before starting a replacement backend. The standard file path may wait for
@@ -416,11 +420,12 @@ returns the sandbox to `Hibernated` so the request can be retried; if the
 replacement's cleanup cannot be confirmed, its owner and operation journal
 remain available through `RecoveryRequired`.
 
-The standard file path retains its storage slot while hibernated. The provider
-path retains no active lease and prepares a fresh lease for every resume. Both
-paths retain the latest resumable image or reference until the next hibernate
-replaces it or an explicit destroy removes it. The daemon does not
-automatically complete an interrupted hibernate or resume after restart.
+The daemon-managed path retains its storage slot while hibernated. The
+provider-owned extension path retains no active lease and prepares a fresh
+lease for every resume. Both paths retain the latest resumable image or
+reference until the next hibernate replaces it or an explicit destroy removes
+it. The daemon does not automatically complete an interrupted hibernate or
+resume after restart.
 
 See the [hibernation and resume user guide](../../docs/user-guide/en/runtime/blaze.md#hibernation-and-resume)
 for the status-code contract, artifact verification, and failure ownership.

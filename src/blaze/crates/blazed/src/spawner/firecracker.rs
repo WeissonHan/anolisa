@@ -624,6 +624,7 @@ impl BackendSpawner for FirecrackerSpawner {
             backend: BackendKind::Firecracker,
             version: Some(read_pinned_backend_version(executable).await?),
             snapshot_kind: SnapshotKind::Full,
+            consumes_typed_opened_attachments: true,
         }))
     }
 

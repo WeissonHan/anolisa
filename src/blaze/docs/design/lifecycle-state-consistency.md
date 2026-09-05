@@ -17,10 +17,15 @@ reusable sandbox instances.
 
 ## Terms and owned objects
 
-The **state root** is the directory configured by `daemon.state_dir`. Each
-persisted sandbox record is stored in one canonically named UUID directory
-below that root. Its `state.json` file contains the lifecycle record used
-during restart.
+The **configured state root** is the directory named by `daemon.state_dir`.
+The standard file daemon also uses it as the **effective state root**. A daemon
+with a build-time provider derives a non-UUID effective child from the provider
+contract revision and instance identity, while retaining the configured root
+as its process-coordination boundary. The exact public rule is documented in
+[Build-time Data-plane Providers](build-time-data-plane-providers.md#lifecycle-state-namespace).
+Each persisted sandbox record is stored in one canonically named UUID directory
+below the effective root. Its `state.json` file contains the lifecycle record
+used during restart.
 
 `StateStore` is the supported entry point for lifecycle-record persistence. It
 keeps the opened state-root directory object for its lifetime instead of
@@ -36,8 +41,9 @@ backend operations.
 ## Writer coordination
 
 A production daemon takes a non-blocking exclusive advisory lock on the opened
-state root before it scans lifecycle records. Another Blaze daemon following
-the same protocol cannot start with that state root until the first daemon
+configured state root before it scans lifecycle records. A build-time provider
+daemon also locks its effective child root. Another Blaze daemon following the
+same protocol cannot start with that configured root until the first daemon
 releases the lock.
 
 Inside one daemon, the startup scan holds the `StateStore` run-directory map
@@ -55,7 +61,9 @@ writers inside one daemon.
 Startup follows this order:
 
 1. Open the configured state root, take its advisory lock, and retain that
-   opened directory object.
+   opened directory object. For a build-time provider, create and open the
+   identity-derived effective child relative to the retained descriptor and
+   lock it as well.
 2. Enumerate UUID-owned entries and build private instance and retained-owner
    maps. For every UUID entry, require:
    - a canonical lowercase, hyphenated UUID directory name;
@@ -111,11 +119,13 @@ contain its previous state.
 operations hold the same per-sandbox operation lock used by lifecycle and
 guest requests. Capture requires a `Running` record with no unfinished
 operation, a live matching backend owner, and full capture support from the
-backend. The standard file path also requires storage capture support. A
-provider-backed path requires a finalized lease and `DataPlaneCheckpoint`; the
-current provider path owns both writable-root and guest-memory content. An
-unsupported combination returns `501 Not Implemented` before the backend is
-quiesced or lifecycle state changes.
+backend. A data plane that declares `daemon_managed_storage` also requires
+storage capture support, whether its active lease comes from the standard file
+provider or another build-time provider. The provider-owned extension path
+instead requires a finalized lease and `DataPlaneCheckpoint`, whose reference
+owns the complete writable-root and guest-memory image. An unsupported
+combination returns `501 Not Implemented` before the backend is quiesced or
+lifecycle state changes.
 
 Capture uses this durable order:
 
@@ -193,9 +203,10 @@ instead of retried as an empty prune.
 `POST /v1/sandboxes/{id}/rollback/{checkpoint_id}` replaces a running sandbox
 from one verified full checkpoint. Before mutation, Blaze verifies the complete
 checkpoint ancestry and artifacts, matches the policy, image, backend, version,
-and snapshot kind, and requires an explicit backend restore capability. A file
-checkpoint also requires storage restore; a provider-managed checkpoint
-requires `DataPlaneCheckpoint` from the matching provider instance. Unsupported
+and snapshot kind, and requires an explicit backend restore capability. A
+checkpoint captured through `daemon_managed_storage` also requires storage
+restore; a checkpoint containing a provider-owned reference requires
+`DataPlaneCheckpoint` from the matching provider instance. Unsupported
 combinations return `501 Not Implemented` while the current backend and
 lifecycle record remain unchanged.
 

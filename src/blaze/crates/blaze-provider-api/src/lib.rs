@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use blaze_core::backend::BackendKind;
 use blaze_core::checkpoint::ProviderCheckpointRecord;
 use blaze_core::data_plane::{
-    BackendProcessIdentity, DataPlaneLeaseRecord, DataPlaneLeaseState, DataPlaneSuspensionRecord,
+    BackendProcessIdentity, DataPlaneLeaseRecord, DataPlaneLeaseState,
+    DataPlaneRequestContextRecord, DataPlaneSuspensionRecord,
 };
 use blaze_core::storage::{StorageSlot, TemplateStorage};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,18 @@ use uuid::Uuid;
 
 /// First source-level provider contract understood by Blaze.
 pub const PROVIDER_CONTRACT_VERSION: u16 = 1;
+
+/// Maximum UTF-8 byte length of an inventory continuation cursor.
+///
+/// Cursors are opaque to Blaze, but bounding them prevents an untrusted
+/// provider from growing daemon memory without limit during restart.
+pub const MAX_INVENTORY_CURSOR_BYTES: usize = 4 * 1024;
+
+/// Maximum number of pages Blaze accepts from one frozen inventory.
+///
+/// Providers must put at least one lease in every non-final page, so this
+/// bound also limits traversals whose cursors never repeat.
+pub const MAX_INVENTORY_PAGES: usize = 4 * 1024;
 
 /// Opaque identity and contract revision of one provider instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,8 +56,12 @@ pub struct ProviderCapabilities {
     pub images: bool,
     /// Prepare a sandbox from a published runtime template.
     pub templates: bool,
-    /// Return typed, already-opened resources for a template restore.
-    pub opened_restore_resources: bool,
+    /// A template preparation may return typed, already-opened resources.
+    pub opened_template_restore_resources: bool,
+    /// A checkpoint restore may return typed, already-opened resources.
+    pub opened_checkpoint_restore_resources: bool,
+    /// A suspension resume may return typed, already-opened resources.
+    pub opened_suspension_restore_resources: bool,
     /// Allow Blaze to manage path-backed resources through its configured
     /// `StorageProvider`.
     ///
@@ -71,6 +88,30 @@ pub struct RequestContext {
     pub generation: u64,
 }
 
+impl From<RequestContext> for DataPlaneRequestContextRecord {
+    fn from(context: RequestContext) -> Self {
+        Self {
+            instance_id: context.instance_id,
+            request_id: context.request_id,
+            operation_id: context.operation_id,
+            lease_id: context.lease_id,
+            generation: context.generation,
+        }
+    }
+}
+
+impl From<DataPlaneRequestContextRecord> for RequestContext {
+    fn from(context: DataPlaneRequestContextRecord) -> Self {
+        Self {
+            instance_id: context.instance_id,
+            request_id: context.request_id,
+            operation_id: context.operation_id,
+            lease_id: context.lease_id,
+            generation: context.generation,
+        }
+    }
+}
+
 /// Immutable source selected by the public control operation.
 #[derive(Debug)]
 pub enum PrepareSource {
@@ -81,6 +122,44 @@ pub enum PrepareSource {
     },
     /// Materialize one already-validated runtime template.
     Template(TemplateSource),
+}
+
+impl PrepareSource {
+    /// Return a stable digest of the immutable source selected for preparation.
+    ///
+    /// The digest is independent of Rust layout and does not include opened
+    /// file descriptors or local paths. A storage provider can therefore bind
+    /// an idempotent prepare request to the same public image or validated
+    /// template across daemon restarts.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"blaze.prepare-source.v1\0");
+        match self {
+            Self::Image { image_digest } => {
+                hasher.update(b"image\0");
+                hash_length_prefixed(&mut hasher, image_digest.as_bytes());
+            }
+            Self::Template(source) => {
+                hasher.update(b"template\0");
+                hash_length_prefixed(&mut hasher, source.image_digest.as_bytes());
+                for (role, artifact) in [
+                    (b"vm-state".as_slice(), &source.storage.vmstate),
+                    (b"guest-memory".as_slice(), &source.storage.memory),
+                    (b"root-filesystem".as_slice(), &source.storage.rootfs),
+                ] {
+                    hash_length_prefixed(&mut hasher, role);
+                    hasher.update(artifact.size_bytes.to_be_bytes());
+                    hash_length_prefixed(&mut hasher, artifact.sha256.as_bytes());
+                }
+            }
+        }
+        hasher.finalize().into()
+    }
+}
+
+fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(value);
 }
 
 /// Opened template artifacts and their public image identity.
@@ -114,24 +193,6 @@ pub enum AttachmentRole {
     GuestMemory,
 }
 
-/// Access mode frozen when an attachment is opened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachmentAccess {
-    /// Consumer cannot modify the object.
-    ReadOnly,
-    /// Consumer may read and write the object.
-    ReadWrite,
-}
-
-/// Sharing rule of one opened attachment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachmentSharing {
-    /// Exactly one backend may consume the object.
-    Exclusive,
-    /// Multiple consumers may share an immutable object.
-    SharedReadOnly,
-}
-
 /// Filesystem object kind expected from descriptor metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentKind {
@@ -148,12 +209,8 @@ pub enum AttachmentKind {
 pub struct OpenedAttachment {
     /// Purpose understood by the backend restore adapter.
     pub role: AttachmentRole,
-    /// Owned descriptor transferred to Blaze for backend consumption.
+    /// Read-write descriptor transferred exclusively to one backend owner.
     pub descriptor: OwnedFd,
-    /// Declared access mode, checked again by Blaze.
-    pub access: AttachmentAccess,
-    /// Declared sharing rule.
-    pub sharing: AttachmentSharing,
     /// Declared object kind, checked again by Blaze.
     pub kind: AttachmentKind,
     /// Logical extent exposed to the backend.
@@ -394,6 +451,10 @@ pub struct ReleaseResult {
 }
 
 /// Opaque, immutable provider content paired with one public checkpoint.
+///
+/// The presence of this reference means the provider owns the complete
+/// data-plane image: both the writable root filesystem and guest memory.
+/// Partial provider ownership is not supported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCheckpointRef {
     /// Build-time provider instance that owns the immutable content.
@@ -410,10 +471,6 @@ pub struct ProviderCheckpointRef {
     pub source_lease_id: Uuid,
     /// Source lease generation after the provider accepted capture.
     pub source_generation: u64,
-    /// Whether this reference owns the writable root-filesystem view.
-    pub root_filesystem: bool,
-    /// Whether this reference owns the guest-memory view.
-    pub guest_memory: bool,
 }
 
 impl ProviderCheckpointRef {
@@ -427,8 +484,6 @@ impl ProviderCheckpointRef {
             parent_reference_id: self.parent_reference_id,
             source_lease_id: self.source_lease_id,
             source_generation: self.source_generation,
-            root_filesystem: self.root_filesystem,
-            guest_memory: self.guest_memory,
         }
     }
 
@@ -442,8 +497,6 @@ impl ProviderCheckpointRef {
             parent_reference_id: record.parent_reference_id,
             source_lease_id: record.source_lease_id,
             source_generation: record.source_generation,
-            root_filesystem: record.root_filesystem,
-            guest_memory: record.guest_memory,
         }
     }
 }
@@ -490,7 +543,9 @@ pub struct RetireCheckpointRequest {
     pub public_checkpoint_id: Uuid,
     /// Absent only when capture had an unknown outcome before a reference was returned.
     pub reference_id: Option<Uuid>,
-    /// Idempotency identity chosen by Blaze for this retirement attempt.
+    /// Stable idempotency identity derived from the complete public owner tuple.
+    ///
+    /// Repeating retirement after a daemon restart uses the same value.
     pub operation_id: Uuid,
 }
 
@@ -506,6 +561,10 @@ pub struct RetireCheckpointResult {
 }
 
 /// Opaque, immutable provider content retained while a sandbox is hibernated.
+///
+/// The presence of this reference means the provider owns the complete
+/// data-plane image: both the writable root filesystem and guest memory.
+/// Partial provider ownership is not supported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSuspensionRef {
     /// Build-time provider instance that owns the immutable content.
@@ -520,10 +579,6 @@ pub struct ProviderSuspensionRef {
     pub source_lease_id: Uuid,
     /// Source lease generation after the provider accepted suspension.
     pub source_generation: u64,
-    /// Whether this reference owns the retained root-filesystem view.
-    pub root_filesystem: bool,
-    /// Whether this reference owns the retained guest-memory view.
-    pub guest_memory: bool,
     /// Logical root-filesystem extent required by a fresh resume lease.
     pub root_filesystem_bytes: u64,
     /// Logical guest-memory extent required by a fresh resume lease.
@@ -540,8 +595,6 @@ impl ProviderSuspensionRef {
             content_digest: self.content_digest.clone(),
             source_lease_id: self.source_lease_id,
             source_generation: self.source_generation,
-            root_filesystem: self.root_filesystem,
-            guest_memory: self.guest_memory,
             root_filesystem_bytes: self.root_filesystem_bytes,
             guest_memory_bytes: self.guest_memory_bytes,
         }
@@ -556,8 +609,6 @@ impl ProviderSuspensionRef {
             content_digest: record.content_digest.clone(),
             source_lease_id: record.source_lease_id,
             source_generation: record.source_generation,
-            root_filesystem: record.root_filesystem,
-            guest_memory: record.guest_memory,
             root_filesystem_bytes: record.root_filesystem_bytes,
             guest_memory_bytes: record.guest_memory_bytes,
         }
@@ -608,7 +659,9 @@ pub struct RetireSuspensionRequest {
     pub suspension_id: Uuid,
     /// Absent only when capture had an unknown outcome before a reference returned.
     pub reference_id: Option<Uuid>,
-    /// Idempotency identity chosen by Blaze for this retirement attempt.
+    /// Stable idempotency identity derived from the complete public owner tuple.
+    ///
+    /// Repeating retirement after a daemon restart uses the same value.
     pub operation_id: Uuid,
 }
 
@@ -770,13 +823,21 @@ pub struct InventoryPageRequest {
     pub page_size: u32,
 }
 
-/// One provider lease visible in the frozen inventory.
+/// One non-released provider lease visible in the frozen inventory.
+///
+/// Released leases no longer own resources and must be omitted. Returning a
+/// released tombstone makes the complete inventory invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InventoryLease {
     pub binding: LeaseBinding,
 }
 
 /// Bounded inventory page. A missing cursor completes the traversal.
+///
+/// A continuation cursor must be non-empty and no longer than
+/// [`MAX_INVENTORY_CURSOR_BYTES`]. A page carrying a continuation cursor must
+/// contain at least one lease. Blaze also stops after [`MAX_INVENTORY_PAGES`]
+/// even when every cursor is distinct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryPage {
     pub leases: Vec<InventoryLease>,
@@ -792,8 +853,6 @@ pub enum ReconcileAction {
     },
     /// Retain resources without allowing them to serve traffic or be reused.
     Quarantine,
-    /// Release resources whose public owner is terminal or absent.
-    Release,
 }
 
 /// Reconcile one observed provider lease against a public expectation.
@@ -850,7 +909,7 @@ pub trait DataPlaneCheckpoint: DataPlaneProvider {
 
 /// Optional hibernation capture, fresh-lease resume, and retirement extension.
 #[async_trait]
-pub trait DataPlaneSuspend: DataPlaneCheckpoint {
+pub trait DataPlaneSuspend: DataPlaneProvider {
     /// Capture immutable provider content at the backend's quiesce boundary.
     async fn suspend(&self, request: SuspendRequest)
     -> Result<SuspensionSubmission, ProviderError>;
@@ -911,6 +970,10 @@ pub trait DataPlaneProvider: Send + Sync {
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedLease, ProviderError>;
 
     /// Observe one lease without creating, stopping, or releasing resources.
+    ///
+    /// Return [`ProviderError::NotFound`] only when no provider state exists
+    /// for the complete request context. A colliding lease identity with a
+    /// different context is a conflict, not absence.
     async fn inspect(&self, request: InspectRequest) -> Result<ObservedLease, ProviderError>;
 
     /// Mark backend readiness before public state is published.
@@ -957,6 +1020,39 @@ mod tests {
     }
 
     #[test]
+    fn durable_request_context_round_trip_preserves_every_identity() {
+        let context = RequestContext {
+            instance_id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
+            generation: 7,
+        };
+
+        let durable = DataPlaneRequestContextRecord::from(context);
+
+        assert_eq!(RequestContext::from(durable), context);
+    }
+
+    #[test]
+    fn durable_checkpoint_round_trip_preserves_complete_owner_identity() {
+        let checkpoint = ProviderCheckpointRef {
+            provider_instance_id: Uuid::new_v4(),
+            public_checkpoint_id: Uuid::new_v4(),
+            reference_id: Uuid::new_v4(),
+            content_digest: format!("sha256:{}", "b".repeat(64)),
+            parent_reference_id: Some(Uuid::new_v4()),
+            source_lease_id: Uuid::new_v4(),
+            source_generation: 9,
+        };
+
+        assert_eq!(
+            ProviderCheckpointRef::from_record(&checkpoint.to_record()),
+            checkpoint
+        );
+    }
+
+    #[test]
     fn durable_suspension_round_trip_preserves_resume_contract() {
         let suspension = ProviderSuspensionRef {
             provider_instance_id: Uuid::new_v4(),
@@ -965,8 +1061,6 @@ mod tests {
             content_digest: format!("sha256:{}", "a".repeat(64)),
             source_lease_id: Uuid::new_v4(),
             source_generation: 9,
-            root_filesystem: true,
-            guest_memory: true,
             root_filesystem_bytes: 8 * 1024 * 1024 * 1024,
             guest_memory_bytes: 512 * 1024 * 1024,
         };

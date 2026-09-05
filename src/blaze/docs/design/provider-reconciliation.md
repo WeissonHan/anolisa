@@ -62,11 +62,13 @@ the exact lease. The provider must preserve every identity, advance exactly one
 generation, and return `Finalized`. Blaze persists that result before serving
 the sandbox.
 
-Any mismatch is fail-closed. Blaze asks the provider to quarantine retained
-resources, stops a proven backend owner when safe, and marks the public sandbox
-`RecoveryRequired`. A provider-only lease is also quarantined. Blaze never
-guesses ownership, adopts by path, or releases a resource through an untrusted
-identity.
+Startup first settles durable transition journals, retries obsolete content
+retirement, and cleans known interrupted lifecycle transactions. Only a real
+mismatch that remains after those steps is fail-closed: Blaze asks the provider
+to quarantine retained resources, stops a proven backend owner when safe, and
+marks the public sandbox `RecoveryRequired`. A provider-only lease is also
+quarantined. Blaze never guesses ownership, adopts by path, or releases a
+resource through an untrusted identity.
 
 ## Crash boundaries
 
@@ -74,11 +76,11 @@ The ordering is deliberately asymmetric:
 
 | Boundary | Durable evidence after a crash | Restart action |
 |---|---|---|
-| Provider prepared, backend not started | Prepared lease | Compensate or quarantine; never adopt |
-| Backend started, public state not running | Lease plus backend identity | Clean up or quarantine; never publish running |
+| Provider prepared, backend not started | Prepared lease and operation journal | Settle the journal and clean up; never adopt |
+| Backend started, public state not running | Lease plus backend identity | Settle the known transaction and clean up; never publish running |
 | Public running, provider committed | Exact committed lease and backend identity | Complete adoption to finalized |
 | Public running, provider finalized | Exact finalized lease and backend identity | Re-adopt with a new generation |
-| Provider adoption succeeded but public persistence failed | Provider state is quarantined when possible | Keep public state recovery-required |
+| Provider adoption succeeded but public persistence failed | Exact adoption before-image and target are in the transition WAL | Inspect, persist the exact successor, and resume adoption |
 
 `OutcomeUnknown` is not success. Implementations must retain enough evidence
 for a later `inspect` or inventory traversal to resolve it.

@@ -12,10 +12,11 @@ exclusive lease; it never reactivates the lease that was released during
 hibernation.
 
 This contract is used only when the build-time provider exposes the suspension
-extension. File-backed sandboxes keep the existing file hibernation path. The
-durable lifecycle state stores a portable provider reference rather than
-depending on an extension's resource model. That ownership record is not part
-of the management HTTP response.
+extension. A provider that declares `daemon_managed_storage`, including the
+standard file provider, keeps the existing storage hibernation path without
+this extension. The durable lifecycle state stores a portable provider
+reference rather than depending on an extension's resource model. That
+ownership record is not part of the management HTTP response.
 
 ## Ownership model
 
@@ -25,17 +26,17 @@ One provider-backed hibernation image has three distinct owners:
 |---|---|
 | Blaze | Sandbox lifecycle, backend snapshot payload, artifact hashes, operation phase, and public hibernation directory |
 | Provider | Immutable root-filesystem and guest-memory content, content manifest, and all provider cleanup state |
-| Shared contract | Provider instance, suspension, opaque reference and source-lease identities, logical extents, ownership flags, and manifest digest |
+| Shared contract | Provider instance, suspension, opaque reference and source-lease identities, logical extents, and manifest digest |
 
 The suspension identity is allocated before provider mutation and makes an
 unknown capture retryable. The opaque reference identifies the exact immutable
 object returned by the provider. Blaze records both identities because a
 request can have an unknown outcome before an exact reference is received.
 
-The current manager integration requires one provider to own both the writable
-root-filesystem view and the guest-memory view. Although the reference type has
-separate ownership flags, partial ownership is rejected because Blaze does not
-yet coordinate an atomic capture across multiple data-plane owners.
+The reference has no per-resource ownership flags. Its presence means one
+provider owns both the writable-root and guest-memory views as a complete,
+internally consistent image. Partial ownership is outside this contract because
+Blaze does not coordinate an atomic capture across multiple data-plane owners.
 
 ## Guest recovery contract
 
@@ -77,12 +78,14 @@ The successful sequence is:
    `Hibernated`; and
 10. retire any older suspension only after the replacement image is durable.
 
-If capture returns `OutcomeUnknown`, Blaze retries with the same suspension
-identity. If it cannot trust an exact returned reference, it asks the provider
-to retire any content created for that identity. Before backend termination,
+If capture returns `OutcomeUnknown`, Blaze does not repeat the capture blindly.
+It inspects the active lease and accepts only the exact generation before the
+call or its exact one-generation successor, then asks the provider to retire
+content by the preallocated suspension identity. A known reference is retired
+by its complete public and provider identity. Before backend termination,
 successful cleanup is followed by backend unquiesce and a return to `Running`.
-After backend termination or whenever cleanup cannot be proven, Blaze retains
-the ownership ledger and enters `RecoveryRequired`.
+After backend termination or whenever inspection or cleanup cannot be proven,
+Blaze retains the write-ahead ownership ledger and enters `RecoveryRequired`.
 
 ## Resume transaction
 
@@ -117,14 +120,13 @@ the manager never invents an opaque provider identifier.
 
 Deletion also releases any active or replacement lease before it commits the
 terminal `Destroyed` state. A terminal record is invalid while it retains an
-active lease, replacement lease, suspension reference, pending suspension
-identity, or pending retirement.
+active lease, replacement lease, suspension reference, or pending suspension
+retirement.
 
 ## Provider requirements
 
 An implementation of `DataPlaneSuspend` must:
 
-- also satisfy the provider checkpoint contract;
 - make `suspend` idempotent by the preselected suspension identity;
 - capture a root-and-memory view from the quiescent source lease and advance
   that finalized lease by exactly one generation;
@@ -133,17 +135,22 @@ An implementation of `DataPlaneSuspend` must:
   prepared lease with exact logical extents;
 - return either one valid path-backed slot or one complete set of typed opened
   attachments;
-- make retirement idempotent for both known references and unknown capture
-  outcomes; and
+- make retirement idempotent by the complete provider instance, public
+  suspension, and optional reference identity; accept the same deterministically
+  derived operation identity after a daemon restart; and
 - retain enough durable state for inventory and operator recovery after a
   daemon interruption.
+
+The suspension and checkpoint extensions are independent. A provider may
+implement either extension without implementing the other.
 
 ## Verification boundary
 
 The public tests cover contract validation, guest negotiation, entropy and
 clock response validation, active-lease release, fresh-lease resume, daemon
-restart while cleanly hibernated, pre-mutation rejection of an incompatible
-guest, retry after backend-start failure, and retirement during deletion.
+restart while cleanly hibernated, startup retry of obsolete retirement records,
+pre-mutation rejection of an incompatible guest, retry after backend-start
+failure, and retirement during deletion.
 
 The current manager fails closed for an interruption inside an unfinished
 hibernate or resume transaction: it preserves the ledger and requires recovery

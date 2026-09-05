@@ -7,8 +7,9 @@
 Blaze can pair daemon-owned backend snapshot artifacts with immutable data-plane
 content owned by a build-time provider. This is an optional extension of
 `DataPlaneProvider`: a provider-backed sandbox uses it only when the compiled
-provider exposes `DataPlaneCheckpoint`. File-backed sandboxes continue to use
-the existing storage checkpoint path.
+provider exposes `DataPlaneCheckpoint`. A provider that declares
+`daemon_managed_storage`, including the standard file provider, continues to
+use the existing storage checkpoint path without this extension.
 
 The contract represents extension-owned content through bounded opaque
 identities and an integrity digest. Each provider materializes and validates the
@@ -28,19 +29,18 @@ One public checkpoint is complete only when both sides of this boundary agree:
 |---|---|
 | Blaze | Public checkpoint UUID, sandbox and runtime identity, parent, backend payload and hashes |
 | Provider | Writable-root and guest-memory content, provider-managed lineage and content metadata |
-| Shared contract | Provider instance UUID, public checkpoint UUID, opaque reference UUID, parent reference, source lease generation, ownership flags and provider-manifest digest |
+| Shared contract | Provider instance UUID, public checkpoint UUID, opaque reference UUID, parent reference, source lease generation and provider-manifest digest |
 
 The public checkpoint UUID and opaque reference UUID are deliberately distinct.
 The first binds content to the catalog entry; the provider resolves the second
 through its own identifier scheme. Blaze rejects a record when either identity
-is nil, the public identity does not match its
-catalog location, the digest is not canonical SHA-256, or the record owns
-neither root filesystem nor guest memory.
+is nil, the public identity does not match its catalog location, or the digest
+is not canonical SHA-256.
 
-The current manager requires the provider to own both root filesystem and guest
-memory. Partial ownership is representable for future composition but is not
-accepted by the capture path because it would require another atomic
-coordinator across independently committed payloads.
+The reference has no per-resource ownership flags. Its presence means the
+provider owns one complete, internally consistent writable-root and guest-memory
+image. Blaze does not support or represent partial ownership because that would
+require another atomic coordinator across independently committed payloads.
 
 ## Capture transaction
 
@@ -56,12 +56,14 @@ uses it as the idempotency identity for capture. The order is:
 7. remove the pending-retirement marker only after publication is durable; and
 8. unquiesce the backend and complete the public operation.
 
-An `OutcomeUnknown` capture is retried with the same public checkpoint identity.
-If no reference can be trusted, Blaze asks the provider to retire anything
-created for that identity without inventing a provider object ID. A known
-unpublished reference is retired before the backend is resumed. If retirement
-cannot be proven, the sandbox enters `RecoveryRequired` and the durable pending
-record is retained.
+An `OutcomeUnknown` capture is not repeated blindly. Blaze inspects the active
+lease and accepts only the exact generation before the call or its exact
+one-generation successor. It then asks the provider to retire content by the
+preallocated public checkpoint identity, without inventing a provider object
+ID. A known unpublished reference is retired by its complete public and
+provider identity before the backend is resumed. If inspection or retirement
+cannot be proven, the sandbox enters `RecoveryRequired` and the durable
+write-ahead identity remains available for startup recovery.
 
 ## Restore transaction
 
@@ -113,7 +115,9 @@ An implementation of `DataPlaneCheckpoint` must:
 - freeze an immutable, internally consistent root-and-memory view;
 - validate reference lineage and the canonical manifest digest on restore;
 - return a new exclusive prepared lease rather than the source lease;
-- make retirement idempotent for both known and unknown capture outcomes; and
+- make retirement idempotent by the complete provider instance, public
+  checkpoint, and optional reference identity; accept the same deterministically
+  derived operation identity after a daemon restart;
 - preserve content until Blaze has removed the corresponding public owner.
 
 The conformance crate validates provider-independent identities, transitions,

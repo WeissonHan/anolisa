@@ -111,6 +111,12 @@ pub struct RestoreCapability {
     pub version: Option<String>,
     /// Snapshot flavor accepted by the adapter.
     pub snapshot_kind: SnapshotKind,
+    /// Whether this adapter consumes typed, already-opened restore attachments.
+    ///
+    /// A provider may transfer such attachments only when this is `true`.
+    /// Path-only adapters must leave it `false` so callers can reject an
+    /// incompatible provider before the provider allocates resources.
+    pub consumes_typed_opened_attachments: bool,
 }
 
 /// Complete input for restoring an owned backend instance.

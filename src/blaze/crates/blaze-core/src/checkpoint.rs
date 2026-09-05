@@ -59,7 +59,9 @@ pub struct CheckpointArtifact {
 /// Implementation-neutral durable identity of provider-owned checkpoint data.
 ///
 /// The bounded identity and integrity fields let different provider resource
-/// models share the same durable Blaze checkpoint schema.
+/// models share the same durable Blaze checkpoint schema. The presence of this
+/// record denotes provider ownership of the complete writable-root and
+/// guest-memory image; partial provider ownership is not supported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCheckpointRecord {
     /// Build-time provider instance that owns the content.
@@ -77,10 +79,6 @@ pub struct ProviderCheckpointRecord {
     pub source_lease_id: Uuid,
     /// Lease generation after the provider accepted this capture.
     pub source_generation: u64,
-    /// Whether the provider owns the checkpoint's writable root filesystem.
-    pub root_filesystem: bool,
-    /// Whether the provider owns the checkpoint's guest-memory data.
-    pub guest_memory: bool,
 }
 
 /// Durable checkpoint identity and integrity manifest.
@@ -378,13 +376,6 @@ fn validate_provider_checkpoint(
             checkpoint_id: checkpoint_id.to_string(),
             field: "provider_checkpoint.parent_reference_id",
             reason: "provider checkpoint cannot be its own parent".to_string(),
-        });
-    }
-    if !provider.root_filesystem && !provider.guest_memory {
-        return Err(CheckpointValidationError::InvalidField {
-            checkpoint_id: checkpoint_id.to_string(),
-            field: "provider_checkpoint",
-            reason: "provider checkpoint owns neither root filesystem nor guest memory".to_string(),
         });
     }
     validate_sha256_identity(
@@ -809,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_checkpoint_requires_bounded_generic_identity() {
+    fn provider_checkpoint_requires_bounded_complete_owner_identity() {
         let mut metadata = metadata();
         let public_checkpoint_id = validate_checkpoint_id(&metadata.id).expect("checkpoint id");
         metadata.provider_checkpoint = Some(ProviderCheckpointRecord {
@@ -820,11 +811,18 @@ mod tests {
             parent_reference_id: None,
             source_lease_id: Uuid::new_v4(),
             source_generation: 7,
-            root_filesystem: true,
-            guest_memory: true,
         });
         validate_checkpoint_manifest(&metadata, metadata.sandbox_id, &metadata.id)
             .expect("generic provider identity is valid");
+        let encoded = serde_json::to_value(
+            metadata
+                .provider_checkpoint
+                .as_ref()
+                .expect("provider checkpoint"),
+        )
+        .expect("serialize provider checkpoint");
+        assert!(encoded.get("root_filesystem").is_none());
+        assert!(encoded.get("guest_memory").is_none());
 
         metadata
             .provider_checkpoint
