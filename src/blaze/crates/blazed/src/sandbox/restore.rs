@@ -352,7 +352,7 @@ impl SandboxManager {
                 RestoreRequest {
                     instance_id: id,
                     binary_path: request.binary_path,
-                    storage,
+                    storage: Some(storage),
                     payload_dir: backend_payload_dir,
                     checkpoint_backend: target_metadata.backend,
                     expected_version: target_metadata.backend_version.clone(),

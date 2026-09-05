@@ -40,6 +40,7 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const PID_HANDOFF_GRACE: Duration = Duration::from_secs(1);
 const STOPPED_MARKER: &str = "backend.stopped";
+const MAX_PROVIDER_RESTORE_ATTACHMENTS: usize = 16;
 /// Fixed host-wide lock used to serialize network slot allocation.
 pub(crate) const HOST_NETWORK_COORDINATION_PATH: &str = "/run/lock/blaze-network.lock";
 /// Conventional host directories containing named network namespace objects.
@@ -543,10 +544,317 @@ impl PinnedExecutable {
     pub(crate) fn inherit_into(&self, _command: &mut tokio::process::Command) {}
 }
 
+/// Backend-visible purpose of one provider restore attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderAttachmentRole {
+    /// Writable root drive referenced by the captured virtual-machine state.
+    RootDrive,
+    /// Writable guest-memory backend consumed by snapshot loading.
+    GuestMemory,
+}
+
+impl ProviderAttachmentRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RootDrive => "root-drive",
+            Self::GuestMemory => "guest-memory",
+        }
+    }
+}
+
+/// Access mode frozen on an opened provider attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderAttachmentAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl ProviderAttachmentAccess {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
+        }
+    }
+}
+
+/// Whether an opened attachment may be shared between backend owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderAttachmentSharing {
+    /// The provider lease grants this attachment to one backend owner only.
+    Exclusive,
+    /// Multiple owners may share an immutable attachment.
+    SharedReadOnly,
+}
+
+impl ProviderAttachmentSharing {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exclusive => "exclusive",
+            Self::SharedReadOnly => "shared-read-only",
+        }
+    }
+}
+
+/// Filesystem object kind observed through `fstat` when an attachment arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderAttachmentKind {
+    RegularFile,
+    CharacterDevice,
+    BlockDevice,
+}
+
+impl ProviderAttachmentKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RegularFile => "regular-file",
+            Self::CharacterDevice => "character-device",
+            Self::BlockDevice => "block-device",
+        }
+    }
+}
+
+/// One opened attachment in a provider-bound restore lease.
+///
+/// The descriptor, rather than its host path, is the authority. `consumer_path`
+/// is only the already-provisioned child-visible path a captured backend state
+/// requires; it never identifies the provider resource itself.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderRestoreAttachment {
+    pub(crate) role: ProviderAttachmentRole,
+    pub(crate) file: Arc<std::fs::File>,
+    pub(crate) access: ProviderAttachmentAccess,
+    pub(crate) sharing: ProviderAttachmentSharing,
+    pub(crate) kind: ProviderAttachmentKind,
+    pub(crate) logical_size_bytes: u64,
+    pub(crate) consumer_path: Option<PathBuf>,
+}
+
+/// Open attachments supplied under one provider lease for one backend restore.
+///
+/// This is a daemon-runtime contract, not a public API or persisted checkpoint
+/// shape. The provider remains responsible for the lease until the backend
+/// owner stops. Binding the collection to a sandbox and monotonically changing
+/// generation prevents a handle set from being reused for another instance or
+/// a superseded incarnation of the same lease.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderRestoreAttachments {
+    pub(crate) instance_id: Uuid,
+    pub(crate) lease_id: Uuid,
+    pub(crate) generation: u64,
+    pub(crate) attachments: Vec<ProviderRestoreAttachment>,
+}
+
+impl ProviderRestoreAttachments {
+    /// Validate provider-independent collection invariants before a backend
+    /// applies its own required-role and access rules.
+    pub(crate) fn validate_shape(&self) -> Result<()> {
+        if self.instance_id.is_nil() {
+            return Err(BlazeError::BackendError {
+                msg: "provider attachment collection must bind a non-nil sandbox identifier"
+                    .to_string(),
+            });
+        }
+        if self.lease_id.is_nil() {
+            return Err(BlazeError::BackendError {
+                msg: "provider attachment collection must bind a non-nil lease identifier"
+                    .to_string(),
+            });
+        }
+        if self.generation == 0 {
+            return Err(BlazeError::BackendError {
+                msg: "provider attachment collection generation must be greater than zero"
+                    .to_string(),
+            });
+        }
+        if self.attachments.is_empty() || self.attachments.len() > MAX_PROVIDER_RESTORE_ATTACHMENTS
+        {
+            return Err(BlazeError::BackendError {
+                msg: format!(
+                    "provider attachment collection must contain between 1 and {MAX_PROVIDER_RESTORE_ATTACHMENTS} entries"
+                ),
+            });
+        }
+        for (index, attachment) in self.attachments.iter().enumerate() {
+            if self.attachments[..index]
+                .iter()
+                .any(|candidate| candidate.role == attachment.role)
+            {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "provider attachment collection contains duplicate {} roles",
+                        attachment.role.as_str()
+                    ),
+                });
+            }
+            if attachment.logical_size_bytes == 0
+                || !attachment.logical_size_bytes.is_multiple_of(4096)
+            {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "provider {} attachment size {} must be a non-zero multiple of 4096 bytes",
+                        attachment.role.as_str(),
+                        attachment.logical_size_bytes
+                    ),
+                });
+            }
+            if attachment.sharing == ProviderAttachmentSharing::SharedReadOnly
+                && attachment.access != ProviderAttachmentAccess::ReadOnly
+            {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "provider {} attachment declares {} sharing but is opened {}",
+                        attachment.role.as_str(),
+                        attachment.sharing.as_str(),
+                        attachment.access.as_str()
+                    ),
+                });
+            }
+            let actual_access = opened_attachment_access(&attachment.file, attachment.role)?;
+            if actual_access != attachment.access {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "provider {} attachment declares {} access but its descriptor is {}",
+                        attachment.role.as_str(),
+                        attachment.access.as_str(),
+                        actual_access.as_str()
+                    ),
+                });
+            }
+            let actual_kind = opened_attachment_kind(&attachment.file, attachment.role)?;
+            if actual_kind != attachment.kind {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "provider {} attachment declares kind {} but its descriptor is {}",
+                        attachment.role.as_str(),
+                        attachment.kind.as_str(),
+                        actual_kind.as_str()
+                    ),
+                });
+            }
+            let metadata =
+                attachment
+                    .file
+                    .metadata()
+                    .map_err(|error| BlazeError::BackendError {
+                        msg: format!(
+                            "cannot inspect provider {} attachment: {error}",
+                            attachment.role.as_str()
+                        ),
+                    })?;
+            if metadata.len() != 0 && metadata.len() != attachment.logical_size_bytes {
+                return Err(BlazeError::BackendError {
+                    msg: format!(
+                        "provider {} attachment reports {} bytes but the contract declares {} bytes",
+                        attachment.role.as_str(),
+                        metadata.len(),
+                        attachment.logical_size_bytes
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn attachment(
+        &self,
+        role: ProviderAttachmentRole,
+    ) -> Option<&ProviderRestoreAttachment> {
+        self.attachments
+            .iter()
+            .find(|attachment| attachment.role == role)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.attachments.len()
+    }
+}
+
+#[cfg(unix)]
+fn opened_attachment_access(
+    file: &std::fs::File,
+    role: ProviderAttachmentRole,
+) -> Result<ProviderAttachmentAccess> {
+    use std::os::fd::AsRawFd;
+
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(BlazeError::BackendError {
+            msg: format!(
+                "cannot inspect provider {} attachment access mode: {}",
+                role.as_str(),
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    match flags & libc::O_ACCMODE {
+        libc::O_RDONLY => Ok(ProviderAttachmentAccess::ReadOnly),
+        libc::O_RDWR => Ok(ProviderAttachmentAccess::ReadWrite),
+        _ => Err(BlazeError::BackendError {
+            msg: format!(
+                "provider {} attachment must be opened for reading",
+                role.as_str()
+            ),
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn opened_attachment_access(
+    _file: &std::fs::File,
+    role: ProviderAttachmentRole,
+) -> Result<ProviderAttachmentAccess> {
+    Err(BlazeError::BackendError {
+        msg: format!(
+            "provider {} attachment access inspection requires Unix",
+            role.as_str()
+        ),
+    })
+}
+
+fn opened_attachment_kind(
+    file: &std::fs::File,
+    role: ProviderAttachmentRole,
+) -> Result<ProviderAttachmentKind> {
+    let metadata = file.metadata().map_err(|error| BlazeError::BackendError {
+        msg: format!(
+            "cannot inspect provider {} attachment: {error}",
+            role.as_str()
+        ),
+    })?;
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        return Ok(ProviderAttachmentKind::RegularFile);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        if file_type.is_char_device() {
+            return Ok(ProviderAttachmentKind::CharacterDevice);
+        }
+        if file_type.is_block_device() {
+            return Ok(ProviderAttachmentKind::BlockDevice);
+        }
+    }
+    Err(BlazeError::BackendError {
+        msg: format!(
+            "provider {} attachment must be a regular file, character device, or block device",
+            role.as_str()
+        ),
+    })
+}
+
 /// Backend restore inputs paired with the opened runtime-directory owner.
 #[derive(Debug, Clone)]
 pub struct BackendRestoreRequest {
     request: RestoreRequest,
+    /// Optional provider-bound attachments for this restore only.
+    ///
+    /// File-backed, self-contained checkpoints leave this empty. A data-plane
+    /// provider may populate it with opened resources that satisfy the public
+    /// attachment contract.
+    pub(crate) provider_attachments: Option<ProviderRestoreAttachments>,
     /// Opened directory used for all replacement runtime artifacts.
     pub run_dir: OwnedRunDir,
     /// Backend executable pinned during preflight.
@@ -573,6 +881,7 @@ impl BackendRestoreRequest {
         }
         Ok(Self {
             request,
+            provider_attachments: None,
             run_dir,
             executable,
         })
@@ -2122,14 +2431,14 @@ mod tests {
             SpawnRequest {
                 instance_id: id,
                 binary_path: PathBuf::new(),
-                storage: StorageSlot {
+                storage: Some(StorageSlot {
                     id: id.to_string(),
                     rootfs_path: slot_dir.join("rootfs.ext4"),
                     mem_path: slot_dir.join("mem.bin"),
                     mem_diff_path: slot_dir.join("mem.diff"),
                     rootfs_diff_path: slot_dir.join("rootfs.diff"),
                     instance_dir: slot_dir,
-                },
+                }),
                 backend: BackendConfigs::default(),
                 vm: None,
             },

@@ -142,6 +142,17 @@ ends.
 See the [Storage Artifact Synchronization user guide](../../docs/user-guide/en/runtime/blaze.md#storage-artifact-synchronization)
 for configuration, selection, retry, and worker shutdown behavior.
 
+### Build-time data-plane extensions
+
+The standard daemon uses the file data plane. Downstream developers may
+implement the public source-level provider contract in an extension crate and
+compose a purpose-built daemon with `BlazeDaemonBuilder`; the standard daemon
+configuration does not switch implementations at runtime, and a failed
+build-time provider does not fall back to files.
+See [build-time data-plane providers](docs/design/build-time-data-plane-providers.md)
+for the lifecycle contract, example, compatibility boundary, and deferred
+capabilities.
+
 ## API Endpoints
 
 Blaze exposes sandbox lifecycle and guest operations through `/v1/sandboxes`.

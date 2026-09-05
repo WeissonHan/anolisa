@@ -14,8 +14,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use blaze_core::backend::{BackendKind, BackendStatus, select_backend};
 use blaze_core::checkpoint::CheckpointMetadata;
-use blaze_core::lifecycle::{SandboxInstance, StartPath};
+use blaze_core::lifecycle::{
+    BackendOwnership, OperationJournal, SandboxInstance, SandboxState, StartPath,
+};
 use blaze_core::policy::{ImageMetadata, RuntimeDecision, WorkloadClass};
+use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::header::CONTENT_TYPE;
@@ -251,10 +254,53 @@ struct CreateInstanceReq {
 
 #[derive(Debug, Serialize)]
 struct CreateInstanceResp {
-    instance: SandboxInstance,
+    instance: SandboxResp,
     decision: RuntimeDecision,
     start_path: StartPath,
     selected_backend: BackendKind,
+}
+
+/// Stable management representation of a sandbox.
+///
+/// The daemon can persist additional ownership and recovery records without
+/// extending the management API. Only fields intentionally listed here are
+/// returned to API clients.
+#[derive(Debug, Serialize)]
+struct SandboxResp {
+    id: Uuid,
+    state: SandboxState,
+    backend: BackendKind,
+    workload_class: WorkloadClass,
+    image_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    template: Option<String>,
+    start_path: StartPath,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    policy_name: String,
+    backend_ownership: BackendOwnership,
+    operation: Option<OperationJournal>,
+    last_checkpoint: Option<String>,
+}
+
+impl From<SandboxInstance> for SandboxResp {
+    fn from(instance: SandboxInstance) -> Self {
+        Self {
+            id: instance.id,
+            state: instance.state,
+            backend: instance.backend,
+            workload_class: instance.workload_class,
+            image_digest: instance.image_digest,
+            template: instance.template,
+            start_path: instance.start_path,
+            created_at: instance.created_at,
+            updated_at: instance.updated_at,
+            policy_name: instance.policy_name,
+            backend_ownership: instance.backend_ownership,
+            operation: instance.operation,
+            last_checkpoint: instance.last_checkpoint,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -266,11 +312,17 @@ struct CheckpointResp {
 }
 
 fn list_sandboxes(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    json_ok(&state.manager.list()?)
+    let sandboxes = state
+        .manager
+        .list()?
+        .into_iter()
+        .map(SandboxResp::from)
+        .collect::<Vec<_>>();
+    json_ok(&sandboxes)
 }
 
 fn get_sandbox(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
-    json_ok(&state.manager.get(parse_uuid(id)?)?)
+    json_ok(&SandboxResp::from(state.manager.get(parse_uuid(id)?)?))
 }
 
 async fn create_sandbox(state: &Arc<ServerState>, body: &[u8]) -> Result<Response<Full<Bytes>>> {
@@ -356,7 +408,7 @@ async fn create_sandbox(state: &Arc<ServerState>, body: &[u8]) -> Result<Respons
         .await?;
     json_created(&CreateInstanceResp {
         start_path: created.instance.start_path,
-        instance: created.instance,
+        instance: SandboxResp::from(created.instance),
         decision,
         selected_backend: created.selected_backend,
     })
@@ -422,24 +474,22 @@ async fn hibernate(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<B
     let uuid = parse_uuid(id)?;
     let instance = state.manager.get(uuid)?;
     let binary_path = configured_backend_path(state, instance.backend)?;
-    json_ok(
-        &state
-            .manager
-            .hibernate(uuid, HibernateSandbox { binary_path })
-            .await?,
-    )
+    let instance = state
+        .manager
+        .hibernate(uuid, HibernateSandbox { binary_path })
+        .await?;
+    json_ok(&SandboxResp::from(instance))
 }
 
 async fn resume(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<Bytes>>> {
     let uuid = parse_uuid(id)?;
     let instance = state.manager.get(uuid)?;
     let binary_path = configured_backend_path(state, instance.backend)?;
-    json_ok(
-        &state
-            .manager
-            .resume(uuid, ResumeSandbox { binary_path })
-            .await?,
-    )
+    let instance = state
+        .manager
+        .resume(uuid, ResumeSandbox { binary_path })
+        .await?;
+    json_ok(&SandboxResp::from(instance))
 }
 
 fn configured_backend_path(
@@ -788,6 +838,32 @@ mod tests {
             "image_digest": "sha256:ownership-test"
         }))
         .expect("request")
+    }
+
+    fn assert_sandbox_management_shape(value: &serde_json::Value) {
+        let mut actual = value
+            .as_object()
+            .expect("sandbox response object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut expected = vec![
+            "backend",
+            "backend_ownership",
+            "created_at",
+            "id",
+            "image_digest",
+            "last_checkpoint",
+            "operation",
+            "policy_name",
+            "start_path",
+            "state",
+            "updated_at",
+            "workload_class",
+        ];
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "management API sandbox fields changed");
     }
 
     fn configured_state_dir(state: &ServerState) -> PathBuf {
@@ -1585,6 +1661,7 @@ mod tests {
             dispatched_json(&state, Method::POST, "/v1/sandboxes", test_request()).await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(created["instance"]["state"], "running");
+        assert_sandbox_management_shape(&created["instance"]);
         assert!(created["decision"].is_object());
         assert_eq!(created["start_path"], "cold");
         assert_eq!(created["selected_backend"], "mock");
@@ -1597,17 +1674,18 @@ mod tests {
         let (status, sandboxes) =
             dispatched_json(&state, Method::GET, "/v1/sandboxes", Vec::new()).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(
-            sandboxes
-                .as_array()
-                .expect("sandbox list")
-                .iter()
-                .any(|candidate| candidate["id"] == id)
-        );
+        let listed = sandboxes
+            .as_array()
+            .expect("sandbox list")
+            .iter()
+            .find(|candidate| candidate["id"] == id)
+            .expect("created sandbox in list");
+        assert_sandbox_management_shape(listed);
 
         let (status, fetched) = dispatched_json(&state, Method::GET, &item, Vec::new()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(fetched["id"], id);
+        assert_sandbox_management_shape(&fetched);
 
         let (status, executed) = dispatched_json(
             &state,
@@ -7306,6 +7384,11 @@ mod tests {
             &self,
             request: crate::spawner::BackendRestoreRequest,
         ) -> crate::spawner::RestoreResult {
+            let storage = request.storage.clone().ok_or_else(|| {
+                SpawnFailure::clean(BlazeError::BackendError {
+                    msg: "template observation requires path-backed storage".to_string(),
+                })
+            })?;
             let observed = ObservedTemplateRestore {
                 instance_id: request.instance_id,
                 preserve_network: request.preserve_network,
@@ -7315,7 +7398,7 @@ mod tests {
                 memory: tokio::fs::read(request.payload_dir.join("memory.snap"))
                     .await
                     .map_err(SpawnFailure::from)?,
-                rootfs: tokio::fs::read(&request.storage.rootfs_path)
+                rootfs: tokio::fs::read(&storage.rootfs_path)
                     .await
                     .map_err(SpawnFailure::from)?,
             };
@@ -7324,7 +7407,7 @@ mod tests {
                 blaze_core::backend::SpawnRequest {
                     instance_id: request.instance_id,
                     binary_path: request.binary_path.clone(),
-                    storage: request.storage.clone(),
+                    storage: Some(storage),
                     backend: BackendConfigs::default(),
                     vm: None,
                 },

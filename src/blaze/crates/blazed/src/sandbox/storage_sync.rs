@@ -457,6 +457,7 @@ mod tests {
     };
     use tokio::sync::Notify;
 
+    use crate::data_plane::FileDataPlaneProvider;
     use crate::file_provider::{ArtifactSyncOpenHook, FileStorageProvider};
     use crate::sandbox::manager::{SandboxManagerInit, SandboxManagerResources};
     use crate::sandbox::template::TemplateCatalog;
@@ -656,11 +657,13 @@ mod tests {
         .expect("test runtime template catalog");
         let mut spawners = SpawnerRegistry::new();
         spawners.insert(BackendKind::Mock, Arc::new(MockSpawner));
+        let data_plane = Arc::new(FileDataPlaneProvider::new(storage.clone()));
         let (manager, resources) = SandboxManager::new(SandboxManagerInit {
             instances: HashMap::new(),
             spawners,
             active_backend: BackendKind::Mock,
             storage,
+            data_plane,
             state_store: StateStore::new(state_dir),
             rootfs_size: 64,
             mem_size: 32,
@@ -751,7 +754,7 @@ mod tests {
                     SpawnRequest {
                         instance_id: id,
                         binary_path: PathBuf::new(),
-                        storage: slot,
+                        storage: Some(slot),
                         backend: BackendConfigs::default(),
                         vm: None,
                     },

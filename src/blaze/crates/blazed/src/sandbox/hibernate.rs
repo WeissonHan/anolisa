@@ -733,7 +733,7 @@ impl SandboxManager {
                     RestoreRequest {
                         instance_id: id,
                         binary_path: request.binary_path,
-                        storage,
+                        storage: Some(storage),
                         // The configured pathname is handed out because the
                         // restore adapter may exec an external backend
                         // process; every artifact was hashed through the
