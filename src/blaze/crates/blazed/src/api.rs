@@ -15,7 +15,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use blaze_core::backend::{BackendKind, BackendStatus, SnapshotKind, select_backend};
 use blaze_core::checkpoint::{CheckpointArtifact, CheckpointMetadata};
 use blaze_core::lifecycle::{
-    BackendOwnership, OperationJournal, SandboxInstance, SandboxState, StartPath,
+    BackendOwnership, OperationJournal, OperationKind, OperationPhase, SandboxInstance,
+    SandboxState, StartPath,
 };
 use blaze_core::policy::{ImageMetadata, RuntimeDecision, WorkloadClass};
 use blaze_provider_api::{CapacityScope, CapacitySnapshot, DrainRequest, DrainResult};
@@ -283,8 +284,32 @@ struct SandboxResp {
     updated_at: DateTime<Utc>,
     policy_name: String,
     backend_ownership: BackendOwnership,
-    operation: Option<OperationJournal>,
+    operation: Option<OperationResp>,
     last_checkpoint: Option<String>,
+}
+
+/// Stable management representation of an in-progress sandbox operation.
+///
+/// The persisted journal may contain write-ahead recovery records. Keeping a
+/// separate response type prevents those records, and future recovery-only
+/// journal fields, from silently becoming part of the management API.
+#[derive(Debug, Serialize)]
+struct OperationResp {
+    kind: OperationKind,
+    started_at: DateTime<Utc>,
+    checkpoint_id: Option<String>,
+    phase: Option<OperationPhase>,
+}
+
+impl From<OperationJournal> for OperationResp {
+    fn from(operation: OperationJournal) -> Self {
+        Self {
+            kind: operation.kind,
+            started_at: operation.started_at,
+            checkpoint_id: operation.checkpoint_id,
+            phase: operation.phase,
+        }
+    }
 }
 
 impl From<SandboxInstance> for SandboxResp {
@@ -301,7 +326,7 @@ impl From<SandboxInstance> for SandboxResp {
             updated_at: instance.updated_at,
             policy_name: instance.policy_name,
             backend_ownership: instance.backend_ownership,
-            operation: instance.operation,
+            operation: instance.operation.map(OperationResp::from),
             last_checkpoint: instance.last_checkpoint,
         }
     }
@@ -961,6 +986,8 @@ mod tests {
     use blaze_core::config::DaemonConfig;
     use blaze_core::data_plane::{
         BackendProcessIdentity, BackendRuntimeRecord, DataPlaneLeaseState,
+        DataPlaneRequestContextRecord, PendingProviderOperationKind,
+        PendingProviderOperationRecord,
     };
     use blaze_core::kernel::HookRegistry;
     #[cfg(feature = "test-failpoints")]
@@ -1080,6 +1107,19 @@ mod tests {
         actual.sort_unstable();
         expected.sort_unstable();
         assert_eq!(actual, expected, "management API sandbox fields changed");
+    }
+
+    fn assert_operation_management_shape(value: &serde_json::Value) {
+        let mut actual = value
+            .as_object()
+            .expect("operation response object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut expected = vec!["checkpoint_id", "kind", "phase", "started_at"];
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "management API operation fields changed");
     }
 
     fn configured_state_dir(state: &ServerState) -> PathBuf {
@@ -3212,6 +3252,48 @@ mod tests {
             .expect("instances")
             .insert(id, instance.clone());
         serde_json::to_value(instance).expect("serialize lifecycle fixture")
+    }
+
+    #[test]
+    fn sandbox_management_response_does_not_expose_provider_journal() {
+        let mut instance = SandboxInstance::new(
+            BackendKind::Mock,
+            WorkloadClass::AgentTool,
+            "sha256:management-shape".to_string(),
+            "management-shape".to_string(),
+        );
+        instance.begin_operation(OperationKind::Create);
+        instance
+            .begin_provider_operation(PendingProviderOperationRecord {
+                provider_instance_id: Uuid::new_v4(),
+                context: DataPlaneRequestContextRecord {
+                    instance_id: instance.id,
+                    request_id: Uuid::new_v4(),
+                    operation_id: Uuid::new_v4(),
+                    lease_id: Uuid::new_v4(),
+                    generation: 1,
+                },
+                generation_before_call: 0,
+                root_filesystem_bytes: 4096,
+                guest_memory_bytes: 8192,
+                kind: PendingProviderOperationKind::PrepareLease,
+            })
+            .expect("provider write-ahead record");
+
+        let persisted = serde_json::to_value(&instance).expect("persisted sandbox shape");
+        assert!(
+            persisted["operation"]["provider_operation"].is_object(),
+            "the fixture must include a persisted provider write-ahead record"
+        );
+
+        let response =
+            serde_json::to_value(SandboxResp::from(instance)).expect("management sandbox shape");
+        assert_sandbox_management_shape(&response);
+        assert_operation_management_shape(&response["operation"]);
+        assert!(
+            response["operation"].get("provider_operation").is_none(),
+            "provider write-ahead records must not enter the management API"
+        );
     }
 
     #[tokio::test]
