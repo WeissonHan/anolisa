@@ -9,6 +9,7 @@
 //! source revision, Rust toolchain, and dependency lock.
 
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -818,8 +819,11 @@ pub struct InventorySnapshot {
 /// Request one page from a previously frozen inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryPageRequest {
+    /// Snapshot identity returned by the matching `begin_inventory` call.
     pub snapshot_id: Uuid,
+    /// `None` for the first page, or the exact cursor returned by the preceding page.
     pub cursor: Option<String>,
+    /// Maximum number of leases the provider may return in this page.
     pub page_size: u32,
 }
 
@@ -829,6 +833,7 @@ pub struct InventoryPageRequest {
 /// released tombstone makes the complete inventory invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InventoryLease {
+    /// Complete non-released lease binding as it existed in the frozen view.
     pub binding: LeaseBinding,
 }
 
@@ -840,7 +845,9 @@ pub struct InventoryLease {
 /// even when every cursor is distinct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryPage {
+    /// Unique, non-released lease bindings from the requested snapshot page.
     pub leases: Vec<InventoryLease>,
+    /// Opaque cursor for the next non-empty page, or `None` when traversal is complete.
     pub next_cursor: Option<String>,
 }
 
@@ -849,6 +856,7 @@ pub struct InventoryPage {
 pub enum ReconcileAction {
     /// Retain an exact live lease and associate it with the proven backend.
     Adopt {
+        /// Backend process identity Blaze verified before requesting adoption.
         backend_process: BackendProcessIdentity,
     },
     /// Retain resources without allowing them to serve traffic or be reused.
@@ -858,30 +866,37 @@ pub enum ReconcileAction {
 /// Reconcile one observed provider lease against a public expectation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileRequest {
+    /// Exact durable lease expected by Blaze, or `None` for a provider-only lease.
     pub expected: Option<LeaseBinding>,
+    /// Exact lease binding returned by the frozen provider inventory.
     pub observed: LeaseBinding,
+    /// Fail-closed convergence action selected from all ownership evidence.
     pub action: ReconcileAction,
 }
 
 /// Provider-confirmed convergence result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileResult {
+    /// Successor binding with unchanged identity, the next generation, and requested state.
     pub binding: LeaseBinding,
 }
 
 /// Optional lease inventory and restart-convergence extension.
 #[async_trait]
 pub trait DataPlaneInventory: DataPlaneProvider {
+    /// Freeze one stable provider view before Blaze requests any inventory pages.
     async fn begin_inventory(
         &self,
         request: BeginInventoryRequest,
     ) -> Result<InventorySnapshot, ProviderError>;
 
+    /// Return one bounded page from the requested snapshot and continuation cursor.
     async fn inventory_page(
         &self,
         request: InventoryPageRequest,
     ) -> Result<InventoryPage, ProviderError>;
 
+    /// Advance the observed lease by one generation to the requested safe state.
     async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResult, ProviderError>;
 }
 
