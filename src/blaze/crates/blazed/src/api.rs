@@ -9111,7 +9111,7 @@ mod tests {
             .expect("startup reconciliation");
 
         assert_eq!(retry.attempted, 1);
-        assert_eq!(retry.completed, 1);
+        assert_eq!(retry.completed, 1, "retry report: {retry:?}");
         assert!(retry.failures.is_empty());
         assert_eq!(
             state

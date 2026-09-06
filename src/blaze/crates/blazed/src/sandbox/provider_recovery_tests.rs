@@ -2004,6 +2004,109 @@ async fn restart_retires_only_an_obsolete_suspension_with_a_shared_reference() {
 }
 
 #[tokio::test]
+async fn inventory_preserves_an_exact_lease_awaiting_explicit_hibernate_cleanup() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let provider = Arc::new(LifecycleRecoveryProvider::new());
+    provider.inventory_enabled.store(true, Ordering::Release);
+    let first = build_lifecycle_manager(&temporary, provider.clone());
+    let (mut instance, binding) = active_instance(&provider, 5);
+    instance
+        .begin_hibernate_operation()
+        .expect("begin hibernation");
+    let id = instance.id;
+    first
+        .mark_instance_recovery(instance)
+        .expect("persist explicit cleanup state");
+    drop(first);
+
+    let restarted = build_lifecycle_manager(&temporary, provider.clone());
+    let report = restarted.reconcile_startup().await.expect("reconcile");
+
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.completed, 0);
+    assert!(report.failures.is_empty());
+    assert_eq!(
+        provider
+            .leases
+            .lock()
+            .expect("provider leases")
+            .get(&binding.context.lease_id)
+            .copied(),
+        Some(binding)
+    );
+    assert!(
+        provider
+            .reconcile_actions
+            .lock()
+            .expect("reconcile actions")
+            .is_empty()
+    );
+    let retained = restarted.get(id).expect("explicit cleanup state");
+    assert_eq!(retained.state, SandboxState::RecoveryRequired);
+    assert_eq!(
+        retained.operation.as_ref().map(|operation| operation.kind),
+        Some(OperationKind::Hibernate)
+    );
+
+    assert!(restarted.destroy(id).await.expect("explicit destroy"));
+    assert_eq!(provider.lease_count(), 0);
+    assert_eq!(
+        restarted.get(id).expect("terminal state").state,
+        SandboxState::Destroyed
+    );
+}
+
+#[tokio::test]
+async fn inventory_quarantines_a_mismatched_lease_for_an_explicit_cleanup_record() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let provider = Arc::new(LifecycleRecoveryProvider::new());
+    provider.inventory_enabled.store(true, Ordering::Release);
+    let first = build_lifecycle_manager(&temporary, provider.clone());
+    let (mut instance, expected) = active_instance(&provider, 7);
+    instance
+        .begin_hibernate_operation()
+        .expect("begin hibernation");
+    first
+        .mark_instance_recovery(instance)
+        .expect("persist explicit cleanup state");
+    let observed = LeaseBinding {
+        generation: expected.generation + 1,
+        ..expected
+    };
+    provider
+        .leases
+        .lock()
+        .expect("provider leases")
+        .insert(expected.context.lease_id, observed);
+    drop(first);
+
+    let restarted = build_lifecycle_manager(&temporary, provider.clone());
+    let report = restarted.reconcile_startup().await.expect("reconcile");
+
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.completed, 0);
+    assert_eq!(report.failures.len(), 1);
+    assert!(report.failures[0].error.contains("no public owner"));
+    assert_eq!(
+        provider
+            .reconcile_actions
+            .lock()
+            .expect("reconcile actions")
+            .as_slice(),
+        &[ReconcileAction::Quarantine]
+    );
+    assert_eq!(
+        provider
+            .leases
+            .lock()
+            .expect("provider leases")
+            .get(&expected.context.lease_id)
+            .map(|binding| binding.state),
+        Some(LeaseState::Quarantined)
+    );
+}
+
+#[tokio::test]
 async fn startup_cleans_an_interrupted_replacement_before_inventory_classification() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let provider = Arc::new(LifecycleRecoveryProvider::new());
