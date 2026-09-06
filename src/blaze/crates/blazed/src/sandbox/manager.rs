@@ -2853,20 +2853,30 @@ impl SandboxManager {
             ..ReconcileReport::default()
         };
         for mut instance in persisted {
-            if !requires_automatic_cleanup(&instance, daemon_managed_storage) {
-                continue;
-            }
             let id = instance.id;
-            let operation_lock = self.operation_lock(id);
-            let _operation = operation_lock.lock().await;
             let expected = instance
                 .data_plane_lease
                 .map(|record| LeaseBinding::from_record(id, record));
-            let observed =
-                expected.and_then(|binding| observed_by_lease.remove(&binding.context.lease_id));
             let expected_replacement = instance
                 .replacement_data_plane_lease
                 .map(|record| LeaseBinding::from_record(id, record));
+            if !requires_automatic_cleanup(&instance, daemon_managed_storage) {
+                // Some recovery records intentionally wait for an explicit
+                // destroy. Their exact leases remain publicly owned during
+                // that wait and therefore are not provider orphans. Consume
+                // only an exact inventory match; a same-ID mismatch stays in
+                // the orphan set and is quarantined below.
+                for expected in [expected, expected_replacement].into_iter().flatten() {
+                    if observed_by_lease.get(&expected.context.lease_id) == Some(&expected) {
+                        observed_by_lease.remove(&expected.context.lease_id);
+                    }
+                }
+                continue;
+            }
+            let operation_lock = self.operation_lock(id);
+            let _operation = operation_lock.lock().await;
+            let observed =
+                expected.and_then(|binding| observed_by_lease.remove(&binding.context.lease_id));
             let observed_replacement = expected_replacement
                 .and_then(|binding| observed_by_lease.remove(&binding.context.lease_id));
             let adoptable = is_running_adoption_candidate(&instance)

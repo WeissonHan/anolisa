@@ -1428,6 +1428,30 @@ fn remove_owned_slot_directory(
     })
 }
 
+fn release_legacy_slot_by_id(ledger: &StorageOwnershipLedger, slot: StorageSlot) -> Result<()> {
+    let _operation = ledger
+        .operations
+        .lock()
+        .map_err(|_| ownership_error(&slot.id, "the ownership operation lock is poisoned"))?;
+    if let Ok(instance_id) = Uuid::parse_str(&slot.id)
+        && read_ownership_manifest(ledger, instance_id)?.is_some()
+    {
+        return Err(ownership_error(
+            &slot.id,
+            "request-scoped storage must be removed through its exact lease binding",
+        ));
+    }
+    let Some(directory) = open_slot_directory(&ledger.root, &slot)? else {
+        return Ok(());
+    };
+    // Records written before request-scoped ownership do not have a storage
+    // manifest. Recovery is nevertheless authorized by the accepted lifecycle
+    // record. Keep that compatibility path separate from `release`, and bind
+    // recursive removal to the directory object opened under the configured
+    // storage root so a path replacement cannot redirect cleanup.
+    remove_owned_slot_directory(&ledger.root, OsStr::new(&slot.id), directory, 0)
+}
+
 fn release_owned_slot(
     ledger: &StorageOwnershipLedger,
     slot: StorageSlot,
@@ -1870,8 +1894,14 @@ impl StorageProvider for FileStorageProvider {
     }
 
     async fn release_by_id(&self, instance_id: &str) -> Result<()> {
+        crate::failpoint::storage("storage-release")?;
         let slot = self.slot_for_id(instance_id)?;
-        self.release(slot).await
+        let ledger = self.ownership_ledger()?;
+        crate::failpoint::spawn_blocking(move || release_legacy_slot_by_id(&ledger, slot))
+            .await
+            .map_err(|source| BlazeError::StorageError {
+                msg: format!("release legacy storage task failed: {source}"),
+            })?
     }
 
     async fn reconstruct(&self, instance_id: &str) -> Result<StorageSlot> {
@@ -2959,6 +2989,56 @@ mod tests {
         assert!(dir.exists());
         provider.release(slot).await.unwrap();
         assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    async fn release_by_id_removes_a_legacy_uuid_slot_without_an_ownership_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let provider = FileStorageProvider::new(tmp.path().to_path_buf());
+        let instance_id = Uuid::new_v4().to_string();
+        let slot = provider
+            .acquire(&AcquireOpts {
+                instance_id: instance_id.clone(),
+                rootfs_size: 1024,
+                mem_size: 512,
+            })
+            .await
+            .expect("legacy storage slot");
+
+        provider
+            .release_by_id(&instance_id)
+            .await
+            .expect("legacy recovery release");
+
+        assert!(!slot.instance_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn release_by_id_never_bypasses_request_scoped_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let provider = FileStorageProvider::new(tmp.path().to_path_buf());
+        let instance_id = Uuid::new_v4();
+        let request = ownership_request(&provider, instance_id, None);
+        provider
+            .reserve_ownership(request)
+            .await
+            .expect("reserve owner");
+        let slot = provider
+            .acquire(&AcquireOpts {
+                instance_id: instance_id.to_string(),
+                rootfs_size: 1024,
+                mem_size: 512,
+            })
+            .await
+            .expect("request-scoped storage slot");
+
+        let error = provider
+            .release_by_id(&instance_id.to_string())
+            .await
+            .expect_err("request-scoped storage requires its exact lease binding");
+
+        assert!(error.to_string().contains("exact lease binding"));
+        assert!(slot.instance_dir.is_dir());
     }
 
     #[tokio::test]
