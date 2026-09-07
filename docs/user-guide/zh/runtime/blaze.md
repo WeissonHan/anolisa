@@ -101,6 +101,49 @@ Blaze 负责配置 sandbox 本地的网络路径。主机以外的路由和 DNS 
 如需关闭该能力，将 `enable_network` 设置为 `false` 或删除该配置项，再通过
 沙箱 API 销毁已经启用网络的 sandbox。
 
+## 构建时数据面扩展
+
+标准 `blazed` 二进制使用内置文件数据面。开发者可以在扩展软件包中实现
+`DataPlaneProvider`，再将实现传给 `BlazeDaemonBuilder`，构建满足自身需求的
+守护进程。这是源码级接口：提供者和守护进程必须使用兼容的源码版本以及同一份
+依赖锁定文件共同构建。标准配置和租户请求不能选择其他提供者；提供者启动失败时，
+也不会回退到文件数据面。
+
+在 Linux 的 `src/blaze` 目录中，运行仓库自带的文件提供者示例，并查看自定义
+守护进程示例的参数：
+
+```bash
+cargo run --locked -p blaze-provider-conformance --example minimal_provider
+cargo run --locked -p blazed --example custom_provider_daemon -- --help
+cargo doc --locked -p blaze-provider-api -p blazed --no-deps
+```
+
+第一条命令在独立临时目录中验证资源准备、提交、最终确认、停止和释放，成功时
+退出状态为零。第二条命令只显示帮助，不启动守护进程。
+[`custom_provider_daemon.rs`](https://github.com/alibaba/anolisa/blob/main/src/blaze/crates/blazed/examples/custom_provider_daemon.rs)
+展示如何向构建器传入提供者和守护进程配置。请求与应答要求见生成的接口文档。
+
+`ExampleFileProvider` 仅为接口验证创建稀疏文件，不实现持久化所有权、重启核对、
+模板、检查点、休眠或可复用容量，不能用作生产存储提供者。每项可选操作都要求
+提供者实现相应扩展，并具有兼容的运行后端。
+
+提供者的生命周期记录保存在 `daemon.state_dir` 下的
+`.provider-state-v<contract_version>-<provider_instance_id>` 目录中。重启前后应
+保持提供者身份不变。改变身份会选择另一个状态目录，不会迁移已有沙箱。
+
+切换提供者或改回标准版本之前，应先使用原提供者完成清理。两种启动路径都会
+只读检查其他提供者的状态目录，不会导入或删除其中的记录。如果外部沙箱尚未
+销毁、销毁记录仍保留资源所有权，或者状态无法读取和验证，守护进程会在开放
+接口之前拒绝启动。空目录，以及能够证明清理已完成的销毁记录，不会阻止启动。
+不要通过重命名或删除状态目录绕过此检查。
+
+如果提供者的准备应答与请求的租约身份或初始状态不一致，Blaze 会保留操作记录，
+并标记为 `RecoveryRequired`。此规则适用于创建、检查点回退和休眠继续。查询原
+请求时找不到资源，并不能证明错误应答对应的资源已经释放，因此重启或再次删除
+都不会清除该未解决记录，也不会报告清理成功。恢复前应核查提供者的资源归属
+记录；不要删除 Blaze 状态目录来绕过保护。租约身份一致、仅资源内容不合法的
+应答，在能够确认释放时仍按正常补偿流程处理。
+
 ## Guest 操作
 
 只有 sandbox 处于 `Running` 且 backend 报告兼容的 guest endpoint 时，

@@ -120,6 +120,61 @@ and verify guest connectivity for the host environment.
 To disable the capability, set `enable_network = false` or remove the key, then
 destroy existing network-enabled sandboxes through the sandbox API.
 
+## Build-time Data-plane Extensions
+
+The standard `blazed` binary uses the built-in file data plane. Developers can
+implement `DataPlaneProvider` in an extension crate and pass that implementation
+to `BlazeDaemonBuilder` when building a custom daemon. This is a source-level
+interface: build the provider and daemon with compatible source revisions and
+one dependency lockfile. Standard configuration and tenant requests cannot
+select another provider, and provider startup failure does not fall back to
+the file data plane.
+
+From `src/blaze` on Linux, run the repository's file-backed example and inspect
+the custom daemon example's arguments:
+
+```bash
+cargo run --locked -p blaze-provider-conformance --example minimal_provider
+cargo run --locked -p blazed --example custom_provider_daemon -- --help
+cargo doc --locked -p blaze-provider-api -p blazed --no-deps
+```
+
+The first command exercises resource preparation, commit, finalization, stop,
+and release in an isolated temporary directory. Success produces exit status
+zero. The second command only displays help; it does not start a daemon.
+[`custom_provider_daemon.rs`](https://github.com/alibaba/anolisa/blob/main/src/blaze/crates/blazed/examples/custom_provider_daemon.rs)
+shows how to supply a provider and daemon configuration to the builder. Consult
+the generated API documentation for request and response requirements.
+
+`ExampleFileProvider` creates sparse files for contract exercises. It does not
+implement persistent ownership, restart reconciliation, templates, checkpoints,
+hibernation, or reusable capacity and is not a production storage provider.
+Each optional operation requires a provider that implements its corresponding
+extension and a compatible runtime backend.
+
+Provider-backed lifecycle records reside below `daemon.state_dir` in
+`.provider-state-v<contract_version>-<provider_instance_id>`. Keep the provider
+identity stable across restarts. Changing it selects a different state
+namespace; it does not migrate existing sandboxes.
+
+Before switching providers or returning to the standard binary, finish cleanup
+with the original provider. Both startup paths inspect other providers' state
+directories without importing or deleting their records. Startup fails before
+opening the API if any foreign sandbox is non-terminal, if a destroyed record
+still retains ownership, or if the state cannot be read and validated. Empty
+directories and destroyed records that prove completed cleanup do not block
+startup. Do not rename or remove state directories to bypass this check.
+
+If a provider's preparation response does not match the requested lease
+identity or initial state, Blaze retains the operation as `RecoveryRequired`.
+This applies to creation, checkpoint restore, and resume. An absent result
+when looking up the original request is not proof that the returned resources
+were released. Restart and repeated deletion therefore retain the unresolved
+record instead of reporting successful cleanup. Diagnose the provider's
+ownership records before recovery; do not delete Blaze's state directory to
+bypass this safeguard. A matching lease with invalid resource content still
+uses normal compensation when release can be confirmed.
+
 ## Guest Operations
 
 Guest operations are available only while a sandbox is `Running` and its
