@@ -699,6 +699,7 @@ fn validate_guest_path(path: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    mod lifecycle_contract;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

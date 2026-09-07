@@ -34,6 +34,9 @@ use crate::state::ServerState;
 use crate::state_store::StateStore;
 use crate::{build_time_provider_state_dir, build_time_provider_state_namespace};
 
+#[cfg(test)]
+mod provider_startup_tests;
+
 /// Boot the daemon: load config + policies, prepare state directories,
 /// bind the API socket, and run the accept loop until SIGTERM/SIGINT.
 pub async fn run(config_path: &Path) -> Result<()> {

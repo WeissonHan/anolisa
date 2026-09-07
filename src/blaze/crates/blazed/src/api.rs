@@ -969,6 +969,7 @@ fn error_response(err: &BlazeDaemonError) -> Response<Full<Bytes>> {
 
 #[cfg(test)]
 mod tests {
+    mod provider_contract;
     mod unsafe_prepare;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -1368,6 +1369,9 @@ mod tests {
         inner: crate::data_plane::FileDataPlaneProvider,
         capacity: std::sync::Mutex<CapacitySnapshot>,
         drains: std::sync::Mutex<HashMap<Uuid, DrainResult>>,
+        response_error: std::sync::Mutex<Option<ProviderError>>,
+        drain_response: std::sync::Mutex<Option<DrainResult>>,
+        drain_calls: AtomicUsize,
     }
 
     impl CapacityTestProvider {
@@ -1396,6 +1400,9 @@ mod tests {
                     accepting_allocations: true,
                 }),
                 drains: std::sync::Mutex::new(HashMap::new()),
+                response_error: std::sync::Mutex::new(None),
+                drain_response: std::sync::Mutex::new(None),
+                drain_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -1474,6 +1481,9 @@ mod tests {
             &self,
             request: CapacityRequest,
         ) -> std::result::Result<CapacitySnapshot, ProviderError> {
+            if let Some(error) = *self.response_error.lock().expect("response error") {
+                return Err(error);
+            }
             let snapshot = *self.capacity.lock().expect("provider capacity");
             if snapshot.scope != request.scope {
                 return Err(ProviderError::NotFound);
@@ -1485,6 +1495,13 @@ mod tests {
             &self,
             request: DrainRequest,
         ) -> std::result::Result<DrainResult, ProviderError> {
+            self.drain_calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(error) = *self.response_error.lock().expect("response error") {
+                return Err(error);
+            }
+            if let Some(response) = *self.drain_response.lock().expect("drain response") {
+                return Ok(response);
+            }
             if request.operation_id.is_nil() {
                 return Err(ProviderError::Conflict);
             }
@@ -2296,6 +2313,10 @@ mod tests {
         suspension_retirement_calls: AtomicUsize,
         suspension_public_owner_path: std::sync::Mutex<Option<PathBuf>>,
         retired_suspension_while_public_owner_existed: AtomicBool,
+        capture_fault: std::sync::Mutex<Option<provider_contract::CaptureFault>>,
+        checkpoint_retirement_fault: std::sync::Mutex<Option<provider_contract::ReceiptFault>>,
+        suspension_retirement_fault: std::sync::Mutex<Option<provider_contract::ReceiptFault>>,
+        opened_file_identities: std::sync::Mutex<HashMap<Uuid, Vec<(u64, u64)>>>,
     }
 
     impl InventoryTestProvider {
@@ -2320,6 +2341,10 @@ mod tests {
                 suspension_retirement_calls: AtomicUsize::new(0),
                 suspension_public_owner_path: std::sync::Mutex::new(None),
                 retired_suspension_while_public_owner_existed: AtomicBool::new(false),
+                capture_fault: std::sync::Mutex::new(None),
+                checkpoint_retirement_fault: std::sync::Mutex::new(None),
+                suspension_retirement_fault: std::sync::Mutex::new(None),
+                opened_file_identities: std::sync::Mutex::new(HashMap::new()),
             }
         }
 
@@ -2617,6 +2642,10 @@ mod tests {
                 .lock()
                 .expect("provider checkpoints")
                 .insert(checkpoint.public_checkpoint_id, checkpoint.clone());
+            let mut checkpoint = checkpoint;
+            if let Some(fault) = *self.capture_fault.lock().expect("capture fault") {
+                fault.apply(&mut checkpoint);
+            }
             Ok(CheckpointSubmission {
                 binding,
                 checkpoint,
@@ -2651,16 +2680,30 @@ mod tests {
             let id = request.context.instance_id.to_string();
             Ok(self.inject_prepared_response_fault(PreparedLease {
                 binding,
-                resources: PreparedResources::CheckpointRestore {
-                    storage: Some(StorageSlot {
-                        id,
-                        rootfs_path: PathBuf::new(),
-                        mem_path: PathBuf::new(),
-                        mem_diff_path: PathBuf::new(),
-                        rootfs_diff_path: PathBuf::new(),
-                        instance_dir: PathBuf::new(),
-                    }),
-                    attachments: Vec::new(),
+                resources: if self
+                    .opened_checkpoint_restore_resources
+                    .load(Ordering::Acquire)
+                {
+                    PreparedResources::CheckpointRestore {
+                        storage: None,
+                        attachments: self.opened_resources(
+                            binding,
+                            request.root_filesystem_bytes,
+                            request.guest_memory_bytes,
+                        ),
+                    }
+                } else {
+                    PreparedResources::CheckpointRestore {
+                        storage: Some(StorageSlot {
+                            id,
+                            rootfs_path: PathBuf::new(),
+                            mem_path: PathBuf::new(),
+                            mem_diff_path: PathBuf::new(),
+                            rootfs_diff_path: PathBuf::new(),
+                            instance_dir: PathBuf::new(),
+                        }),
+                        attachments: Vec::new(),
+                    }
                 },
             }))
         }
@@ -2669,6 +2712,19 @@ mod tests {
             &self,
             request: RetireCheckpointRequest,
         ) -> std::result::Result<RetireCheckpointResult, ProviderError> {
+            if let Some(fault) = *self
+                .checkpoint_retirement_fault
+                .lock()
+                .expect("retirement fault")
+            {
+                let (public_checkpoint_id, reference_id) =
+                    fault.identities(request.public_checkpoint_id, request.reference_id);
+                return Ok(RetireCheckpointResult {
+                    public_checkpoint_id,
+                    reference_id,
+                    retired: true,
+                });
+            }
             if request.provider_instance_id != self.descriptor().provider_instance_id
                 || request.public_checkpoint_id.is_nil()
                 || request
@@ -2766,16 +2822,30 @@ mod tests {
             );
             Ok(self.inject_prepared_response_fault(PreparedLease {
                 binding,
-                resources: PreparedResources::SuspensionRestore {
-                    storage: Some(StorageSlot {
-                        id: request.context.instance_id.to_string(),
-                        rootfs_path: PathBuf::new(),
-                        mem_path: PathBuf::new(),
-                        mem_diff_path: PathBuf::new(),
-                        rootfs_diff_path: PathBuf::new(),
-                        instance_dir: PathBuf::new(),
-                    }),
-                    attachments: Vec::new(),
+                resources: if self
+                    .opened_suspension_restore_resources
+                    .load(Ordering::Acquire)
+                {
+                    PreparedResources::SuspensionRestore {
+                        storage: None,
+                        attachments: self.opened_resources(
+                            binding,
+                            request.root_filesystem_bytes,
+                            request.guest_memory_bytes,
+                        ),
+                    }
+                } else {
+                    PreparedResources::SuspensionRestore {
+                        storage: Some(StorageSlot {
+                            id: request.context.instance_id.to_string(),
+                            rootfs_path: PathBuf::new(),
+                            mem_path: PathBuf::new(),
+                            mem_diff_path: PathBuf::new(),
+                            rootfs_diff_path: PathBuf::new(),
+                            instance_dir: PathBuf::new(),
+                        }),
+                        attachments: Vec::new(),
+                    }
                 },
             }))
         }
@@ -2784,6 +2854,19 @@ mod tests {
             &self,
             request: RetireSuspensionRequest,
         ) -> std::result::Result<RetireSuspensionResult, ProviderError> {
+            if let Some(fault) = *self
+                .suspension_retirement_fault
+                .lock()
+                .expect("retirement fault")
+            {
+                let (suspension_id, reference_id) =
+                    fault.identities(request.suspension_id, request.reference_id);
+                return Ok(RetireSuspensionResult {
+                    suspension_id,
+                    reference_id,
+                    retired: true,
+                });
+            }
             self.suspension_retirement_calls
                 .fetch_add(1, Ordering::AcqRel);
             if self

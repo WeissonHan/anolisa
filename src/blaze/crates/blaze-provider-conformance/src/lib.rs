@@ -569,6 +569,7 @@ pub async fn exercise_create_delete(
 
 #[cfg(test)]
 mod tests {
+    mod response_contract;
     use std::fs::OpenOptions;
     use std::path::PathBuf;
 
